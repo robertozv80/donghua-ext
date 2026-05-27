@@ -3,75 +3,77 @@ package com.donghuaext
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.loadExtractor
-import org.jsoup.nodes.Element
+import com.lagradost.cloudstream3.utils.newExtractorLink
+import org.jsoup.Jsoup
 
 class SeriesDonghuaProvider : MainAPI() {
     override var mainUrl = "https://seriesdonghua.com"
     override var name = "SeriesDonghua"
     override val hasMainPage = true
     override var lang = "es"
-    override val hasQuickSearch = true
+    override val hasQuickSearch = false
     override val supportedTypes = setOf(TvType.Anime)
 
-    // ==================== Homepage ====================
     override val mainPage = mainPageOf(
-        "$mainUrl/" to "Inicio",
-        "$mainUrl/donghua/" to "Donghuas",
-        "$mainUrl/anime/" to "Animes"
+        "$mainUrl" to "Inicio",
+        "$mainUrl/genre/donghua" to "Donghua",
+        "$mainUrl/genre/anime" to "Anime"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page > 1) "${request.data}page/$page/" else request.data
+        val url = if (page == 1) request.data else "${request.data}/page/$page"
         val doc = app.get(url).document
-        val items = doc.select("div.bs").mapNotNull { it.toSearchResult() }
-        return newHomePageResponse(request.name, items, page + 1)
-    }
-
-    private fun Element.toSearchResult(): SearchResponse? {
-        val titleEl = selectFirst("a") ?: return null
-        val title = titleEl.attr("title").ifBlank { titleEl.text() }.trim()
-        val href = titleEl.attr("abs:href")
-        if (href.isBlank()) return null
-        val posterUrl = selectFirst("img")?.attr("abs:src")
-        return newAnimeSearchResponse(title, href, TvType.Anime) {
-            this.posterUrl = posterUrl
+        val items = doc.select("article, .post-item, .item").mapNotNull { el ->
+            val a = el.selectFirst("a") ?: return@mapNotNull null
+            val title = a.attr("title").ifBlank { a.text() }
+            val href = a.attr("abs:href")
+            val poster = el.selectFirst("img")?.attr("abs:src")
+            if (title.isNotBlank() && href.isNotBlank()) {
+                newAnimeSearchResponse(title, href) {
+                    this.posterUrl = poster
+                }
+            } else null
         }
+        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
-
-    // ==================== Search ====================
-    override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val doc = app.get("$mainUrl/?s=${query}").document
-        return doc.select("div.bs").mapNotNull { it.toSearchResult() }
+        val doc = app.get("$mainUrl/?s=$query").document
+        return doc.select("article, .post-item, .item").mapNotNull { el ->
+            val a = el.selectFirst("a") ?: return@mapNotNull null
+            val title = a.attr("title").ifBlank { a.text() }
+            val href = a.attr("abs:href")
+            val poster = el.selectFirst("img")?.attr("abs:src")
+            if (title.isNotBlank() && href.isNotBlank()) {
+                newAnimeSearchResponse(title, href) {
+                    this.posterUrl = poster
+                }
+            } else null
+        }
     }
 
-    // ==================== Detail ====================
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url).document
+        val title = doc.selectFirst("h1, .entry-title")?.text() ?: ""
+        val poster = doc.selectFirst("img.wp-post-image, .poster img")?.attr("abs:src")
+        val description = doc.selectFirst(".entry-content, .synopsis, .descripcion")?.text()
 
-        val title = doc.selectFirst("h1")?.text()?.trim() ?: ""
-        val poster = doc.selectFirst("div.bigcontent img")?.attr("abs:src")
-            ?: doc.selectFirst("div.thumb img")?.attr("abs:src")
-        val synopsis = doc.selectFirst("div.entry-content, div.sinopsis, div.desc")?.text()?.trim()
-        val genres = doc.select("div.genxed a, div.sigen a, a[rel=tag]").map { it.text().trim() }
-
-        val episodes = doc.select("div.eplister ul li a, div.lsch a, div.episodelist a").mapNotNull { ep ->
-            val epTitle = ep.selectFirst("span.epl-title, span")?.text()?.trim()
-                ?: ep.text().trim().ifBlank { return@mapNotNull null }
-            val epHref = ep.attr("abs:href").ifBlank { return@mapNotNull null }
-            Episode(epHref, epTitle)
+        val episodes = doc.select(".episode-list a, .episodios a, .capitulos a, .eplister a").mapNotNull { el ->
+            val epName = el.text()
+            val epUrl = el.attr("abs:href")
+            if (epUrl.isNotBlank()) {
+                newEpisode(epUrl) {
+                    this.name = epName
+                }
+            } else null
         }
 
-        return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
+        return newTvSeriesLoadResponse(title, url, this, episodes) {
             this.posterUrl = poster
-            this.plot = synopsis
-            this.tags = genres
+            this.plot = description
         }
     }
 
-    // ==================== Links ====================
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -80,44 +82,57 @@ class SeriesDonghuaProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data).document
 
-        // Look for iframes (common video players)
+        // Try to find iframe sources
         val iframes = doc.select("iframe").mapNotNull { it.attr("abs:src") }
+        for (iframeSrc in iframes) {
+            try {
+                val iframeDoc = app.get(iframeSrc, referer = data).document
+                val videoUrls = mutableListOf<String>()
 
-        for (iframe in iframes) {
-            loadExtractor(iframe, data, subtitleCallback, callback)
+                iframeDoc.select("source, video source").forEach { el ->
+                    val src = el.attr("abs:src")
+                    if (src.isNotBlank()) videoUrls.add(src)
+                }
+                iframeDoc.select("video").forEach { el ->
+                    val src = el.attr("abs:src")
+                    if (src.isNotBlank()) videoUrls.add(src)
+                }
+
+                // Check for JavaScript video URLs
+                iframeDoc.select("script").forEach { script ->
+                    val content = script.html()
+                    val regex = Regex("""file\s*[:=]\s*["']([^"']+)["']""")
+                    regex.findAll(content).forEach { match ->
+                        val videoUrl = match.groupValues[1]
+                        if (videoUrl.startsWith("http")) videoUrls.add(videoUrl)
+                    }
+                }
+
+                for (videoUrl in videoUrls) {
+                    callback(
+                        newExtractorLink(name, "Video", videoUrl) {
+                            this.referer = iframeSrc
+                            this.quality = Qualities.Unknown.value
+                            this.isM3u8 = videoUrl.contains(".m3u8")
+                            this.headers = mapOf("Referer" to iframeSrc)
+                        }
+                    )
+                }
+            } catch (_: Exception) {}
         }
 
-        // Also check for direct video/m3u8 in script tags
-        doc.select("script").forEach { script ->
-            val content = script.data()
-            val m3u8Regex = Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""")
-            m3u8Regex.findAll(content).forEach { match ->
+        // Also try direct video sources on the page
+        doc.select("video source, video").forEach { el ->
+            val src = el.attr("abs:src")
+            if (src.isNotBlank()) {
                 callback(
-                    ExtractorLink(
-                        source = name,
-                        name = "SeriesDonghua HLS",
-                        url = match.value,
-                        referer = mainUrl,
-                        quality = Qualities.Unknown.value,
-                        isM3u8 = true
-                    )
+                    newExtractorLink(name, "Direct", src) {
+                        this.referer = data
+                        this.quality = Qualities.Unknown.value
+                        this.isM3u8 = src.contains(".m3u8")
+                    }
                 )
             }
-        }
-
-        // Check for video source tags
-        doc.select("video source, video src").forEach { source ->
-            val videoUrl = source.attr("abs:src").ifBlank { return@forEach }
-            callback(
-                ExtractorLink(
-                    source = name,
-                    name = "SeriesDonghua",
-                    url = videoUrl,
-                    referer = mainUrl,
-                    quality = Qualities.Unknown.value,
-                    isM3u8 = videoUrl.contains(".m3u8")
-                )
-            )
         }
 
         return true
