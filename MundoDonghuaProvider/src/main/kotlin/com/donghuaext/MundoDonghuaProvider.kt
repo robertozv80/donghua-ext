@@ -65,7 +65,7 @@ class MundoDonghuaProvider : MainAPI() {
                 }
             } else null
         }
-        return newTvSeriesLoadResponse(title, url, this, episodes) {
+        return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
             this.posterUrl = poster
             this.plot = description
         }
@@ -79,12 +79,10 @@ class MundoDonghuaProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data).document
 
-        // Try to find iframe sources
         val iframes = doc.select("iframe").mapNotNull { it.attr("abs:src") }
         for (iframeSrc in iframes) {
             try {
                 val iframeDoc = app.get(iframeSrc, referer = data).document
-                // Look for video source in various formats
                 val videoUrls = mutableListOf<String>()
 
                 iframeDoc.select("source, video source").forEach { el ->
@@ -96,7 +94,6 @@ class MundoDonghuaProvider : MainAPI() {
                     if (src.isNotBlank()) videoUrls.add(src)
                 }
 
-                // Also check for JavaScript video URLs
                 iframeDoc.select("script").forEach { script ->
                     val content = script.html()
                     val regex = Regex("""file\s*[:=]\s*["']([^"']+)["']""")
@@ -108,27 +105,32 @@ class MundoDonghuaProvider : MainAPI() {
 
                 for (videoUrl in videoUrls) {
                     callback(
-                        newExtractorLink(name, "Video", videoUrl) {
-                            this.referer = iframeSrc
-                            this.quality = Qualities.Unknown.value
-                            this.isM3u8 = videoUrl.contains(".m3u8")
-                            this.headers = mapOf("Referer" to iframeSrc)
-                        }
+                        newExtractorLink(
+                            source = name,
+                            name = "Video",
+                            url = videoUrl,
+                            referer = iframeSrc,
+                            quality = Qualities.Unknown.value,
+                            isM3u8 = videoUrl.contains(".m3u8"),
+                            headers = mapOf("Referer" to iframeSrc)
+                        )
                     )
                 }
             } catch (_: Exception) {}
         }
 
-        // Also try direct video sources on the page
         doc.select("video source, video").forEach { el ->
             val src = el.attr("abs:src")
             if (src.isNotBlank()) {
                 callback(
-                    newExtractorLink(name, "Direct", src) {
-                        this.referer = data
-                        this.quality = Qualities.Unknown.value
-                        this.isM3u8 = src.contains(".m3u8")
-                    }
+                    newExtractorLink(
+                        source = name,
+                        name = "Direct",
+                        url = src,
+                        referer = data,
+                        quality = Qualities.Unknown.value,
+                        isM3u8 = src.contains(".m3u8")
+                    )
                 )
             }
         }
