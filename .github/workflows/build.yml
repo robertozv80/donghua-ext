@@ -1,33 +1,35 @@
-name: Build CS3 Plugins
+name: Build
 
 on:
   push:
-    branches: [ main ]
-  workflow_dispatch:
+    branches:
+      - main
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: '17'
+          distribution: temurin
+          java-version: 17
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
-      - name: Build plugins
-        run: |
-          chmod +x gradlew
-          ./gradlew make
-      - name: Upload builds
-        uses: actions/upload-artifact@v4
-        with:
-          name: plugin-builds
-          path: builds/
-      - name: Deploy to builds branch
+
+      - name: Build Plugins
+        run: ./gradlew make
+
+      - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./builds
+          publish_dir: ./build
           publish_branch: builds
