@@ -111,12 +111,12 @@ class DonghuaLifeProvider : MainAPI() {
                         newExtractorLink(
                             source = name,
                             name = "Video",
-                            url = videoUrl,
-                            referer = iframeSrc,
-                            quality = Qualities.Unknown.value,
-                            isM3u8 = videoUrl.contains(".m3u8"),
-                            headers = mapOf("Referer" to iframeSrc)
-                        )
+                            url = videoUrl
+                        ) {
+                            this.referer = iframeSrc
+                            this.quality = Qualities.Unknown.value
+                            this.headers = mapOf("Referer" to iframeSrc)
+                        }
                     )
                 }
             } catch (_: Exception) {}
@@ -129,11 +129,11 @@ class DonghuaLifeProvider : MainAPI() {
                     newExtractorLink(
                         source = name,
                         name = "Direct",
-                        url = src,
-                        referer = data,
-                        quality = Qualities.Unknown.value,
-                        isM3u8 = src.contains(".m3u8")
-                    )
+                        url = src
+                    ) {
+                        this.referer = data
+                        this.quality = Qualities.Unknown.value
+                    }
                 )
             }
         }
