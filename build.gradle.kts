@@ -20,8 +20,4 @@ allprojects {
 
 subprojects {
     apply(plugin = "com.lagradost.cloudstream3.gradle")
-
-    dependencies {
-        add("implementation", "org.jsoup:jsoup:1.18.3")
-    }
 }
