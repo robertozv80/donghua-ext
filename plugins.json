@@ -2,10 +2,12 @@
   {
     "name": "AnimeGratisProvider",
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/AnimeGratisProvider.cs3",
-    "api": "",
+    "api": "com.donghuaext.AnimeGratisProviderPlugin",
     "version": 1,
-    "authors": [],
-    "description": "",
+    "authors": [
+      "robertozv80"
+    ],
+    "description": "AnimeGratisProvider - Donghua/Anime provider",
     "language": "es",
     "types": [
       "Anime"
@@ -14,10 +16,12 @@
   {
     "name": "DonghuaLifeProvider",
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/DonghuaLifeProvider.cs3",
-    "api": "",
+    "api": "com.donghuaext.DonghuaLifeProviderPlugin",
     "version": 1,
-    "authors": [],
-    "description": "",
+    "authors": [
+      "robertozv80"
+    ],
+    "description": "DonghuaLifeProvider - Donghua/Anime provider",
     "language": "es",
     "types": [
       "Anime"
@@ -26,10 +30,12 @@
   {
     "name": "MundoDonghuaProvider",
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/MundoDonghuaProvider.cs3",
-    "api": "",
+    "api": "com.donghuaext.MundoDonghuaProviderPlugin",
     "version": 1,
-    "authors": [],
-    "description": "",
+    "authors": [
+      "robertozv80"
+    ],
+    "description": "MundoDonghuaProvider - Donghua/Anime provider",
     "language": "es",
     "types": [
       "Anime"
@@ -38,10 +44,12 @@
   {
     "name": "SeriesDonghuaProvider",
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/SeriesDonghuaProvider.cs3",
-    "api": "",
+    "api": "com.donghuaext.SeriesDonghuaProviderPlugin",
     "version": 1,
-    "authors": [],
-    "description": "",
+    "authors": [
+      "robertozv80"
+    ],
+    "description": "SeriesDonghuaProvider - Donghua/Anime provider",
     "language": "es",
     "types": [
       "Anime"
