@@ -16,3 +16,8 @@ allprojects {
         maven("https://jitpack.io")
     }
 }
+
+subprojects {
+    apply(plugin = "com.android.library")
+    apply(plugin = "com.lagradost.cloudstream.gradle")
+}
