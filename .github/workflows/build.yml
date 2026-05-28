@@ -34,11 +34,13 @@ jobs:
         run: |
           mkdir -p deploy
           find . -name "*.cs3" -exec cp {} deploy/ \;
+
           if [ -f build/plugins.json ]; then
             cp build/plugins.json deploy/plugins.json
           else
-            find . -name "plugins.json" -exec cp {} deploy/ \; 2>/dev/null || true
+            find . -name "plugins.json" -not -path "*/deploy/*" -exec cp {} deploy/ \; 2>/dev/null || true
           fi
+
           cp repo.json deploy/repo.json
           echo "=== Deploy contents ==="
           ls -la deploy/
