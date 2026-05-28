@@ -45,17 +45,15 @@ jobs:
           for f in sorted(glob.glob('*.cs3')):
               with zipfile.ZipFile(f, 'r') as z:
                   manifest = json.loads(z.read('manifest.json'))
-                  print(f'=== {f} manifest ===')
-                  print(json.dumps(manifest, indent=2))
                   entry = {
                       'name': manifest.get('name', os.path.splitext(f)[0]),
                       'url': 'https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/' + f,
-                      'api': manifest.get('api', ''),
+                      'api': manifest.get('pluginClassName', ''),
                       'version': manifest.get('version', 1),
-                      'authors': manifest.get('authors', []),
-                      'description': manifest.get('description', ''),
-                      'language': manifest.get('language', 'es'),
-                      'types': manifest.get('types', ['Anime'])
+                      'authors': ['robertozv80'],
+                      'description': manifest.get('name', '') + ' - Donghua/Anime provider',
+                      'language': 'es',
+                      'types': ['Anime']
                   }
                   plugins.append(entry)
           with open('plugins.json', 'w') as out:
