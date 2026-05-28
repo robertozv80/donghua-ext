@@ -10,3 +10,7 @@ cloudstream {
 
     iconUrl = "https://www.google.com/s2/favicons?domain=animegratis.net&sz=%size%"
 }
+
+dependencies {
+    implementation("org.jsoup:jsoup:1.18.3")
+}
