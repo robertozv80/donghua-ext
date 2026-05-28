@@ -47,7 +47,13 @@ jobs:
               name = os.path.splitext(f)[0]
               plugins.append({
                   'name': name,
-                  'url': 'https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/' + f
+                  'url': 'https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/' + f,
+                  'api': 'com.donghuaext.' + name,
+                  'version': 1,
+                  'authors': ['robertozv80'],
+                  'description': name + ' - Donghua/Anime provider',
+                  'language': 'es',
+                  'types': ['Anime']
               })
           with open('plugins.json', 'w') as out:
               json.dump(plugins, out, indent=2)
