@@ -30,8 +30,19 @@ jobs:
       - name: Build Plugins
         run: ./gradlew make
 
-      - name: Copy repo.json to build
-        run: cp repo.json build/repo.json
+      - name: Find build output
+        run: find . -name "*.cs3" -o -name "plugins.json" | head -20
+
+      - name: Copy repo.json to build output
+        run: |
+          BUILD_DIR=$(find . -name "plugins.json" -exec dirname {} \; | head -1)
+          if [ -z "$BUILD_DIR" ]; then
+            BUILD_DIR="build"
+            mkdir -p "$BUILD_DIR"
+          fi
+          cp repo.json "$BUILD_DIR/repo.json"
+          echo "Build directory: $BUILD_DIR"
+          ls -la "$BUILD_DIR"
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
