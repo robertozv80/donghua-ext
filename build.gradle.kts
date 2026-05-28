@@ -16,9 +16,3 @@ allprojects {
         maven("https://jitpack.io")
     }
 }
-
-apply(plugin = "com.lagradost.cloudstream.gradle")
-
-cloudstream {
-    repositoryUrl = "https://github.com/robertozv80/donghua-ext"
-}
