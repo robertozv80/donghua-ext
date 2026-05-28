@@ -1,6 +1,18 @@
 [
-  {"name":"AnimeGratisProvider","url":"https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/AnimeGratisProvider.cs3"},
-  {"name":"DonghuaLifeProvider","url":"https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/DonghuaLifeProvider.cs3"},
-  {"name":"MundoDonghuaProvider","url":"https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/MundoDonghuaProvider.cs3"},
-  {"name":"SeriesDonghuaProvider","url":"https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/SeriesDonghuaProvider.cs3"}
+  {
+    "name": "AnimeGratisProvider",
+    "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/AnimeGratisProvider.cs3"
+  },
+  {
+    "name": "DonghuaLifeProvider",
+    "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/DonghuaLifeProvider.cs3"
+  },
+  {
+    "name": "MundoDonghuaProvider",
+    "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/MundoDonghuaProvider.cs3"
+  },
+  {
+    "name": "SeriesDonghuaProvider",
+    "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/SeriesDonghuaProvider.cs3"
+  }
 ]
