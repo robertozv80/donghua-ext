@@ -1,5 +1,7 @@
 {
   "name": "Donghua Extensions",
+  "description": "Donghua y Anime en español",
+  "manifestVersion": 1,
   "pluginLists": [
     "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/plugins.json"
   ]

@@ -40,22 +40,31 @@ jobs:
         run: |
           cd deploy
           python3 -c "
-          import json, glob, os, zipfile
+          import json, glob, os, zipfile, hashlib
           plugins = []
           for f in sorted(glob.glob('*.cs3')):
+              file_size = os.path.getsize(f)
               with zipfile.ZipFile(f, 'r') as z:
                   manifest = json.loads(z.read('manifest.json'))
-                  entry = {
-                      'name': manifest.get('name', os.path.splitext(f)[0]),
-                      'url': 'https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/' + f,
-                      'api': manifest.get('pluginClassName', ''),
-                      'version': manifest.get('version', 1),
-                      'authors': ['robertozv80'],
-                      'description': manifest.get('name', '') + ' - Donghua/Anime provider',
-                      'language': 'es',
-                      'types': ['Anime']
-                  }
-                  plugins.append(entry)
+              with open(f, 'rb') as fh:
+                  file_hash = 'sha256-' + hashlib.sha256(fh.read()).hexdigest()
+              name = manifest.get('name', os.path.splitext(f)[0])
+              entry = {
+                  'url': 'https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/' + f,
+                  'status': 1,
+                  'version': manifest.get('version', 1),
+                  'apiVersion': 1,
+                  'name': name,
+                  'internalName': name,
+                  'authors': ['robertozv80'],
+                  'description': name + ' - Donghua/Anime provider',
+                  'repositoryUrl': 'https://github.com/robertozv80/donghua-ext',
+                  'language': 'es',
+                  'tvTypes': ['Anime'],
+                  'fileSize': file_size,
+                  'fileHash': file_hash
+              }
+              plugins.append(entry)
           with open('plugins.json', 'w') as out:
               json.dump(plugins, out, indent=2)
           print('=== Final plugins.json ===')
