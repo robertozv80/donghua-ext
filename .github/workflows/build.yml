@@ -30,17 +30,35 @@ jobs:
       - name: Build Plugins
         run: ./gradlew make
 
+      - name: Find all generated files
+        run: |
+          echo "=== Searching for .cs3 files ==="
+          find . -name "*.cs3"
+          echo "=== Searching for plugins.json ==="
+          find . -name "plugins.json"
+          echo "=== Searching for manifest.json ==="
+          find . -name "manifest.json"
+
+      - name: Inspect cs3 files
+        run: |
+          for f in $(find . -name "*.cs3"); do
+            echo "=== Contents of $f ==="
+            unzip -l "$f"
+          done
+
       - name: Prepare deploy directory
         run: |
           mkdir -p deploy
           find . -name "*.cs3" -exec cp {} deploy/ \;
-          cp repo.json deploy/repo.json
-          ls -la deploy/
-
-      - name: Generate plugins.json
-        run: |
-          cd deploy
-          python3 -c "
+          
+          GRADLE_PLUGINS=$(find . -name "plugins.json" | head -1)
+          if [ -n "$GRADLE_PLUGINS" ]; then
+            echo "Using Gradle-generated plugins.json from: $GRADLE_PLUGINS"
+            cp "$GRADLE_PLUGINS" deploy/plugins.json
+          else
+            echo "No Gradle plugins.json found, generating manually"
+            cd deploy
+            python3 -c "
           import json, glob, os
           plugins = []
           for f in sorted(glob.glob('*.cs3')):
@@ -58,7 +76,14 @@ jobs:
           with open('plugins.json', 'w') as out:
               json.dump(plugins, out, indent=2)
           "
-          cat plugins.json
+            cd ..
+          fi
+          
+          cp repo.json deploy/repo.json
+          echo "=== Deploy directory contents ==="
+          ls -la deploy/
+          echo "=== plugins.json ==="
+          cat deploy/plugins.json
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
