@@ -25,6 +25,7 @@ subprojects {
     apply(plugin = "com.lagradost.cloudstream3.gradle")
 
     configure<LibraryExtension> {
+        namespace = "com.donghuaext"
         compileSdk = 36
         defaultConfig {
             minSdk = 21
