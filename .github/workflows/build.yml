@@ -40,19 +40,18 @@ jobs:
       - name: Generate plugins.json
         run: |
           cd deploy
-          echo '[' > plugins.json
-          first=true
-          for f in *.cs3; do
-            if [ "$first" = true ]; then
-              first=false
-            else
-              echo ',' >> plugins.json
-            fi
-            name="${f%.cs3}"
-            echo -n "  {\"name\":\"$name\",\"url\":\"https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/$f\"}" >> plugins.json
-          done
-          echo '' >> plugins.json
-          echo ']' >> plugins.json
+          python3 -c "
+          import json, glob, os
+          plugins = []
+          for f in sorted(glob.glob('*.cs3')):
+              name = os.path.splitext(f)[0]
+              plugins.append({
+                  'name': name,
+                  'url': 'https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/' + f
+              })
+          with open('plugins.json', 'w') as out:
+              json.dump(plugins, out, indent=2)
+          "
           cat plugins.json
 
       - name: Deploy to GitHub Pages
