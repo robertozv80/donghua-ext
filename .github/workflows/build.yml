@@ -52,7 +52,7 @@ jobs:
             echo -n "  {\"name\":\"$name\",\"url\":\"https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/$f\"}" >> plugins.json
           done
           echo '' >> plugins.json
-          ']' >> plugins.json
+          echo ']' >> plugins.json
           cat plugins.json
 
       - name: Deploy to GitHub Pages
