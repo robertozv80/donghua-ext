@@ -30,23 +30,34 @@ jobs:
       - name: Build Plugins
         run: ./gradlew make
 
-      - name: Find build output
-        run: find . -name "*.cs3" -o -name "plugins.json" | head -20
-
-      - name: Copy repo.json to build output
+      - name: Prepare deploy directory
         run: |
-          BUILD_DIR=$(find . -name "plugins.json" -exec dirname {} \; | head -1)
-          if [ -z "$BUILD_DIR" ]; then
-            BUILD_DIR="build"
-            mkdir -p "$BUILD_DIR"
-          fi
-          cp repo.json "$BUILD_DIR/repo.json"
-          echo "Build directory: $BUILD_DIR"
-          ls -la "$BUILD_DIR"
+          mkdir -p deploy
+          find . -name "*.cs3" -exec cp {} deploy/ \;
+          cp repo.json deploy/repo.json
+          ls -la deploy/
+
+      - name: Generate plugins.json
+        run: |
+          cd deploy
+          echo '[' > plugins.json
+          first=true
+          for f in *.cs3; do
+            if [ "$first" = true ]; then
+              first=false
+            else
+              echo ',' >> plugins.json
+            fi
+            name="${f%.cs3}"
+            echo -n "  {\"name\":\"$name\",\"url\":\"https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/$f\"}" >> plugins.json
+          done
+          echo '' >> plugins.json
+          ']' >> plugins.json
+          cat plugins.json
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./build
+          publish_dir: ./deploy
           publish_branch: builds
