@@ -1,3 +1,5 @@
+import com.android.build.api.dsl.LibraryExtension
+
 buildscript {
     repositories {
         google()
@@ -21,4 +23,11 @@ allprojects {
 subprojects {
     apply(plugin = "com.android.library")
     apply(plugin = "com.lagradost.cloudstream3.gradle")
+
+    configure<LibraryExtension> {
+        compileSdk = 36
+        defaultConfig {
+            minSdk = 21
+        }
+    }
 }
