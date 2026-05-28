@@ -1,0 +1,9 @@
+{
+  "name": "Donghua Extensions",
+  "pluginLists": [
+    {
+      "name": "Donghua Plugins",
+      "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/plugins.json"
+    }
+  ]
+}
