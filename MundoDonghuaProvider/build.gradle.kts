@@ -12,5 +12,5 @@ cloudstream {
 }
 
 dependencies {
-    implementation("org.jsoup:jsoup:1.18.3")
+    add("implementation", "org.jsoup:jsoup:1.18.3")
 }
