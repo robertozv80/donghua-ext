@@ -1,78 +1,78 @@
 [
-  {
-    "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/AnimeGratisProvider.cs3",
-    "status": 1,
-    "version": 1,
-    "apiVersion": 1,
-    "name": "AnimeGratisProvider",
-    "internalName": "AnimeGratisProvider",
-    "authors": [
-      "robertozv80"
-    ],
-    "description": "AnimeGratisProvider - Donghua/Anime provider",
-    "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
-    "language": "es",
-    "tvTypes": [
-      "Anime"
-    ],
-    "fileSize": 13905,
-    "fileHash": "sha256-09506e04da8931ab8366e18e33e8a20345e22da49bd73e0955b3daa7df9898f6"
-  },
-  {
-    "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/DonghuaLifeProvider.cs3",
-    "status": 1,
-    "version": 1,
-    "apiVersion": 1,
-    "name": "DonghuaLifeProvider",
-    "internalName": "DonghuaLifeProvider",
-    "authors": [
-      "robertozv80"
-    ],
-    "description": "DonghuaLifeProvider - Donghua/Anime provider",
-    "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
-    "language": "es",
-    "tvTypes": [
-      "Anime"
-    ],
-    "fileSize": 13892,
-    "fileHash": "sha256-2fbe8841702337ef0f46c93019cad30a8bc9c93fc92f3390fcb9f2603ec36f47"
-  },
-  {
-    "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/MundoDonghuaProvider.cs3",
-    "status": 1,
-    "version": 1,
-    "apiVersion": 1,
-    "name": "MundoDonghuaProvider",
-    "internalName": "MundoDonghuaProvider",
-    "authors": [
-      "robertozv80"
-    ],
-    "description": "MundoDonghuaProvider - Donghua/Anime provider",
-    "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
-    "language": "es",
-    "tvTypes": [
-      "Anime"
-    ],
-    "fileSize": 13758,
-    "fileHash": "sha256-b70531b18703b953caee11cfb42d619387f71b6029fdb2b8b9a9a8431db14237"
-  },
-  {
-    "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/SeriesDonghuaProvider.cs3",
-    "status": 1,
-    "version": 1,
-    "apiVersion": 1,
-    "name": "SeriesDonghuaProvider",
-    "internalName": "SeriesDonghuaProvider",
-    "authors": [
-      "robertozv80"
-    ],
-    "description": "SeriesDonghuaProvider - Donghua/Anime provider",
-    "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
-    "language": "es",
-    "tvTypes": [
-      "Anime"
-    ],
-    "fileSize": 13909,
-    "fileHash": "sha256-4c2b2dfaf0cdd1bb855201760a6d42aca54ed0edb5f3f660b9b357d2726a2667"
-  }
+    {
+        "url": "",
+        "status": 1,
+        "version": 1,
+        "name": "AnimeGratisProvider",
+        "internalName": "AnimeGratisProvider",
+        "authors": [
+            "robertozv80"
+        ],
+        "description": "AnimeGratis - Anime y donghua en espa\u00f1ol gratis",
+        "fileSize": 13802,
+        "language": "es",
+        "tvTypes": [
+            "Anime"
+        ],
+        "iconUrl": "https://www.google.com/s2/favicons?domain=animegratis.net&sz=%size%",
+        "apiVersion": 1,
+        "fileHash": "sha256-e57259f03d28983b4b2a219abe652bf07a6c9d8e920f7660fd731af4c881b120"
+    },
+    {
+        "url": "",
+        "status": 1,
+        "version": 1,
+        "name": "DonghuaLifeProvider",
+        "internalName": "DonghuaLifeProvider",
+        "authors": [
+            "robertozv80"
+        ],
+        "description": "DonghuaLife - Donghuas en espa\u00f1ol con subt\u00edtulos",
+        "fileSize": 13793,
+        "language": "es",
+        "tvTypes": [
+            "Anime"
+        ],
+        "iconUrl": "https://www.google.com/s2/favicons?domain=donghualife.com&sz=%size%",
+        "apiVersion": 1,
+        "fileHash": "sha256-8efad0b77dd4b10abe3db958484b335938da3fd177bdb8aa81d17206f93767fb"
+    },
+    {
+        "url": "",
+        "status": 1,
+        "version": 1,
+        "name": "MundoDonghuaProvider",
+        "internalName": "MundoDonghuaProvider",
+        "authors": [
+            "robertozv80"
+        ],
+        "description": "MundoDonghua - Donghuas y anime chino en espa\u00f1ol",
+        "fileSize": 13617,
+        "language": "es",
+        "tvTypes": [
+            "Anime"
+        ],
+        "iconUrl": "https://www.google.com/s2/favicons?domain=mundodonghua.com&sz=%size%",
+        "apiVersion": 1,
+        "fileHash": "sha256-182570e62839b04a8ae2160af932ac4808ec0f16c41f569316ee95bbb157f6d5"
+    },
+    {
+        "url": "",
+        "status": 1,
+        "version": 1,
+        "name": "SeriesDonghuaProvider",
+        "internalName": "SeriesDonghuaProvider",
+        "authors": [
+            "robertozv80"
+        ],
+        "description": "SeriesDonghua - Donghuas y anime chino en espa\u00f1ol",
+        "fileSize": 13811,
+        "language": "es",
+        "tvTypes": [
+            "Anime"
+        ],
+        "iconUrl": "https://www.google.com/s2/favicons?domain=seriesdonghua.com&sz=%size%",
+        "apiVersion": 1,
+        "fileHash": "sha256-a02adbc18fc61f5da9dc6bb7d8b4a65aeea0e79f9be40e51333daf7af9102c11"
+    }
 ]
