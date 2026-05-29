@@ -12,5 +12,6 @@ cloudstream {
 }
 
 dependencies {
+    add("cloudstream", "com.lagradost:cloudstream3:pre-release")
     add("implementation", "org.jsoup:jsoup:1.18.3")
 }
