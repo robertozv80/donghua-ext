@@ -29,14 +29,14 @@
       "robertozv80"
     ],
     "description": "DonghuaLife - Donghuas en espa\u00f1ol con subt\u00edtulos",
-    "fileSize": 13793,
+    "fileSize": 14071,
     "language": "es",
     "tvTypes": [
       "Anime"
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=donghualife.com&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-8efad0b77dd4b10abe3db958484b335938da3fd177bdb8aa81d17206f93767fb",
+    "fileHash": "sha256-4320c5dff8479b0fc14241194965b95e7b7a870ba70f55303a3743bbed6a08fd",
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext"
   },
   {
