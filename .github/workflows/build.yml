@@ -30,17 +30,31 @@ jobs:
       - name: Build Plugins
         run: ./gradlew make makePluginsJson
 
+      - name: Fix plugins.json URLs
+        run: |
+          BASE_URL="https://raw.githubusercontent.com/${{ github.repository }}/builds"
+          REPO_URL="https://github.com/${{ github.repository }}"
+          
+          python3 -c "
+          import json
+          with open('build/plugins.json', 'r') as f:
+              plugins = json.load(f)
+          for p in plugins:
+              p['url'] = '$BASE_URL/' + p['internalName'] + '.cs3'
+              p['repositoryUrl'] = '$REPO_URL'
+          with open('build/plugins.json', 'w') as f:
+              json.dump(plugins, f, indent=2)
+          "
+          
+          echo "=== Fixed plugins.json ==="
+          cat build/plugins.json
+
       - name: Prepare deploy directory
         run: |
           mkdir -p deploy
           find . -name "*.cs3" -exec cp {} deploy/ \;
 
-          if [ -f build/plugins.json ]; then
-            cp build/plugins.json deploy/plugins.json
-          else
-            find . -name "plugins.json" -not -path "*/deploy/*" -exec cp {} deploy/ \; 2>/dev/null || true
-          fi
-
+          cp build/plugins.json deploy/plugins.json
           cp repo.json deploy/repo.json
           echo "=== Deploy contents ==="
           ls -la deploy/
