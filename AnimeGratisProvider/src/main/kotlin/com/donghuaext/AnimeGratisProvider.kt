@@ -4,7 +4,6 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import org.jsoup.Jsoup
 
 class AnimeGratisProvider : MainAPI() {
     override var mainUrl = "https://animegratis.net"
@@ -23,9 +22,9 @@ class AnimeGratisProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) request.data else "${request.data}/page/$page"
         val doc = app.get(url).document
-        val items = doc.select("article, .post-item, .item").mapNotNull { el ->
+        val items = doc.select("article, .post-item, .item, div.item").mapNotNull { el ->
             val a = el.selectFirst("a") ?: return@mapNotNull null
-            val title = a.attr("title").ifBlank { a.text() }
+            val title = a.attr("title").ifBlank { el.selectFirst("h2, h3, h5")?.text() ?: a.text() }
             val href = a.attr("abs:href")
             val poster = el.selectFirst("img")?.attr("abs:src")
             if (title.isNotBlank() && href.isNotBlank()) {
@@ -39,9 +38,9 @@ class AnimeGratisProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val doc = app.get("$mainUrl/?s=$query").document
-        return doc.select("article, .post-item, .item").mapNotNull { el ->
+        return doc.select("article, .post-item, .item, div.item").mapNotNull { el ->
             val a = el.selectFirst("a") ?: return@mapNotNull null
-            val title = a.attr("title").ifBlank { a.text() }
+            val title = a.attr("title").ifBlank { el.selectFirst("h2, h3, h5")?.text() ?: a.text() }
             val href = a.attr("abs:href")
             val poster = el.selectFirst("img")?.attr("abs:src")
             if (title.isNotBlank() && href.isNotBlank()) {
@@ -55,10 +54,12 @@ class AnimeGratisProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url).document
         val title = doc.selectFirst("h1, .entry-title")?.text() ?: ""
-        val poster = doc.selectFirst("img.wp-post-image, .poster img")?.attr("abs:src")
+        val poster = doc.selectFirst("img.wp-post-image, .poster img, meta[property=og:image]")?.let {
+            if (it.tagName() == "meta") it.attr("content") else it.attr("abs:src")
+        }
         val description = doc.selectFirst(".entry-content, .synopsis, .descripcion")?.text()
 
-        val episodes = doc.select(".episode-list a, .episodios a, .capitulos a, .eplister a").mapNotNull { el ->
+        val episodes = doc.select(".episode-list a, .episodios a, .capitulos a, .eplister a, ul.donghua-list a").mapNotNull { el ->
             val epName = el.text()
             val epUrl = el.attr("abs:href")
             if (epUrl.isNotBlank()) {
@@ -82,7 +83,7 @@ class AnimeGratisProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data).document
 
-        val iframes = doc.select("iframe").mapNotNull { it.attr("abs:src") }
+        val iframes = doc.select("iframe").mapNotNull { it.attr("abs:src").ifBlank { null } }
         for (iframeSrc in iframes) {
             try {
                 val iframeDoc = app.get(iframeSrc, referer = data).document
@@ -108,11 +109,7 @@ class AnimeGratisProvider : MainAPI() {
 
                 for (videoUrl in videoUrls) {
                     callback(
-                        newExtractorLink(
-                            source = name,
-                            name = "Video",
-                            url = videoUrl
-                        ) {
+                        newExtractorLink(source = name, name = "Video", url = videoUrl) {
                             this.referer = iframeSrc
                             this.quality = Qualities.Unknown.value
                             this.headers = mapOf("Referer" to iframeSrc)
@@ -126,11 +123,7 @@ class AnimeGratisProvider : MainAPI() {
             val src = el.attr("abs:src")
             if (src.isNotBlank()) {
                 callback(
-                    newExtractorLink(
-                        source = name,
-                        name = "Direct",
-                        url = src
-                    ) {
+                    newExtractorLink(source = name, name = "Direct", url = src) {
                         this.referer = data
                         this.quality = Qualities.Unknown.value
                     }
