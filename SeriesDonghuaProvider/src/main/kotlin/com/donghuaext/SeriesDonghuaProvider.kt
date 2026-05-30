@@ -4,7 +4,6 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import org.jsoup.Jsoup
 
 class SeriesDonghuaProvider : MainAPI() {
     override var mainUrl = "https://seriesdonghua.com"
@@ -15,20 +14,19 @@ class SeriesDonghuaProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime)
 
     override val mainPage = mainPageOf(
-        "$mainUrl" to "Inicio",
-        "$mainUrl/genre/donghua" to "Donghua",
-        "$mainUrl/genre/anime" to "Anime"
+        "$mainUrl/todos-los-donghuas" to "Donghuas",
+        "$mainUrl/donghuas-en-emision" to "En Emisión"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page == 1) request.data else "${request.data}/page/$page"
+        val url = if (page == 1) request.data else "${request.data}?pag=$page"
         val doc = app.get(url).document
-        val items = doc.select("article, .post-item, .item").mapNotNull { el ->
-            val a = el.selectFirst("a") ?: return@mapNotNull null
-            val title = a.attr("title").ifBlank { a.text() }
+        val items = doc.select("div.item").mapNotNull { el ->
+            val a = el.selectFirst("a.angled-img") ?: return@mapNotNull null
+            val title = el.selectFirst("h5")?.text() ?: return@mapNotNull null
             val href = a.attr("abs:href")
-            val poster = el.selectFirst("img")?.attr("abs:src")
-            if (title.isNotBlank() && href.isNotBlank()) {
+            val poster = el.selectFirst("div.img img")?.attr("abs:src")
+            if (href.isNotBlank()) {
                 newAnimeSearchResponse(title, href) {
                     this.posterUrl = poster
                 }
@@ -39,12 +37,12 @@ class SeriesDonghuaProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val doc = app.get("$mainUrl/?s=$query").document
-        return doc.select("article, .post-item, .item").mapNotNull { el ->
-            val a = el.selectFirst("a") ?: return@mapNotNull null
-            val title = a.attr("title").ifBlank { a.text() }
+        return doc.select("div.item").mapNotNull { el ->
+            val a = el.selectFirst("a.angled-img") ?: return@mapNotNull null
+            val title = el.selectFirst("h5")?.text() ?: return@mapNotNull null
             val href = a.attr("abs:href")
-            val poster = el.selectFirst("img")?.attr("abs:src")
-            if (title.isNotBlank() && href.isNotBlank()) {
+            val poster = el.selectFirst("div.img img")?.attr("abs:src")
+            if (href.isNotBlank()) {
                 newAnimeSearchResponse(title, href) {
                     this.posterUrl = poster
                 }
@@ -54,12 +52,11 @@ class SeriesDonghuaProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url).document
-        val title = doc.selectFirst("h1, .entry-title")?.text() ?: ""
-        val poster = doc.selectFirst("img.wp-post-image, .poster img")?.attr("abs:src")
-        val description = doc.selectFirst(".entry-content, .synopsis, .descripcion")?.text()
-
-        val episodes = doc.select(".episode-list a, .episodios a, .capitulos a, .eplister a").mapNotNull { el ->
-            val epName = el.text()
+        val title = doc.selectFirst("div.ls-title-serie")?.text() ?: ""
+        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
+        val description = doc.selectFirst("div.text-justify.fc-dark")?.text()
+        val episodes = doc.select("ul.donghua-list > a").mapNotNull { el ->
+            val epName = el.selectFirst("blockquote")?.text() ?: el.text()
             val epUrl = el.attr("abs:href")
             if (epUrl.isNotBlank()) {
                 newEpisode(epUrl) {
@@ -67,7 +64,6 @@ class SeriesDonghuaProvider : MainAPI() {
                 }
             } else null
         }
-
         return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
             this.posterUrl = poster
             this.plot = description
@@ -82,55 +78,38 @@ class SeriesDonghuaProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data).document
 
-        val iframes = doc.select("iframe").mapNotNull { it.attr("abs:src") }
-        for (iframeSrc in iframes) {
-            try {
-                val iframeDoc = app.get(iframeSrc, referer = data).document
-                val videoUrls = mutableListOf<String>()
-
-                iframeDoc.select("source, video source").forEach { el ->
-                    val src = el.attr("abs:src")
-                    if (src.isNotBlank()) videoUrls.add(src)
-                }
-                iframeDoc.select("video").forEach { el ->
-                    val src = el.attr("abs:src")
-                    if (src.isNotBlank()) videoUrls.add(src)
-                }
-
-                iframeDoc.select("script").forEach { script ->
-                    val content = script.html()
-                    val regex = Regex("""file\s*[:=]\s*["']([^"']+)["']""")
-                    regex.findAll(content).forEach { match ->
-                        val videoUrl = match.groupValues[1]
-                        if (videoUrl.startsWith("http")) videoUrls.add(videoUrl)
+        doc.select("script").forEach { script ->
+            val content = script.html()
+            if (content.contains("VIDEO_MAP_JSON")) {
+                val jsonRegex = Regex("""VIDEO_MAP_JSON\s*=\s*\{([^}]+)\}""")
+                val match = jsonRegex.find(content)
+                if (match != null) {
+                    val jsonStr = match.groupValues[1]
+                    val pairRegex = Regex(""""(\w+)"\s*:\s*"([^"]+)"""")
+                    pairRegex.findAll(jsonStr).forEach { pairMatch ->
+                        val serverName = pairMatch.groupValues[1]
+                        var videoUrl = pairMatch.groupValues[2]
+                        if (serverName == "asura" && !videoUrl.startsWith("http")) {
+                            videoUrl = "https://www.dailymotion.com/embed/video/$videoUrl"
+                        }
+                        if (videoUrl.startsWith("http")) {
+                            callback(
+                                newExtractorLink(source = name, name = serverName.replaceFirstChar { it.uppercase() }, url = videoUrl) {
+                                    this.referer = data
+                                    this.quality = Qualities.Unknown.value
+                                }
+                            )
+                        }
                     }
                 }
-
-                for (videoUrl in videoUrls) {
-                    callback(
-                        newExtractorLink(
-                            source = name,
-                            name = "Video",
-                            url = videoUrl
-                        ) {
-                            this.referer = iframeSrc
-                            this.quality = Qualities.Unknown.value
-                            this.headers = mapOf("Referer" to iframeSrc)
-                        }
-                    )
-                }
-            } catch (_: Exception) {}
+            }
         }
 
-        doc.select("video source, video").forEach { el ->
+        doc.select("iframe").forEach { el ->
             val src = el.attr("abs:src")
             if (src.isNotBlank()) {
                 callback(
-                    newExtractorLink(
-                        source = name,
-                        name = "Direct",
-                        url = src
-                    ) {
+                    newExtractorLink(source = name, name = "Embed", url = src) {
                         this.referer = data
                         this.quality = Qualities.Unknown.value
                     }
