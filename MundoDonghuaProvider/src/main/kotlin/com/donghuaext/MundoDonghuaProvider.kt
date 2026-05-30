@@ -4,7 +4,6 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import org.jsoup.Jsoup
 
 class MundoDonghuaProvider : MainAPI() {
     override var mainUrl = "https://mundodonghua.com"
@@ -15,19 +14,19 @@ class MundoDonghuaProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime)
 
     override val mainPage = mainPageOf(
-        "$mainUrl/donghuas" to "Donghuas",
-        "$mainUrl/emision" to "En Emisión"
+        "$mainUrl/lista-donghuas" to "Donghuas",
+        "$mainUrl/lista-donghuas-emision" to "En Emisión"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page == 1) request.data else "${request.data}/page/$page"
+        val url = if (page == 1) request.data else "${request.data}/$page"
         val doc = app.get(url).document
-        val items = doc.select("article, .donghua-item").mapNotNull { el ->
+        val items = doc.select("div.md-card").mapNotNull { el ->
             val a = el.selectFirst("a") ?: return@mapNotNull null
-            val title = a.text()
+            val title = el.selectFirst("h3.md-card-title")?.text() ?: return@mapNotNull null
             val href = a.attr("abs:href")
-            val poster = el.selectFirst("img")?.attr("abs:src")
-            if (title.isNotBlank() && href.isNotBlank()) {
+            val poster = el.selectFirst("div.md-card-img img")?.attr("abs:src")
+            if (href.isNotBlank()) {
                 newAnimeSearchResponse(title, href) {
                     this.posterUrl = poster
                 }
@@ -37,13 +36,13 @@ class MundoDonghuaProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val doc = app.get("$mainUrl/?s=$query").document
-        return doc.select("article, .donghua-item").mapNotNull { el ->
+        val doc = app.get("$mainUrl/busquedas/?donghua=$query").document
+        return doc.select("div.md-card").mapNotNull { el ->
             val a = el.selectFirst("a") ?: return@mapNotNull null
-            val title = a.text()
+            val title = el.selectFirst("h3.md-card-title")?.text() ?: return@mapNotNull null
             val href = a.attr("abs:href")
-            val poster = el.selectFirst("img")?.attr("abs:src")
-            if (title.isNotBlank() && href.isNotBlank()) {
+            val poster = el.selectFirst("div.md-card-img img")?.attr("abs:src")
+            if (href.isNotBlank()) {
                 newAnimeSearchResponse(title, href) {
                     this.posterUrl = poster
                 }
@@ -53,11 +52,11 @@ class MundoDonghuaProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url).document
-        val title = doc.selectFirst("h1, .entry-title")?.text() ?: ""
-        val poster = doc.selectFirst("img.wp-post-image, .poster img")?.attr("abs:src")
-        val description = doc.selectFirst(".entry-content, .synopsis, .descripcion")?.text()
-        val episodes = doc.select(".episode-list a, .episodios a, .capitulos a").mapNotNull { el ->
-            val epName = el.text()
+        val title = doc.selectFirst("h1.md-detail-title")?.text() ?: ""
+        val poster = doc.selectFirst("div.md-detail-poster img")?.attr("abs:src")
+        val description = doc.selectFirst("p.md-detail-synopsis")?.text()
+        val episodes = doc.select("a.md-ep-link").mapNotNull { el ->
+            val epName = el.selectFirst("h5")?.text() ?: el.text()
             val epUrl = el.attr("abs:href")
             if (epUrl.isNotBlank()) {
                 newEpisode(epUrl) {
@@ -79,55 +78,45 @@ class MundoDonghuaProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data).document
 
-        val iframes = doc.select("iframe").mapNotNull { it.attr("abs:src") }
+        val iframes = doc.select("iframe").mapNotNull { it.attr("abs:src").ifBlank { null } }
         for (iframeSrc in iframes) {
             try {
                 val iframeDoc = app.get(iframeSrc, referer = data).document
-                val videoUrls = mutableListOf<String>()
-
                 iframeDoc.select("source, video source").forEach { el ->
                     val src = el.attr("abs:src")
-                    if (src.isNotBlank()) videoUrls.add(src)
-                }
-                iframeDoc.select("video").forEach { el ->
-                    val src = el.attr("abs:src")
-                    if (src.isNotBlank()) videoUrls.add(src)
-                }
-
-                iframeDoc.select("script").forEach { script ->
-                    val content = script.html()
-                    val regex = Regex("""file\s*[:=]\s*["']([^"']+)["']""")
-                    regex.findAll(content).forEach { match ->
-                        val videoUrl = match.groupValues[1]
-                        if (videoUrl.startsWith("http")) videoUrls.add(videoUrl)
+                    if (src.isNotBlank()) {
+                        callback(
+                            newExtractorLink(source = name, name = "Video", url = src) {
+                                this.referer = iframeSrc
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
                     }
                 }
+            } catch (_: Exception) {}
+        }
 
-                for (videoUrl in videoUrls) {
+        doc.select("script").forEach { script ->
+            val content = script.html()
+            val regex = Regex("""(?:file|src|source)\s*[:=]\s*["']([^"']+)["']""")
+            regex.findAll(content).forEach { match ->
+                val videoUrl = match.groupValues[1]
+                if (videoUrl.startsWith("http")) {
                     callback(
-                        newExtractorLink(
-                            source = name,
-                            name = "Video",
-                            url = videoUrl
-                        ) {
-                            this.referer = iframeSrc
+                        newExtractorLink(source = name, name = "Video", url = videoUrl) {
+                            this.referer = data
                             this.quality = Qualities.Unknown.value
-                            this.headers = mapOf("Referer" to iframeSrc)
                         }
                     )
                 }
-            } catch (_: Exception) {}
+            }
         }
 
         doc.select("video source, video").forEach { el ->
             val src = el.attr("abs:src")
             if (src.isNotBlank()) {
                 callback(
-                    newExtractorLink(
-                        source = name,
-                        name = "Direct",
-                        url = src
-                    ) {
+                    newExtractorLink(source = name, name = "Direct", url = src) {
                         this.referer = data
                         this.quality = Qualities.Unknown.value
                     }
