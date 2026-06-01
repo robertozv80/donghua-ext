@@ -9,14 +9,14 @@
       "robertozv80"
     ],
     "description": "AnimeGratis - Anime y donghua en espa\u00f1ol gratis",
-    "fileSize": 14140,
+    "fileSize": 14125,
     "language": "es",
     "tvTypes": [
       "Anime"
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=animegratis.net&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-c13df6d5b1d606d27bfae35aeb9c1704e5589ba27dd0f8f352871e582f6d2f9a",
+    "fileHash": "sha256-373306d3f28615a9a62c655e61bf241d3632dcd1617a5ff04dbd06d7652bfcaa",
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext"
   },
   {
@@ -29,14 +29,14 @@
       "robertozv80"
     ],
     "description": "DonghuaLife - Donghuas en espa\u00f1ol con subt\u00edtulos",
-    "fileSize": 14071,
+    "fileSize": 14059,
     "language": "es",
     "tvTypes": [
       "Anime"
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=donghualife.com&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-4320c5dff8479b0fc14241194965b95e7b7a870ba70f55303a3743bbed6a08fd",
+    "fileHash": "sha256-2fa0d07c2f39f8d9e1117bcfb40a11ac8f6b79c169f17dda2b22b554e72652c4",
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext"
   },
   {
@@ -49,14 +49,14 @@
       "robertozv80"
     ],
     "description": "MundoDonghua - Donghuas y anime chino en espa\u00f1ol",
-    "fileSize": 14822,
+    "fileSize": 14847,
     "language": "es",
     "tvTypes": [
       "Anime"
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=mundodonghua.com&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-d2da63dd445b7319a5c2e8ce2061ff04536f3102195efc6240653bf6520cb932",
+    "fileHash": "sha256-378b85737399a9ecd4b477af9e6e4c8d54cc66b14e98c89027fd13fd9dc6b418",
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext"
   },
   {
@@ -69,14 +69,14 @@
       "robertozv80"
     ],
     "description": "SeriesDonghua - Donghuas y anime chino en espa\u00f1ol",
-    "fileSize": 13440,
+    "fileSize": 13442,
     "language": "es",
     "tvTypes": [
       "Anime"
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=seriesdonghua.com&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-ca20a6d9ad0f50663d2b30b0a4985313ab389a7f928fe02d40c2396dcd5fb8eb",
+    "fileHash": "sha256-4735f4e738fd840bce7462b17eda6414df27a5475bc8a0c5c367f62337373b36",
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext"
   }
 ]
