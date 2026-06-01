@@ -1,10 +1,10 @@
 package com.donghuaext
 
-import com.lagradost.cloudstream3.plugins.BasePlugin
+import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 
 @CloudstreamPlugin
-class DonghuaLifeProviderPlugin : BasePlugin() {
+class DonghuaLifeProviderPlugin : Plugin() {
     override fun load() {
         registerMainAPI(DonghuaLifeProvider())
     }
