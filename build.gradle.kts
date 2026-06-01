@@ -9,9 +9,9 @@ buildscript {
         maven("https://jitpack.io")
     }
     dependencies {
-        classpath("com.android.tools.build:gradle:8.7.3")
-        classpath("com.github.recloudstream:gradle:-SNAPSHOT")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.0.21")
+        classpath("com.android.tools.build:gradle:9.1.1")
+        classpath("com.github.recloudstream:gradle:master-SNAPSHOT")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")
     }
 }
 
@@ -30,7 +30,7 @@ subprojects {
 
     configure<LibraryExtension> {
         namespace = "com.donghuaext"
-        compileSdk = 35
+        compileSdk = 36
         defaultConfig {
             minSdk = 21
         }
