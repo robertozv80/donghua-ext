@@ -25,8 +25,8 @@ class AnimeGratisProvider : MainAPI() {
         val items = doc.select("article, .post-item, .item, div.item").mapNotNull { el ->
             val a = el.selectFirst("a") ?: return@mapNotNull null
             val title = a.attr("title").ifBlank { el.selectFirst("h2, h3, h5")?.text() ?: a.text() }
-            val href = a.attr("abs:href")
-            val poster = el.selectFirst("img")?.attr("abs:src")
+            val href = a.fixUrl(attr("href"))
+            val poster = el.selectFirst("img")?.fixUrl(attr("src"))
             if (title.isNotBlank() && href.isNotBlank()) {
                 newAnimeSearchResponse(title, href) {
                     this.posterUrl = poster
@@ -41,8 +41,8 @@ class AnimeGratisProvider : MainAPI() {
         return doc.select("article, .post-item, .item, div.item").mapNotNull { el ->
             val a = el.selectFirst("a") ?: return@mapNotNull null
             val title = a.attr("title").ifBlank { el.selectFirst("h2, h3, h5")?.text() ?: a.text() }
-            val href = a.attr("abs:href")
-            val poster = el.selectFirst("img")?.attr("abs:src")
+            val href = a.fixUrl(attr("href"))
+            val poster = el.selectFirst("img")?.fixUrl(attr("src"))
             if (title.isNotBlank() && href.isNotBlank()) {
                 newAnimeSearchResponse(title, href) {
                     this.posterUrl = poster
@@ -55,13 +55,13 @@ class AnimeGratisProvider : MainAPI() {
         val doc = app.get(url).document
         val title = doc.selectFirst("h1, .entry-title")?.text() ?: ""
         val poster = doc.selectFirst("img.wp-post-image, .poster img, meta[property=og:image]")?.let {
-            if (it.tagName() == "meta") it.attr("content") else it.attr("abs:src")
+            if (it.tagName() == "meta") it.attr("content") else it.fixUrl(attr("src"))
         }
         val description = doc.selectFirst(".entry-content, .synopsis, .descripcion")?.text()
 
         val episodes = doc.select(".episode-list a, .episodios a, .capitulos a, .eplister a, ul.donghua-list a").mapNotNull { el ->
             val epName = el.text()
-            val epUrl = el.attr("abs:href")
+            val epUrl = el.fixUrl(attr("href"))
             if (epUrl.isNotBlank()) {
                 newEpisode(epUrl) {
                     this.name = epName
@@ -83,18 +83,18 @@ class AnimeGratisProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data).document
 
-        val iframes = doc.select("iframe").mapNotNull { it.attr("abs:src").ifBlank { null } }
+        val iframes = doc.select("iframe").mapNotNull { it.fixUrl(attr("src")).ifBlank { null } }
         for (iframeSrc in iframes) {
             try {
                 val iframeDoc = app.get(iframeSrc, referer = data).document
                 val videoUrls = mutableListOf<String>()
 
                 iframeDoc.select("source, video source").forEach { el ->
-                    val src = el.attr("abs:src")
+                    val src = el.fixUrl(attr("src"))
                     if (src.isNotBlank()) videoUrls.add(src)
                 }
                 iframeDoc.select("video").forEach { el ->
-                    val src = el.attr("abs:src")
+                    val src = el.fixUrl(attr("src"))
                     if (src.isNotBlank()) videoUrls.add(src)
                 }
 
@@ -120,7 +120,7 @@ class AnimeGratisProvider : MainAPI() {
         }
 
         doc.select("video source, video").forEach { el ->
-            val src = el.attr("abs:src")
+            val src = el.fixUrl(attr("src"))
             if (src.isNotBlank()) {
                 callback(
                     newExtractorLink(source = name, name = "Direct", url = src) {
