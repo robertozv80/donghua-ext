@@ -24,8 +24,8 @@ class SeriesDonghuaProvider : MainAPI() {
         val items = doc.select("div.item").mapNotNull { el ->
             val a = el.selectFirst("a.angled-img") ?: return@mapNotNull null
             val title = el.selectFirst("h5")?.text() ?: return@mapNotNull null
-            val href = a.attr("abs:href")
-            val poster = el.selectFirst("div.img img")?.attr("abs:src")
+            val href = a.fixUrl(attr("href"))
+            val poster = el.selectFirst("div.img img")?.fixUrl(attr("src"))
             if (href.isNotBlank()) {
                 newAnimeSearchResponse(title, href) {
                     this.posterUrl = poster
@@ -40,8 +40,8 @@ class SeriesDonghuaProvider : MainAPI() {
         return doc.select("div.item").mapNotNull { el ->
             val a = el.selectFirst("a.angled-img") ?: return@mapNotNull null
             val title = el.selectFirst("h5")?.text() ?: return@mapNotNull null
-            val href = a.attr("abs:href")
-            val poster = el.selectFirst("div.img img")?.attr("abs:src")
+            val href = a.fixUrl(attr("href"))
+            val poster = el.selectFirst("div.img img")?.fixUrl(attr("src"))
             if (href.isNotBlank()) {
                 newAnimeSearchResponse(title, href) {
                     this.posterUrl = poster
@@ -57,7 +57,7 @@ class SeriesDonghuaProvider : MainAPI() {
         val description = doc.selectFirst("div.text-justify.fc-dark")?.text()
         val episodes = doc.select("ul.donghua-list > a").mapNotNull { el ->
             val epName = el.selectFirst("blockquote")?.text() ?: el.text()
-            val epUrl = el.attr("abs:href")
+            val epUrl = el.fixUrl(attr("href"))
             if (epUrl.isNotBlank()) {
                 newEpisode(epUrl) {
                     this.name = epName
@@ -106,7 +106,7 @@ class SeriesDonghuaProvider : MainAPI() {
         }
 
         doc.select("iframe").forEach { el ->
-            val src = el.attr("abs:src")
+            val src = el.fixUrl(attr("src"))
             if (src.isNotBlank()) {
                 callback(
                     newExtractorLink(source = name, name = "Embed", url = src) {
