@@ -69,14 +69,14 @@
       "robertozv80"
     ],
     "description": "SeriesDonghua - Donghuas y anime chino en espa\u00f1ol",
-    "fileSize": 13442,
+    "fileSize": 13447,
     "language": "es",
     "tvTypes": [
       "Anime"
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=seriesdonghua.com&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-4735f4e738fd840bce7462b17eda6414df27a5475bc8a0c5c367f62337373b36",
+    "fileHash": "sha256-13e717b4d5506bf0ba0da9641604e43d151907c2cd856e46e8f88c2a8267fb14",
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext"
   }
 ]
