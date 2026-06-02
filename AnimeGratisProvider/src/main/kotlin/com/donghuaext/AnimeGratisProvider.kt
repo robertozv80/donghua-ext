@@ -13,6 +13,16 @@ class AnimeGratisProvider : MainAPI() {
     override val hasQuickSearch = false
     override val supportedTypes = setOf(TvType.Anime)
 
+    private fun resolveUrl(url: String): String {
+        return when {
+            url.startsWith("http") -> url
+            url.startsWith("//") -> "https:$url"
+            url.startsWith("/") -> "$mainUrl$url"
+            url.isNotBlank() -> "$mainUrl/$url"
+            else -> ""
+        }
+    }
+
     override val mainPage = mainPageOf(
         "$mainUrl" to "Inicio",
         "$mainUrl/genre/anime" to "Anime",
@@ -25,8 +35,8 @@ class AnimeGratisProvider : MainAPI() {
         val items = doc.select("article, .post-item, .item, div.item").mapNotNull { el ->
             val a = el.selectFirst("a") ?: return@mapNotNull null
             val title = a.attr("title").ifBlank { el.selectFirst("h2, h3, h5")?.text() ?: a.text() }
-            val href = a.fixUrl(attr("href"))
-            val poster = el.selectFirst("img")?.fixUrl(attr("src"))
+            val href = resolveUrl(a.attr("href"))
+            val poster = resolveUrl(el.selectFirst("img")?.attr("src") ?: "")
             if (title.isNotBlank() && href.isNotBlank()) {
                 newAnimeSearchResponse(title, href) {
                     this.posterUrl = poster
@@ -41,8 +51,8 @@ class AnimeGratisProvider : MainAPI() {
         return doc.select("article, .post-item, .item, div.item").mapNotNull { el ->
             val a = el.selectFirst("a") ?: return@mapNotNull null
             val title = a.attr("title").ifBlank { el.selectFirst("h2, h3, h5")?.text() ?: a.text() }
-            val href = a.fixUrl(attr("href"))
-            val poster = el.selectFirst("img")?.fixUrl(attr("src"))
+            val href = resolveUrl(a.attr("href"))
+            val poster = resolveUrl(el.selectFirst("img")?.attr("src") ?: "")
             if (title.isNotBlank() && href.isNotBlank()) {
                 newAnimeSearchResponse(title, href) {
                     this.posterUrl = poster
@@ -54,14 +64,15 @@ class AnimeGratisProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url).document
         val title = doc.selectFirst("h1, .entry-title")?.text() ?: ""
-        val poster = doc.selectFirst("img.wp-post-image, .poster img, meta[property=og:image]")?.let {
-            if (it.tagName() == "meta") it.attr("content") else it.fixUrl(attr("src"))
-        }
+        val poster = doc.selectFirst("img.wp-post-image, .poster img, meta[property=og:image]")?.let { el ->
+            val src = if (el.tagName() == "meta") el.attr("content") else el.attr("src")
+            resolveUrl(src)
+        } ?: ""
         val description = doc.selectFirst(".entry-content, .synopsis, .descripcion")?.text()
 
         val episodes = doc.select(".episode-list a, .episodios a, .capitulos a, .eplister a, ul.donghua-list a").mapNotNull { el ->
             val epName = el.text()
-            val epUrl = el.fixUrl(attr("href"))
+            val epUrl = resolveUrl(el.attr("href"))
             if (epUrl.isNotBlank()) {
                 newEpisode(epUrl) {
                     this.name = epName
@@ -83,44 +94,17 @@ class AnimeGratisProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data).document
 
-        val iframes = doc.select("iframe").mapNotNull { it.fixUrl(attr("src")).ifBlank { null } }
+        val iframes = doc.select("iframe").mapNotNull { el ->
+            resolveUrl(el.attr("src")).ifBlank { null }
+        }
         for (iframeSrc in iframes) {
             try {
-                val iframeDoc = app.get(iframeSrc, referer = data).document
-                val videoUrls = mutableListOf<String>()
-
-                iframeDoc.select("source, video source").forEach { el ->
-                    val src = el.fixUrl(attr("src"))
-                    if (src.isNotBlank()) videoUrls.add(src)
-                }
-                iframeDoc.select("video").forEach { el ->
-                    val src = el.fixUrl(attr("src"))
-                    if (src.isNotBlank()) videoUrls.add(src)
-                }
-
-                iframeDoc.select("script").forEach { script ->
-                    val content = script.html()
-                    val regex = Regex("""file\s*[:=]\s*["']([^"']+)["']""")
-                    regex.findAll(content).forEach { match ->
-                        val videoUrl = match.groupValues[1]
-                        if (videoUrl.startsWith("http")) videoUrls.add(videoUrl)
-                    }
-                }
-
-                for (videoUrl in videoUrls) {
-                    callback(
-                        newExtractorLink(source = name, name = "Video", url = videoUrl) {
-                            this.referer = iframeSrc
-                            this.quality = Qualities.Unknown.value
-                            this.headers = mapOf("Referer" to iframeSrc)
-                        }
-                    )
-                }
+                loadExtractor(iframeSrc, data, subtitleCallback, callback)
             } catch (_: Exception) {}
         }
 
         doc.select("video source, video").forEach { el ->
-            val src = el.fixUrl(attr("src"))
+            val src = resolveUrl(el.attr("src"))
             if (src.isNotBlank()) {
                 callback(
                     newExtractorLink(source = name, name = "Direct", url = src) {
@@ -128,6 +112,22 @@ class AnimeGratisProvider : MainAPI() {
                         this.quality = Qualities.Unknown.value
                     }
                 )
+            }
+        }
+
+        doc.select("script").forEach { script ->
+            val content = script.html()
+            val regex = Regex("""file\s*[:=]\s*["']([^"']+)["']""")
+            regex.findAll(content).forEach { match ->
+                val videoUrl = match.groupValues[1]
+                if (videoUrl.startsWith("http")) {
+                    callback(
+                        newExtractorLink(source = name, name = "Video", url = videoUrl) {
+                            this.referer = data
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                }
             }
         }
 
