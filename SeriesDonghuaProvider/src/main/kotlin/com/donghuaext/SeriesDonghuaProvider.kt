@@ -13,6 +13,16 @@ class SeriesDonghuaProvider : MainAPI() {
     override val hasQuickSearch = false
     override val supportedTypes = setOf(TvType.Anime)
 
+    private fun resolveUrl(url: String): String {
+        return when {
+            url.startsWith("http") -> url
+            url.startsWith("//") -> "https:$url"
+            url.startsWith("/") -> "$mainUrl$url"
+            url.isNotBlank() -> "$mainUrl/$url"
+            else -> ""
+        }
+    }
+
     override val mainPage = mainPageOf(
         "$mainUrl/todos-los-donghuas" to "Donghuas",
         "$mainUrl/donghuas-en-emision" to "En Emisión"
@@ -24,8 +34,8 @@ class SeriesDonghuaProvider : MainAPI() {
         val items = doc.select("div.item").mapNotNull { el ->
             val a = el.selectFirst("a.angled-img") ?: return@mapNotNull null
             val title = el.selectFirst("h5")?.text() ?: return@mapNotNull null
-            val href = a.fixUrl(attr("href"))
-            val poster = el.selectFirst("div.img img")?.fixUrl(attr("src"))
+            val href = resolveUrl(a.attr("href"))
+            val poster = resolveUrl(el.selectFirst("div.img img")?.attr("src") ?: "")
             if (href.isNotBlank()) {
                 newAnimeSearchResponse(title, href) {
                     this.posterUrl = poster
@@ -40,8 +50,8 @@ class SeriesDonghuaProvider : MainAPI() {
         return doc.select("div.item").mapNotNull { el ->
             val a = el.selectFirst("a.angled-img") ?: return@mapNotNull null
             val title = el.selectFirst("h5")?.text() ?: return@mapNotNull null
-            val href = a.fixUrl(attr("href"))
-            val poster = el.selectFirst("div.img img")?.fixUrl(attr("src"))
+            val href = resolveUrl(a.attr("href"))
+            val poster = resolveUrl(el.selectFirst("div.img img")?.attr("src") ?: "")
             if (href.isNotBlank()) {
                 newAnimeSearchResponse(title, href) {
                     this.posterUrl = poster
@@ -53,11 +63,11 @@ class SeriesDonghuaProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url).document
         val title = doc.selectFirst("div.ls-title-serie")?.text() ?: ""
-        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
+        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content") ?: ""
         val description = doc.selectFirst("div.text-justify.fc-dark")?.text()
         val episodes = doc.select("ul.donghua-list > a").mapNotNull { el ->
             val epName = el.selectFirst("blockquote")?.text() ?: el.text()
-            val epUrl = el.fixUrl(attr("href"))
+            val epUrl = resolveUrl(el.attr("href"))
             if (epUrl.isNotBlank()) {
                 newEpisode(epUrl) {
                     this.name = epName
@@ -78,6 +88,7 @@ class SeriesDonghuaProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data).document
 
+        // Parse VIDEO_MAP_JSON from script tags
         doc.select("script").forEach { script ->
             val content = script.html()
             if (content.contains("VIDEO_MAP_JSON")) {
@@ -105,15 +116,13 @@ class SeriesDonghuaProvider : MainAPI() {
             }
         }
 
+        // Extract from iframes
         doc.select("iframe").forEach { el ->
-            val src = el.fixUrl(attr("src"))
+            val src = resolveUrl(el.attr("src"))
             if (src.isNotBlank()) {
-                callback(
-                    newExtractorLink(source = name, name = "Embed", url = src) {
-                        this.referer = data
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
+                try {
+                    loadExtractor(src, data, subtitleCallback, callback)
+                } catch (_: Exception) {}
             }
         }
 
