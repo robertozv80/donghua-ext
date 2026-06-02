@@ -13,6 +13,16 @@ class MundoDonghuaProvider : MainAPI() {
     override val hasQuickSearch = false
     override val supportedTypes = setOf(TvType.Anime)
 
+    private fun resolveUrl(url: String): String {
+        return when {
+            url.startsWith("http") -> url
+            url.startsWith("//") -> "https:$url"
+            url.startsWith("/") -> "$mainUrl$url"
+            url.isNotBlank() -> "$mainUrl/$url"
+            else -> ""
+        }
+    }
+
     override val mainPage = mainPageOf(
         "$mainUrl/lista-donghuas" to "Donghuas",
         "$mainUrl/lista-donghuas-emision" to "En Emisión"
@@ -24,8 +34,8 @@ class MundoDonghuaProvider : MainAPI() {
         val items = doc.select("div.md-card").mapNotNull { el ->
             val a = el.selectFirst("a") ?: return@mapNotNull null
             val title = el.selectFirst("h3.md-card-title")?.text() ?: return@mapNotNull null
-            val href = a.fixUrl(attr("href"))
-            val poster = el.selectFirst("div.md-card-img img")?.fixUrl(attr("src"))
+            val href = resolveUrl(a.attr("href"))
+            val poster = resolveUrl(el.selectFirst("div.md-card-img img")?.attr("src") ?: "")
             if (href.isNotBlank()) {
                 newAnimeSearchResponse(title, href) {
                     this.posterUrl = poster
@@ -40,8 +50,8 @@ class MundoDonghuaProvider : MainAPI() {
         return doc.select("div.md-card").mapNotNull { el ->
             val a = el.selectFirst("a") ?: return@mapNotNull null
             val title = el.selectFirst("h3.md-card-title")?.text() ?: return@mapNotNull null
-            val href = a.fixUrl(attr("href"))
-            val poster = el.selectFirst("div.md-card-img img")?.fixUrl(attr("src"))
+            val href = resolveUrl(a.attr("href"))
+            val poster = resolveUrl(el.selectFirst("div.md-card-img img")?.attr("src") ?: "")
             if (href.isNotBlank()) {
                 newAnimeSearchResponse(title, href) {
                     this.posterUrl = poster
@@ -53,11 +63,12 @@ class MundoDonghuaProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url).document
         val title = doc.selectFirst("h1.md-detail-title")?.text() ?: ""
-        val poster = doc.selectFirst("div.md-detail-poster img")?.fixUrl(attr("src"))
+        val poster = resolveUrl(doc.selectFirst("div.md-detail-poster img, div.md-detail-img img, img.md-poster")?.attr("src") ?: "")
+            .ifBlank { doc.selectFirst("meta[property=og:image]")?.attr("content") ?: "" }
         val description = doc.selectFirst("p.md-detail-synopsis")?.text()
         val episodes = doc.select("a.md-ep-link").mapNotNull { el ->
             val epName = el.selectFirst("h5")?.text() ?: el.text()
-            val epUrl = el.fixUrl(attr("href"))
+            val epUrl = resolveUrl(el.attr("href"))
             if (epUrl.isNotBlank()) {
                 newEpisode(epUrl) {
                     this.name = epName
@@ -78,22 +89,25 @@ class MundoDonghuaProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data).document
 
-        val iframes = doc.select("iframe").mapNotNull { it.fixUrl(attr("src")).ifBlank { null } }
+        val iframes = doc.select("iframe").mapNotNull { el ->
+            resolveUrl(el.attr("src")).ifBlank { null }
+        }
         for (iframeSrc in iframes) {
             try {
-                val iframeDoc = app.get(iframeSrc, referer = data).document
-                iframeDoc.select("source, video source").forEach { el ->
-                    val src = el.fixUrl(attr("src"))
-                    if (src.isNotBlank()) {
-                        callback(
-                            newExtractorLink(source = name, name = "Video", url = src) {
-                                this.referer = iframeSrc
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
-                    }
-                }
+                loadExtractor(iframeSrc, data, subtitleCallback, callback)
             } catch (_: Exception) {}
+        }
+
+        doc.select("video source, video").forEach { el ->
+            val src = resolveUrl(el.attr("src"))
+            if (src.isNotBlank()) {
+                callback(
+                    newExtractorLink(source = name, name = "Direct", url = src) {
+                        this.referer = data
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+            }
         }
 
         doc.select("script").forEach { script ->
@@ -109,18 +123,6 @@ class MundoDonghuaProvider : MainAPI() {
                         }
                     )
                 }
-            }
-        }
-
-        doc.select("video source, video").forEach { el ->
-            val src = el.fixUrl(attr("src"))
-            if (src.isNotBlank()) {
-                callback(
-                    newExtractorLink(source = name, name = "Direct", url = src) {
-                        this.referer = data
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
             }
         }
 
