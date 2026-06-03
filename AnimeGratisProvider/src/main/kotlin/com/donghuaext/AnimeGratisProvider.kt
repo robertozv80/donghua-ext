@@ -99,7 +99,35 @@ class AnimeGratisProvider : MainAPI() {
         }
         for (iframeSrc in iframes) {
             try {
-                loadExtractor(iframeSrc, data, subtitleCallback, callback)
+                val iframeDoc = app.get(iframeSrc, referer = data).document
+                val videoUrls = mutableListOf<String>()
+
+                iframeDoc.select("source, video source").forEach { el ->
+                    val src = resolveUrl(el.attr("src"))
+                    if (src.isNotBlank()) videoUrls.add(src)
+                }
+                iframeDoc.select("video").forEach { el ->
+                    val src = resolveUrl(el.attr("src"))
+                    if (src.isNotBlank()) videoUrls.add(src)
+                }
+
+                iframeDoc.select("script").forEach { script ->
+                    val content = script.html()
+                    val regex = Regex("""file\s*[:=]\s*["']([^"']+)["']""")
+                    regex.findAll(content).forEach { match ->
+                        val videoUrl = match.groupValues[1]
+                        if (videoUrl.startsWith("http")) videoUrls.add(videoUrl)
+                    }
+                }
+
+                for (videoUrl in videoUrls) {
+                    callback(
+                        newExtractorLink(source = name, name = "Video", url = videoUrl) {
+                            this.referer = iframeSrc
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                }
             } catch (_: Exception) {}
         }
 
@@ -112,22 +140,6 @@ class AnimeGratisProvider : MainAPI() {
                         this.quality = Qualities.Unknown.value
                     }
                 )
-            }
-        }
-
-        doc.select("script").forEach { script ->
-            val content = script.html()
-            val regex = Regex("""file\s*[:=]\s*["']([^"']+)["']""")
-            regex.findAll(content).forEach { match ->
-                val videoUrl = match.groupValues[1]
-                if (videoUrl.startsWith("http")) {
-                    callback(
-                        newExtractorLink(source = name, name = "Video", url = videoUrl) {
-                            this.referer = data
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                }
             }
         }
 
