@@ -119,19 +119,26 @@ class DonghuaLifeProvider : MainAPI() {
         if (mainIframe != null) {
             val src = resolveUrl(mainIframe.attr("src"))
             if (src.isNotBlank()) {
-                try {
-                    loadExtractor(src, data, subtitleCallback, callback)
-                } catch (_: Exception) {}
+                callback(
+                    newExtractorLink(source = name, name = "Video", url = src) {
+                        this.referer = data
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
             }
         }
 
         // Alternative servers via data-video
         doc.select("a[data-video]").forEach { el ->
             val videoUrl = el.attr("data-video")
+            val serverName = el.text().trim()
             if (videoUrl.isNotBlank() && videoUrl.startsWith("http")) {
-                try {
-                    loadExtractor(videoUrl, data, subtitleCallback, callback)
-                } catch (_: Exception) {}
+                callback(
+                    newExtractorLink(source = name, name = serverName.ifBlank { "Server" }, url = videoUrl) {
+                        this.referer = data
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
             }
         }
 
@@ -139,9 +146,12 @@ class DonghuaLifeProvider : MainAPI() {
         doc.select("iframe").forEach { el ->
             val src = resolveUrl(el.attr("src"))
             if (src.isNotBlank()) {
-                try {
-                    loadExtractor(src, data, subtitleCallback, callback)
-                } catch (_: Exception) {}
+                callback(
+                    newExtractorLink(source = name, name = "Embed", url = src) {
+                        this.referer = data
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
             }
         }
 
