@@ -120,9 +120,12 @@ class SeriesDonghuaProvider : MainAPI() {
         doc.select("iframe").forEach { el ->
             val src = resolveUrl(el.attr("src"))
             if (src.isNotBlank()) {
-                try {
-                    loadExtractor(src, data, subtitleCallback, callback)
-                } catch (_: Exception) {}
+                callback(
+                    newExtractorLink(source = name, name = "Embed", url = src) {
+                        this.referer = data
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
             }
         }
 
