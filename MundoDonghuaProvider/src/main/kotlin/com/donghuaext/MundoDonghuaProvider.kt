@@ -94,7 +94,18 @@ class MundoDonghuaProvider : MainAPI() {
         }
         for (iframeSrc in iframes) {
             try {
-                loadExtractor(iframeSrc, data, subtitleCallback, callback)
+                val iframeDoc = app.get(iframeSrc, referer = data).document
+                iframeDoc.select("source, video source").forEach { el ->
+                    val src = resolveUrl(el.attr("src"))
+                    if (src.isNotBlank()) {
+                        callback(
+                            newExtractorLink(source = name, name = "Video", url = src) {
+                                this.referer = iframeSrc
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                    }
+                }
             } catch (_: Exception) {}
         }
 
