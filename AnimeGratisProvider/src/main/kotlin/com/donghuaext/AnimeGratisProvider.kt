@@ -38,9 +38,7 @@ class AnimeGratisProvider : MainAPI() {
             val href = resolveUrl(a.attr("href"))
             val poster = resolveUrl(el.selectFirst("img")?.attr("src") ?: "")
             if (title.isNotBlank() && href.isNotBlank()) {
-                newAnimeSearchResponse(title, href) {
-                    this.posterUrl = poster
-                }
+                newAnimeSearchResponse(title, href) { this.posterUrl = poster }
             } else null
         }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
@@ -54,9 +52,7 @@ class AnimeGratisProvider : MainAPI() {
             val href = resolveUrl(a.attr("href"))
             val poster = resolveUrl(el.selectFirst("img")?.attr("src") ?: "")
             if (title.isNotBlank() && href.isNotBlank()) {
-                newAnimeSearchResponse(title, href) {
-                    this.posterUrl = poster
-                }
+                newAnimeSearchResponse(title, href) { this.posterUrl = poster }
             } else null
         }
     }
@@ -74,11 +70,9 @@ class AnimeGratisProvider : MainAPI() {
             val epName = el.text()
             val epUrl = resolveUrl(el.attr("href"))
             if (epUrl.isNotBlank()) {
-                newEpisode(epUrl) {
-                    this.name = epName
-                }
+                newEpisode(epUrl) { this.name = epName }
             } else null
-        }
+        }.reversed()
 
         return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
             this.posterUrl = poster
