@@ -24,23 +24,37 @@ class MundoDonghuaProvider : MainAPI() {
     }
 
     override val mainPage = mainPageOf(
+        "$mainUrl/lista-episodios" to "Nuevos Episodios",
         "$mainUrl/lista-donghuas" to "Donghuas",
-        "$mainUrl/lista-donghuas-emision" to "En Emisión"
+        "$mainUrl/lista-donghuas-emision" to "En Emisión",
+        "$mainUrl/lista-donghuas-finalizados" to "Finalizados"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page == 1) request.data else "${request.data}/$page"
-        val doc = app.get(url).document
-        val items = doc.select("div.md-card").mapNotNull { el ->
-            val a = el.selectFirst("a") ?: return@mapNotNull null
-            val title = el.selectFirst("h3.md-card-title")?.text() ?: return@mapNotNull null
-            val href = resolveUrl(a.attr("href"))
-            val poster = resolveUrl(el.selectFirst("div.md-card-img img")?.attr("src") ?: "")
-            if (href.isNotBlank()) {
-                newAnimeSearchResponse(title, href) {
-                    this.posterUrl = poster
+        val doc = app.get(request.data).document
+        val items = when (request.name) {
+            "Nuevos Episodios" -> {
+                doc.select("div.md-ep-item, div.md-card, a.md-ep-link").mapNotNull { el ->
+                    val a = el.selectFirst("a") ?: el.takeIf { it.tagName() == "a" } ?: return@mapNotNull null
+                    val title = el.selectFirst("h3, h5, .md-card-title, .md-ep-title")?.text() ?: a.text()
+                    val href = resolveUrl(a.attr("href"))
+                    val poster = resolveUrl(el.selectFirst("img")?.attr("src") ?: "")
+                    if (href.isNotBlank()) {
+                        newAnimeSearchResponse(title, href) { this.posterUrl = poster }
+                    } else null
                 }
-            } else null
+            }
+            else -> {
+                doc.select("div.md-card").mapNotNull { el ->
+                    val a = el.selectFirst("a") ?: return@mapNotNull null
+                    val title = el.selectFirst("h3.md-card-title")?.text() ?: return@mapNotNull null
+                    val href = resolveUrl(a.attr("href"))
+                    val poster = resolveUrl(el.selectFirst("div.md-card-img img")?.attr("src") ?: "")
+                    if (href.isNotBlank()) {
+                        newAnimeSearchResponse(title, href) { this.posterUrl = poster }
+                    } else null
+                }
+            }
         }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
@@ -49,13 +63,11 @@ class MundoDonghuaProvider : MainAPI() {
         val doc = app.get("$mainUrl/busquedas/?donghua=$query").document
         return doc.select("div.md-card").mapNotNull { el ->
             val a = el.selectFirst("a") ?: return@mapNotNull null
-            val title = el.selectFirst("h3.md-card-title")?.text() ?: return@mapNotNull null
+            val title = el.selectFirst("h3.md-card-title, h5.md-card-title")?.text() ?: return@mapNotNull null
             val href = resolveUrl(a.attr("href"))
             val poster = resolveUrl(el.selectFirst("div.md-card-img img")?.attr("src") ?: "")
             if (href.isNotBlank()) {
-                newAnimeSearchResponse(title, href) {
-                    this.posterUrl = poster
-                }
+                newAnimeSearchResponse(title, href) { this.posterUrl = poster }
             } else null
         }
     }
@@ -70,11 +82,9 @@ class MundoDonghuaProvider : MainAPI() {
             val epName = el.selectFirst("h5")?.text() ?: el.text()
             val epUrl = resolveUrl(el.attr("href"))
             if (epUrl.isNotBlank()) {
-                newEpisode(epUrl) {
-                    this.name = epName
-                }
+                newEpisode(epUrl) { this.name = epName }
             } else null
-        }
+        }.reversed()
         return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
             this.posterUrl = poster
             this.plot = description
@@ -89,26 +99,95 @@ class MundoDonghuaProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data).document
 
-        val iframes = doc.select("iframe").mapNotNull { el ->
-            resolveUrl(el.attr("src")).ifBlank { null }
+        // Extract server names from tabs
+        val serverNames = doc.select("button.md-server-tab").mapNotNull {
+            it.text().trim().ifBlank { null }
         }
-        for (iframeSrc in iframes) {
-            try {
-                val iframeDoc = app.get(iframeSrc, referer = data).document
-                iframeDoc.select("source, video source").forEach { el ->
-                    val src = resolveUrl(el.attr("src"))
-                    if (src.isNotBlank()) {
+
+        // Method 1: Look for iframes already loaded
+        doc.select("iframe").forEach { el ->
+            val src = resolveUrl(el.attr("src"))
+            if (src.isNotBlank() && src != "about:blank") {
+                callback(
+                    newExtractorLink(source = name, name = "Tamamo", url = src) {
+                        this.referer = data
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+            }
+        }
+
+        // Method 2: Parse obfuscated JS to find embed URLs for each server
+        doc.select("script").forEach { script ->
+            val content = script.html()
+
+            // Find URLs in eval blocks - common patterns
+            val urlPatterns = listOf(
+                Regex("""https?://[^\s'"]+?/e/[^\s'"]+"""),  // embed patterns like /e/xxxx
+                Regex("""https?://[^\s'"]+?\.xyz/[^\s'"]+"""),
+                Regex("""https?://[^\s'"]+?\.com/[^\s'"]+?/e/[^\s'"]+"""),
+                Regex("""https?://voe\.sx/[^\s'"]+"""),
+                Regex("""https?://[^\s'"]+?\.sx/[^\s'"]+"""),
+                Regex("""https?://vidhidepro\.com/[^\s'"]+"""),
+                Regex("""https?://[^\s'"]+?bysekoze[^\s'"]*""")
+            )
+            for (pattern in urlPatterns) {
+                pattern.findAll(content).forEach { match ->
+                    val videoUrl = match.value.trimEnd(',', ';', ')')
+                    if (videoUrl.startsWith("http")) {
                         callback(
-                            newExtractorLink(source = name, name = "Video", url = src) {
-                                this.referer = iframeSrc
+                            newExtractorLink(source = name, name = "Server", url = videoUrl) {
+                                this.referer = data
                                 this.quality = Qualities.Unknown.value
                             }
                         )
                     }
                 }
+            }
+
+            // Look for src attributes being set in JS
+            val srcRegex = Regex("""["']https?://[^"']+["']""")
+            srcRegex.findAll(content).forEach { match ->
+                val videoUrl = match.value.trim('"', '\'')
+                if (videoUrl.startsWith("http") &&
+                    (videoUrl.contains("/e/") || videoUrl.contains("embed") ||
+                     videoUrl.contains("player") || videoUrl.contains("video"))) {
+                    callback(
+                        newExtractorLink(source = name, name = "Server", url = videoUrl) {
+                            this.referer = data
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                }
+            }
+        }
+
+        // Method 3: Try fetching the tamamo API endpoint
+        val donghuaKey = doc.selectFirst("input#donghua_key")?.attr("value")
+        if (!donghuaKey.isNullOrBlank()) {
+            try {
+                val apiDoc = app.post("$mainUrl/api_donghua.php", data = mapOf("slug" to donghuaKey)).text
+                if (apiDoc.isNotBlank()) {
+                    // API returns JSON with video URLs
+                    val urlRegex = Regex("""https?://[^"'\s,]+""")
+                    urlRegex.findAll(apiDoc).forEach { match ->
+                        val videoUrl = match.value.trimEnd(',', ';', ')', ']', '}')
+                        if (videoUrl.startsWith("http") &&
+                            (videoUrl.contains("player") || videoUrl.contains("embed") ||
+                             videoUrl.contains("/e/") || videoUrl.contains(".php"))) {
+                            callback(
+                                newExtractorLink(source = name, name = "Tamamo", url = videoUrl) {
+                                    this.referer = data
+                                    this.quality = Qualities.Unknown.value
+                                }
+                            )
+                        }
+                    }
+                }
             } catch (_: Exception) {}
         }
 
+        // Method 4: Direct video/source tags
         doc.select("video source, video").forEach { el ->
             val src = resolveUrl(el.attr("src"))
             if (src.isNotBlank()) {
@@ -118,22 +197,6 @@ class MundoDonghuaProvider : MainAPI() {
                         this.quality = Qualities.Unknown.value
                     }
                 )
-            }
-        }
-
-        doc.select("script").forEach { script ->
-            val content = script.html()
-            val regex = Regex("""(?:file|src|source)\s*[:=]\s*["']([^"']+)["']""")
-            regex.findAll(content).forEach { match ->
-                val videoUrl = match.groupValues[1]
-                if (videoUrl.startsWith("http")) {
-                    callback(
-                        newExtractorLink(source = name, name = "Video", url = videoUrl) {
-                            this.referer = data
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                }
             }
         }
 
