@@ -9,14 +9,14 @@
       "robertozv80"
     ],
     "description": "AnimeGratis - Anime y donghua en espa\u00f1ol gratis",
-    "fileSize": 14389,
+    "fileSize": 14420,
     "language": "es",
     "tvTypes": [
       "Anime"
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=animegratis.net&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-23dc97874b3021ed453eb3a4e3e3d4d8b8c298cdec12a02ec021e7b1ebf8b23e",
+    "fileHash": "sha256-d42b2902aa129d4a94bf5b76fb8ab4f4a63bb46027a6c7e090edc63374b5bdbc",
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext"
   },
   {
