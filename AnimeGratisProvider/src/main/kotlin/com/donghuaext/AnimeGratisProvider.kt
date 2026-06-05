@@ -1,6 +1,5 @@
 package com.donghuaext
 
-import com.google.gson.annotations.SerializedName
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
@@ -199,9 +198,8 @@ class AnimeGratisProvider : MainAPI() {
         return results
     }
 
-    // Modelos para parsear JSON-LD (usando Gson @SerializedName en vez de Jackson @JsonProperty)
+    // Modelos para parsear JSON-LD (sin anotaciones - los nombres de campo coinciden con las claves JSON)
     data class TvSeriesJsonLd(
-        @SerializedName("@type") val type: String? = null,
         val name: String? = null,
         val alternateName: String? = null,
         val description: String? = null,
