@@ -301,20 +301,20 @@ class SeriesDonghuaProvider : MainAPI() {
 
                 // ===== Asura → Dailymotion =====
                 videoMap.asura?.let { rawValue ->
-                    try {
-                        val asuraVal = decodeDoubleEncoded(rawValue)
-                        if (asuraVal.isNotEmpty()) {
+                    val asuraVal = decodeDoubleEncoded(rawValue)
+                    if (asuraVal.isNotEmpty()) {
+                        try {
                             // asura es un ID de Dailymotion
                             val dmUrl = "https://www.dailymotion.com/embed/video/$asuraVal"
                             loadExtractor(dmUrl, data, subtitleCallback, callback)
                             foundLinks = true
+                        } catch (_: Exception) {
+                            // Fallback: extracción manual
+                            try {
+                                extractDailymotion(asuraVal, data, "Daily", callback)
+                                foundLinks = true
+                            } catch (_: Exception) {}
                         }
-                    } catch (_: Exception) {
-                        // Fallback: extracción manual
-                        try {
-                            extractDailymotion(asuraVal, data, "Daily", callback)
-                            foundLinks = true
-                        } catch (_: Exception) {}
                     }
                 }
 
@@ -416,9 +416,8 @@ class SeriesDonghuaProvider : MainAPI() {
 
     /**
      * Decodifica un valor double-encoded del VIDEO_MAP_JSON
-     * Jackson ya resuelve la primera capa de escapes JSON.
-     * El valor resultante es: "valor" (con comillas externas)
-     * Necesitamos quitar las comillas y resolver escapes restantes.
+     * Gson resuelve la primera capa de escapes JSON automáticamente.
+     * El valor resultante puede tener comillas externas y escapes residuales.
      */
     private fun decodeDoubleEncoded(value: String): String {
         var result = value.trim()
