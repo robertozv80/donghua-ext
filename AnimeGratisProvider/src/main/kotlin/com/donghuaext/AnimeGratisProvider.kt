@@ -51,18 +51,17 @@ class AnimeGratisProvider : MainAPI() {
         "Sec-Fetch-Site" to "none",
     )
 
-    // ========== Helpers para atributos de imagen ==========
+    // ========== Helper para atributos de imagen ==========
     // Jsoup .attr() retorna "" (no null) si el atributo no existe.
     // Por eso necesitamos .isNotBlank() para que la cadena de fallback funcione.
+    // NOTA: Solo una versión con receptor nullable — Kotlin/JVM no permite
+    // dos extension functions con receptor Element y Element? (misma firma JVM).
 
-    private fun org.jsoup.nodes.Element.bestImageUrl(): String {
+    private fun org.jsoup.nodes.Element?.bestImageUrl(): String {
+        if (this == null) return ""
         return listOf("data-fb2", "data-fallback", "src")
             .map { attr -> this.attr(attr).trim() }
             .firstOrNull { it.isNotBlank() } ?: ""
-    }
-
-    private fun org.jsoup.nodes.Element?.bestImageUrl(): String {
-        return this?.bestImageUrl() ?: ""
     }
 
     // ========== MODELOS PARA #ssr-init (directorio) ==========
