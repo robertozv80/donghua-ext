@@ -7,9 +7,6 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
-import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
-import org.mozilla.javascript.Context
-import org.mozilla.javascript.Scriptable
 import kotlin.collections.ArrayList
 
 class SeriesDonghuaProvider : MainAPI() {
@@ -157,7 +154,6 @@ class SeriesDonghuaProvider : MainAPI() {
             else -> null
         }
 
-        // Detectar tipo
         val typeInfo = doc.select("div.row div.col-md-6 p.fc-dark, p.fc-dark").map { it.text() }.joinToString(" ")
         val tvType = when {
             typeInfo.contains(Regex("Tipo.*Pel.cula", RegexOption.IGNORE_CASE)) -> TvType.AnimeMovie
@@ -165,7 +161,6 @@ class SeriesDonghuaProvider : MainAPI() {
             else -> TvType.Anime
         }
 
-        // Extraer episodios
         val episodes = ArrayList<Episode>()
         doc.select("div.donghua-list-scroll ul.donghua-list a, ul.donghua-list a").map { epLink ->
             val href = epLink.attr("href")
@@ -181,7 +176,6 @@ class SeriesDonghuaProvider : MainAPI() {
             )
         }
 
-        // Para películas sin episodios
         if (episodes.isEmpty() && tvType == TvType.AnimeMovie) {
             return newMovieLoadResponse(title, seriesUrl, TvType.AnimeMovie, seriesUrl) {
                 posterUrl = poster
@@ -199,7 +193,7 @@ class SeriesDonghuaProvider : MainAPI() {
         }
     }
 
-    // Modelo para parsear el VIDEO_MAP_JSON (sin @JsonProperty - Gson usa nombres de campo directamente)
+    // Modelo para parsear el VIDEO_MAP_JSON (sin anotaciones - Gson usa nombres de campo directamente)
     data class VideoMapJson(
         val asura: String? = null,
         val skadi: String? = null,
@@ -216,80 +210,27 @@ class SeriesDonghuaProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data, timeout = 120).document
 
-        // Buscar VIDEO_MAP_JSON usando Rhino para ejecutar scripts ofuscados
-        // El sitio genera VIDEO_MAP_JSON via JavaScript ofuscado (document.write)
-        // Jsoup no ejecuta JS, así que usamos Rhino para ejecutar los scripts
+        // VIDEO_MAP_JSON ya NO está ofuscado - aparece en texto claro en los scripts
         var videoMapJsonStr: String? = null
 
-        // Método 1: Ejecutar scripts ofuscados con Rhino
+        // Buscar VIDEO_MAP_JSON directamente en los scripts
         for (script in doc.select("script")) {
             val scriptData = script.data()
-            // Detectar scripts ofuscados que generan VIDEO_MAP_JSON
-            if (scriptData.contains("_0x") || scriptData.contains("document.write") || scriptData.contains("VIDEO_MAP_JSON")) {
-                try {
-                    val cx = Context.enter()
-                    try {
-                        cx.optimizationLevel = -1
-                        val scope = cx.initSafeStandardObjects()
-
-                        // Mock de window y document para capturar document.write
-                        cx.evaluateString(scope, """
-                            var window = { location: { hostname: 'seriesdonghua.com' }, addEventListener: function() {} };
-                            var document = {
-                                write: function(s) { this._written = (this._written || '') + s; },
-                                _written: '',
-                                getElementById: function() { return { value: '', style: {} }; },
-                                querySelector: function() { return null; },
-                                querySelectorAll: function() { return []; },
-                                addEventListener: function() {},
-                                createElement: function() { return { appendChild: function() {}, style: {}, setAttribute: function() {} }; },
-                                body: { appendChild: function() {}, style: {} },
-                                head: { appendChild: function() {} },
-                                readyState: 'complete'
-                            };
-                            var navigator = { userAgent: 'Mozilla/5.0' };
-                            var setTimeout = function(f, t) { if(typeof f === 'function') f(); return 0; };
-                            var setInterval = function(f, t) { return 0; };
-                            var clearTimeout = function() {};
-                            var clearInterval = function() {};
-                        """.trimIndent(), "setup", 1, null)
-
-                        // Ejecutar el script ofuscado
-                        cx.evaluateString(scope, scriptData, "obfuscated", 1, null)
-
-                        // Obtener la salida de document.write
-                        val docObj = scope.get("document", scope) as? Scriptable
-                        val written = docObj?.get("_written", docObj)?.toString() ?: ""
-
-                        // Extraer VIDEO_MAP_JSON de la salida
-                        if (written.contains("VIDEO_MAP_JSON")) {
-                            val videoMapRegex = Regex("""VIDEO_MAP_JSON\s*=\s*(\{[^}]*\})""")
-                            val match = videoMapRegex.find(written)
-                            if (match != null) {
-                                videoMapJsonStr = match.destructured.component1()
-                            }
-                        }
-                    } finally {
-                        Context.exit()
-                    }
-                } catch (_: Exception) {}
-
-                if (videoMapJsonStr != null) break
-            }
-        }
-
-        // Método 2: Fallback - buscar VIDEO_MAP_JSON directamente en los scripts (si no está ofuscado)
-        if (videoMapJsonStr == null) {
-            for (script in doc.select("script")) {
-                val scriptData = script.data()
-                if (scriptData.contains("VIDEO_MAP_JSON")) {
-                    val videoMapRegex = Regex("""const\s+VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;""")
-                    val match = videoMapRegex.find(scriptData)
+            if (scriptData.contains("VIDEO_MAP_JSON")) {
+                // Intentar varios patrones de regex
+                val patterns = listOf(
+                    Regex("""const\s+VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
+                    Regex("""VIDEO_MAP_JSON\s*=\s*(\{[^}]+\})"""),
+                    Regex("""VIDEO_MAP_JSON\s*=\s*(\{.*?\})\s*;?"""),
+                )
+                for (pattern in patterns) {
+                    val match = pattern.find(scriptData)
                     if (match != null) {
                         videoMapJsonStr = match.destructured.component1()
                         break
                     }
                 }
+                if (videoMapJsonStr != null) break
             }
         }
 
@@ -297,15 +238,15 @@ class SeriesDonghuaProvider : MainAPI() {
         var foundLinks = false
         if (videoMapJsonStr != null) {
             try {
-                val videoMap = parseJson<VideoMapJson>(videoMapJsonStr)
+                val videoMap = try { parseJson<VideoMapJson>(videoMapJsonStr) } catch (_: Exception) { null }
 
                 // ===== Asura → Dailymotion =====
                 videoMap.asura?.let { rawValue ->
                     val asuraVal = decodeDoubleEncoded(rawValue)
                     if (asuraVal.isNotEmpty()) {
+                        // asura es un ID de Dailymotion
+                        val dmUrl = "https://www.dailymotion.com/embed/video/$asuraVal"
                         try {
-                            // asura es un ID de Dailymotion
-                            val dmUrl = "https://www.dailymotion.com/embed/video/$asuraVal"
                             loadExtractor(dmUrl, data, subtitleCallback, callback)
                             foundLinks = true
                         } catch (_: Exception) {
@@ -320,54 +261,68 @@ class SeriesDonghuaProvider : MainAPI() {
 
                 // ===== Skadi → ok.ru =====
                 videoMap.skadi?.let { rawValue ->
-                    try {
-                        val skadiUrl = decodeDoubleEncoded(rawValue)
-                        if (skadiUrl.startsWith("http")) {
-                            try {
-                                loadExtractor(skadiUrl, data, subtitleCallback, callback)
-                            } catch (_: Exception) {
-                                extractOkRu(skadiUrl, data, "Ok.ru", callback)
-                            }
+                    val skadiUrl = decodeDoubleEncoded(rawValue)
+                    if (skadiUrl.startsWith("http")) {
+                        try {
+                            loadExtractor(skadiUrl, data, subtitleCallback, callback)
+                            foundLinks = true
+                        } catch (_: Exception) {
+                            extractOkRu(skadiUrl, data, "Ok.ru", callback)
                             foundLinks = true
                         }
-                    } catch (_: Exception) {}
+                    }
                 }
 
-                // ===== Fembed → Rumble =====
+                // ===== Fembed → Variable (Rumble, StreamSB, likessb, etc.) =====
                 videoMap.fembed?.let { rawValue ->
-                    try {
-                        val rumbleUrl = decodeDoubleEncoded(rawValue)
-                        if (rumbleUrl.startsWith("http") && rumbleUrl.contains("rumble.com")) {
-                            extractRumble(rumbleUrl, data, "Rumble", callback)
-                            foundLinks = true
+                    val fembedUrl = decodeDoubleEncoded(rawValue)
+                    if (fembedUrl.startsWith("http")) {
+                        when {
+                            fembedUrl.contains("rumble.com") -> {
+                                extractRumble(fembedUrl, data, "Rumble", callback)
+                                foundLinks = true
+                            }
+                            fembedUrl.contains("likessb.com") || fembedUrl.contains("streamsb") -> {
+                                try {
+                                    loadExtractor(fembedUrl, data, subtitleCallback, callback)
+                                    foundLinks = true
+                                } catch (_: Exception) {
+                                    extractStreamSB(fembedUrl, data, "StreamSB", callback)
+                                    foundLinks = true
+                                }
+                            }
+                            else -> {
+                                // Intentar con loadExtractor para cualquier otro host
+                                try {
+                                    loadExtractor(fembedUrl, data, subtitleCallback, callback)
+                                    foundLinks = true
+                                } catch (_: Exception) {}
+                            }
                         }
-                    } catch (_: Exception) {}
+                    }
                 }
 
                 // ===== Tape → Odysee =====
                 videoMap.tape?.let { rawValue ->
-                    try {
-                        val odyseeUrl = decodeDoubleEncoded(rawValue)
-                        if (odyseeUrl.startsWith("http")) {
-                            extractOdysee(odyseeUrl, data, "Odysee", callback)
-                            foundLinks = true
-                        }
-                    } catch (_: Exception) {}
+                    val odyseeUrl = decodeDoubleEncoded(rawValue)
+                    if (odyseeUrl.startsWith("http")) {
+                        extractOdysee(odyseeUrl, data, "Odysee", callback)
+                        foundLinks = true
+                    }
                 }
 
                 // ===== Amagi → Voe.sx =====
                 videoMap.amagi?.let { rawValue ->
-                    try {
-                        val voeUrl = decodeDoubleEncoded(rawValue)
-                        if (voeUrl.startsWith("http")) {
-                            try {
-                                loadExtractor(voeUrl, data, subtitleCallback, callback)
-                            } catch (_: Exception) {
-                                extractVoe(voeUrl, data, "Voe", callback)
-                            }
+                    val voeUrl = decodeDoubleEncoded(rawValue)
+                    if (voeUrl.startsWith("http")) {
+                        try {
+                            loadExtractor(voeUrl, data, subtitleCallback, callback)
+                            foundLinks = true
+                        } catch (_: Exception) {
+                            extractVoe(voeUrl, data, "Voe", callback)
                             foundLinks = true
                         }
-                    } catch (_: Exception) {}
+                    }
                 }
 
             } catch (_: Exception) {}
@@ -408,6 +363,31 @@ class SeriesDonghuaProvider : MainAPI() {
                         } catch (_: Exception) {}
                     }
                 }
+            }
+        }
+
+        // Último fallback: buscar URLs de video en los scripts
+        if (!foundLinks) {
+            for (script in doc.select("script")) {
+                val scriptData = script.data()
+                // Buscar URLs de iframe de video conocidos
+                val iframePatterns = listOf(
+                    Regex("""(https?://[^"'\s<>]*dailymotion\.com/embed/[^"'\s<>]+)"""),
+                    Regex("""(https?://[^"'\s<>]*rumble\.com/embed/[^"'\s<>]+)"""),
+                    Regex("""(https?://[^"'\s<>]*ok\.ru/videoembed/[^"'\s<>]+)"""),
+                    Regex("""(https?://[^"'\s<>]*voe\.sx/e/[^"'\s<>]+)"""),
+                    Regex("""(https?://[^"'\s<>]*odysee\.com/[^"'\s<>]+)"""),
+                )
+                for (pattern in iframePatterns) {
+                    for (match in pattern.findAll(scriptData)) {
+                        val url = match.value
+                        try {
+                            loadExtractor(url, data, subtitleCallback, callback)
+                            foundLinks = true
+                        } catch (_: Exception) {}
+                    }
+                }
+                if (foundLinks) break
             }
         }
 
@@ -488,7 +468,6 @@ class SeriesDonghuaProvider : MainAPI() {
             val response = app.get(videoUrl, referer = referer, timeout = 15)
             val html = response.text
 
-            // ok.ru usa JSON con metadata de video
             val videoUrlRegex = Regex(""""(https?://[^"]+\.(?:mp4|m3u8)[^"]*)"""")
             for (match in videoUrlRegex.findAll(html)) {
                 val url = match.destructured.component1()
@@ -611,6 +590,8 @@ class SeriesDonghuaProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ) {
         try {
+            // Odysee embed URL: https://odysee.com/$/embed/@SeriesDonghua:9/ATG_040:a
+            // Convertir a stream URL
             val streamUrl = embedUrl.replace("/$/embed/", "/$/stream/")
             callback(
                 newExtractorLink(source = serverName, name = serverName, url = streamUrl) {
@@ -625,6 +606,42 @@ class SeriesDonghuaProvider : MainAPI() {
      * Extracción de video Voe.sx
      */
     private suspend fun extractVoe(
+        videoUrl: String,
+        referer: String,
+        serverName: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        try {
+            val response = app.get(videoUrl, referer = referer, timeout = 15)
+            val html = response.text
+
+            // Buscar URLs m3u8
+            val m3u8Regex = Regex("""(https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)""")
+            for (match in m3u8Regex.findAll(html)) {
+                try {
+                    generateM3u8(serverName, match.value, videoUrl).forEach(callback)
+                    return
+                } catch (_: Exception) {}
+            }
+
+            // Buscar URLs mp4
+            val mp4Regex = Regex("""(https?://[^"'\s<>]+\.mp4[^"'\s<>]*)""")
+            for (match in mp4Regex.findAll(html)) {
+                callback(
+                    newExtractorLink(source = serverName, name = serverName, url = match.value) {
+                        this.referer = videoUrl
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+                return
+            }
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * Extracción básica de StreamSB / likessb
+     */
+    private suspend fun extractStreamSB(
         videoUrl: String,
         referer: String,
         serverName: String,
