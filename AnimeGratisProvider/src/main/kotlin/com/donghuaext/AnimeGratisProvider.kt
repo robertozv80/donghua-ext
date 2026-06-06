@@ -43,16 +43,19 @@ class AnimeGratisProvider : MainAPI() {
         "User-Agent" to USER_AGENT,
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language" to "es-ES,es;q=0.8,en-US;q=0.5,en;q=0.3",
-        "Accept-Encoding" to "gzip, deflate",
+        "Accept-Encoding" to "gzip, deflate, br",
         "DNT" to "1",
         "Connection" to "keep-alive",
         "Upgrade-Insecure-Requests" to "1",
+        "Sec-Fetch-Dest" to "document",
+        "Sec-Fetch-Mode" to "navigate",
+        "Sec-Fetch-Site" to "none",
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val isHomePage = request.data == "$mainUrl/"
         val url = if (isHomePage) {
-            request.data // Homepage sin paginación
+            request.data
         } else {
             if (page > 1) "${request.data}?page=$page" else request.data
         }
@@ -61,40 +64,24 @@ class AnimeGratisProvider : MainAPI() {
 
         val home = if (isHomePage) {
             // Homepage: sección "Nuevos Episodios" / "En Emisión"
-            // Los enlaces son <a> directos dentro de #emisionGrid
-            // Cada <a> tiene href="/anime/{slug}/episodio-{N}"
-            val emisionCards = doc.select("#emisionGrid > a[href*=\"episodio\"]")
+            // El sitio usa Astro SSR con Tailwind CSS
+            // Los episodios están en #emisionGrid con <a data-home-episode-card>
+            val emisionCards = doc.select("a[data-home-episode-card]")
             if (emisionCards.isNotEmpty()) {
                 emisionCards.mapNotNull { link ->
-                    val href = link.attr("href") ?: return@mapNotNull null
-                    val img = link.selectFirst("img")
-                    val title = img?.attr("alt") ?: link.selectFirst("p.home-anime-title")?.text() ?: link.text()
-                    val poster = img?.attr("src") ?: img?.attr("data-fallback")
-                    // Limpiar título: "Nombre Episodio 9" → "Nombre"
-                    val cleanTitle = title.replace(Regex("\\s*Episodio\\s*\\d+"), "").trim()
-                    // Convertir URL episodio a URL serie: /anime/slug/episodio-N → /anime/slug-anime
-                    val seriesUrl = episodeUrlToSeriesUrl(href)
-                    val epNum = Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
-                    val dubstat = if (cleanTitle.contains("Latino") || cleanTitle.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
-                    newAnimeSearchResponse(cleanTitle, seriesUrl) {
-                        this.posterUrl = resolveUrl(poster ?: "")
-                        addDubStatus(dubstat, epNum)
-                    }
+                    parseHomeEpisodeCard(link)
                 }
             } else {
-                // Fallback: buscar todos los <a> con href que contenga "episodio"
-                doc.select("a[href*=\"episodio\"]").mapNotNull { link ->
-                    val href = link.attr("href") ?: return@mapNotNull null
-                    val img = link.selectFirst("img")
-                    val title = img?.attr("alt") ?: link.text()
-                    val poster = img?.attr("src") ?: img?.attr("data-fallback")
-                    val cleanTitle = title.replace(Regex("\\s*Episodio\\s*\\d+"), "").trim()
-                    val seriesUrl = episodeUrlToSeriesUrl(href)
-                    val epNum = Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
-                    val dubstat = if (cleanTitle.contains("Latino") || cleanTitle.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
-                    newAnimeSearchResponse(cleanTitle, seriesUrl) {
-                        this.posterUrl = resolveUrl(poster ?: "")
-                        addDubStatus(dubstat, epNum)
+                // Fallback: buscar en #emisionGrid
+                val gridCards = doc.select("#emisionGrid > a[href*=\"episodio\"]")
+                if (gridCards.isNotEmpty()) {
+                    gridCards.mapNotNull { link ->
+                        parseHomeEpisodeCard(link)
+                    }
+                } else {
+                    // Último fallback: cualquier <a> con href a episodio
+                    doc.select("a[href*=\"episodio\"]").mapNotNull { link ->
+                        parseHomeEpisodeCard(link)
                     }
                 }
             }
@@ -116,7 +103,6 @@ class AnimeGratisProvider : MainAPI() {
                     }
                 }
             } else {
-                // Fallback: selector genérico
                 doc.select("div.anime-card").mapNotNull {
                     val title = it.selectFirst("h3 a")?.text() ?: return@mapNotNull null
                     val href = it.selectFirst("h3 a")?.attr("href")
@@ -134,11 +120,33 @@ class AnimeGratisProvider : MainAPI() {
         }
 
         val hasNext = if (isHomePage) false
-            else doc.select("a[href*=\"page=${page + 1}\"], link[rel=\"next\"]").isNotEmpty()
+            else doc.select("link[rel=\"next\"]").isNotEmpty()
         return newHomePageResponse(
             list = HomePageList(request.name, home, isHorizontalImages = false),
             hasNext = hasNext
         )
+    }
+
+    /**
+     * Parsea una tarjeta de episodio del homepage
+     */
+    private fun parseHomeEpisodeCard(link: org.jsoup.nodes.Element): SearchResponse? {
+        val href = link.attr("href") ?: return null
+        if (!href.contains("episodio")) return null
+
+        val img = link.selectFirst("img")
+        val title = img?.attr("alt") ?: link.selectFirst("p.home-anime-title")?.text() ?: link.text()
+        val poster = img?.attr("src") ?: img?.attr("data-fallback")
+        // Limpiar título: "Nombre Episodio 9" → "Nombre"
+        val cleanTitle = title.replace(Regex("\\s*Episodio\\s*\\d+"), "").trim()
+        // Convertir URL episodio a URL serie: /anime/slug/episodio-N → /anime/slug-anime
+        val seriesUrl = episodeUrlToSeriesUrl(href)
+        val epNum = Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
+        val dubstat = if (cleanTitle.contains("Latino") || cleanTitle.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
+        return newAnimeSearchResponse(cleanTitle, seriesUrl) {
+            this.posterUrl = resolveUrl(poster ?: "")
+            addDubStatus(dubstat, epNum)
+        }
     }
 
     /**
@@ -147,7 +155,6 @@ class AnimeGratisProvider : MainAPI() {
      */
     private fun episodeUrlToSeriesUrl(epHref: String): String {
         val fullUrl = resolveUrl(epHref)
-        // Patrón: /anime/{slug}/episodio-{N}
         val regex = Regex("/anime/([^/]+)/episodio-\\d+")
         val match = regex.find(fullUrl)
         return if (match != null) {
@@ -160,11 +167,10 @@ class AnimeGratisProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         // Búsqueda del lado del cliente: el sitio NO filtra desde el servidor
-        // Fetch /directorio y filtrar por título en Kotlin
         val queryLower = query.lowercase(Locale.getDefault())
         val results = ArrayList<SearchResponse>()
         var page = 1
-        var maxPages = 5 // Limitar a 5 páginas para no demorar
+        var maxPages = 5
 
         while (page <= maxPages) {
             val url = if (page > 1) "$mainUrl/directorio?page=$page" else "$mainUrl/directorio"
@@ -187,10 +193,9 @@ class AnimeGratisProvider : MainAPI() {
             }
             results.addAll(pageResults)
 
-            // Si ya encontramos suficientes resultados, parar
             if (results.size >= 20) break
 
-            val hasNext = doc.select("a[href*=\"page=${page + 1}\"], link[rel=\"next\"]").isNotEmpty()
+            val hasNext = doc.select("link[rel=\"next\"]").isNotEmpty()
             if (!hasNext) break
             page++
         }
@@ -198,7 +203,7 @@ class AnimeGratisProvider : MainAPI() {
         return results
     }
 
-    // Modelos para parsear JSON-LD (sin anotaciones - los nombres de campo coinciden con las claves JSON)
+    // Modelos para parsear JSON-LD (sin anotaciones - nombres de campo coinciden con claves JSON)
     data class TvSeriesJsonLd(
         val name: String? = null,
         val alternateName: String? = null,
@@ -249,14 +254,18 @@ class AnimeGratisProvider : MainAPI() {
         }
 
         val title = jsonLdTitle ?: doc.selectFirst("h1")?.text() ?: ""
-        val description = jsonLdDescription ?: doc.selectFirst("h2")?.nextElementSibling()?.text() ?: ""
-        val poster = jsonLdImage ?: doc.selectFirst("#episodes-grid img")?.attr("src")
+        val description = jsonLdDescription ?: doc.selectFirst("h2:contains(Sinopsis) + p")?.text()
+            ?: doc.selectFirst("h2")?.nextElementSibling()?.text() ?: ""
+        // Poster: primero JSON-LD, luego img de la sección grid, luego og:image
+        val poster = jsonLdImage
+            ?: doc.selectFirst("section img[src*=\"cover\"]")?.attr("src")
+            ?: doc.selectFirst("head meta[property=og:image]")?.attr("content")
             ?: doc.selectFirst("img[data-fallback]")?.attr("data-fallback")
-            ?: doc.selectFirst("img[data-fb2]")?.attr("data-fb2")
             ?: ""
         val genres = if (jsonLdGenres.isNotEmpty()) jsonLdGenres
             else doc.select("a[href^=\"/directorio/genero/\"]").map { it.text() }
 
+        // Status: buscar en los spans de info
         val statusText = doc.select("span").map { it.text() }.find {
             it.contains("En emisión") || it.contains("Finalizado") || it.contains("Próximamente")
         }
@@ -277,9 +286,8 @@ class AnimeGratisProvider : MainAPI() {
 
         val episodes = ArrayList<Episode>()
 
-        // Primero: buscar episodios con data-episode en el HTML renderizado
-        // Selector: #episodes-grid a.episode-card con data-episode
-        val epCards = doc.select("#episodes-grid a.episode-card")
+        // Buscar episodios: selector principal a[data-episode] dentro de #episodes-grid
+        val epCards = doc.select("#episodes-grid a[data-episode]")
         if (epCards.isNotEmpty()) {
             epCards.amap { epCard ->
                 val href = epCard.attr("href")
@@ -294,27 +302,40 @@ class AnimeGratisProvider : MainAPI() {
                 }
             }
         } else {
-            // Fallback: buscar cualquier enlace a episodio
-            doc.select("a[href*=\"episodio\"]").amap { epCard ->
-                val href = epCard.attr("href")
-                val epNum = Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
-                if (href.isNotEmpty()) {
-                    episodes.add(
-                        newEpisode(resolveUrl(href)) {
-                            this.episode = epNum
-                        }
-                    )
+            // Fallback: buscar .episode-card sin data-episode
+            val epCards2 = doc.select("#episodes-grid a.episode-card")
+            if (epCards2.isNotEmpty()) {
+                epCards2.amap { epCard ->
+                    val href = epCard.attr("href")
+                    val epNum = Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
+                    if (href.isNotEmpty()) {
+                        episodes.add(
+                            newEpisode(resolveUrl(href)) {
+                                this.episode = epNum
+                            }
+                        )
+                    }
+                }
+            } else {
+                // Último fallback: cualquier enlace a episodio
+                doc.select("a[href*=\"episodio\"]").amap { epCard ->
+                    val href = epCard.attr("href")
+                    val epNum = Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
+                    if (href.isNotEmpty()) {
+                        episodes.add(
+                            newEpisode(resolveUrl(href)) {
+                                this.episode = epNum
+                            }
+                        )
+                    }
                 }
             }
         }
 
         // Si hay pocos episodios pero el JSON-LD indica más, generar las URLs faltantes
-        // El sitio usa select de rango que carga episodios via JS
-        // Formato de URL: /anime/{slug}/episodio-{N}  (slug sin -anime)
         if (episodes.size < (jsonLdEpCount ?: 0)) {
             val totalEps = jsonLdEpCount ?: episodes.size
             if (totalEps > episodes.size) {
-                // Extraer slug del URL: /anime/death-note-anime → death-note
                 val slugWithAnime = url.substringAfter("/anime/")
                 val slug = slugWithAnime.removeSuffix("-anime").removeSuffix("/")
 
@@ -357,11 +378,12 @@ class AnimeGratisProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data, headers = headers, timeout = 30).document
 
-        // Método principal: extraer URLs de los botones de servidor
+        var foundLinks = false
+
+        // Método 1: extraer URLs de los botones de servidor (data-url)
         doc.select("button.server-btn[data-url]").amap { btn ->
             val videoUrl = btn.attr("data-url")
             val serverName = btn.attr("data-server") ?: "Server"
-            val langGroup = btn.attr("data-lang-group") ?: "ja"
 
             if (videoUrl.isNotEmpty() && videoUrl.startsWith("http")) {
                 try {
@@ -376,66 +398,117 @@ class AnimeGratisProvider : MainAPI() {
                                     val m3u8Url = m3u8Regex.find(text)?.value
                                     if (!m3u8Url.isNullOrEmpty()) {
                                         generateM3u8(serverName, m3u8Url, data).forEach(callback)
+                                        foundLinks = true
                                     }
                                 } else if (text.contains(".mp4")) {
                                     val mp4Regex = Regex("""(https?://[^\s"'<>]+\.mp4[^\s"'<>]*)""")
                                     val mp4Url = mp4Regex.find(text)?.value
                                     if (!mp4Url.isNullOrEmpty()) {
                                         callback(
-                                            newExtractorLink(
-                                                source = serverName,
-                                                name = serverName,
-                                                url = mp4Url
-                                            ) {
+                                            newExtractorLink(source = serverName, name = serverName, url = mp4Url) {
                                                 this.referer = data
                                                 this.quality = Qualities.Unknown.value
                                             }
                                         )
+                                        foundLinks = true
                                     }
                                 }
                             } catch (_: Exception) {
-                                loadExtractor(videoUrl, data, subtitleCallback, callback)
+                                try {
+                                    loadExtractor(videoUrl, data, subtitleCallback, callback)
+                                    foundLinks = true
+                                } catch (_: Exception) {}
                             }
                         }
-                        // Otros servidores conocidos
                         else -> {
-                            loadExtractor(videoUrl, data, subtitleCallback, callback)
+                            try {
+                                loadExtractor(videoUrl, data, subtitleCallback, callback)
+                                foundLinks = true
+                            } catch (_: Exception) {}
                         }
                     }
                 } catch (_: Exception) {}
             }
         }
 
-        // Método alternativo: buscar iframe del video
-        doc.select("iframe#videoFrame, iframe").amap { iframe ->
-            val src = iframe.attr("src")
-            if (src.isNotEmpty()) {
-                val fullSrc = resolveUrl(src)
-                if (fullSrc.startsWith("http")) {
+        // Método 2: buscar data-url en cualquier elemento (no solo buttons)
+        if (!foundLinks) {
+            doc.select("[data-url]").amap { el ->
+                val videoUrl = el.attr("data-url")
+                if (videoUrl.isNotEmpty() && videoUrl.startsWith("http")) {
                     try {
-                        when {
-                            fullSrc.contains("zilla-networks.com") || fullSrc.contains("player.zilla") -> {
-                                try {
-                                    val response = app.get(fullSrc, referer = data, headers = headers, timeout = 15)
-                                    val text = response.text
-                                    if (text.contains(".m3u8") || text.contains("#EXTM3U")) {
-                                        val m3u8Regex = Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""")
-                                        val m3u8Url = m3u8Regex.find(text)?.value
-                                        if (!m3u8Url.isNullOrEmpty()) {
-                                            generateM3u8("HLS", m3u8Url, data).forEach(callback)
-                                        }
-                                    }
-                                } catch (_: Exception) {}
-                            }
-                            else -> {
-                                loadExtractor(fullSrc, data, subtitleCallback, callback)
-                            }
-                        }
+                        loadExtractor(videoUrl, data, subtitleCallback, callback)
+                        foundLinks = true
                     } catch (_: Exception) {}
                 }
             }
         }
 
-        return true
+        // Método 3: buscar iframe del video
+        if (!foundLinks) {
+            doc.select("iframe").amap { iframe ->
+                val src = iframe.attr("src") ?: iframe.attr("data-src")
+                if (src.isNotEmpty()) {
+                    val fullSrc = resolveUrl(src)
+                    if (fullSrc.startsWith("http")) {
+                        try {
+                            when {
+                                fullSrc.contains("zilla-networks.com") || fullSrc.contains("player.zilla") -> {
+                                    try {
+                                        val response = app.get(fullSrc, referer = data, headers = headers, timeout = 15)
+                                        val text = response.text
+                                        if (text.contains(".m3u8") || text.contains("#EXTM3U")) {
+                                            val m3u8Regex = Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""")
+                                            val m3u8Url = m3u8Regex.find(text)?.value
+                                            if (!m3u8Url.isNullOrEmpty()) {
+                                                generateM3u8("HLS", m3u8Url, data).forEach(callback)
+                                                foundLinks = true
+                                            }
+                                        }
+                                    } catch (_: Exception) {}
+                                }
+                                else -> {
+                                    try {
+                                        loadExtractor(fullSrc, data, subtitleCallback, callback)
+                                        foundLinks = true
+                                    } catch (_: Exception) {}
+                                }
+                            }
+                        } catch (_: Exception) {}
+                    }
+                }
+            }
+        }
+
+        // Método 4: buscar URL de video directamente en scripts de la página
+        if (!foundLinks) {
+            for (script in doc.select("script")) {
+                val scriptData = script.data()
+                if (scriptData.contains("m3u8") || scriptData.contains("mp4")) {
+                    val m3u8Regex = Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""")
+                    m3u8Regex.find(scriptData)?.value?.let { url ->
+                        try {
+                            generateM3u8("Server", url, data).forEach(callback)
+                            foundLinks = true
+                        } catch (_: Exception) {}
+                    }
+                    if (!foundLinks) {
+                        val mp4Regex = Regex("""(https?://[^\s"'<>]+\.mp4[^\s"'<>]*)""")
+                        mp4Regex.find(scriptData)?.value?.let { url ->
+                            callback(
+                                newExtractorLink(source = "Server", name = "Server", url = url) {
+                                    this.referer = data
+                                    this.quality = Qualities.Unknown.value
+                                }
+                            )
+                            foundLinks = true
+                        }
+                    }
+                }
+                if (foundLinks) break
+            }
+        }
+
+        return foundLinks
     }
 }
