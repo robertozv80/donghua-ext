@@ -239,6 +239,7 @@ class SeriesDonghuaProvider : MainAPI() {
         if (videoMapJsonStr != null) {
             try {
                 val videoMap = try { parseJson<VideoMapJson>(videoMapJsonStr) } catch (_: Exception) { null }
+                if (videoMap == null) return@try
 
                 // ===== Asura → Dailymotion =====
                 videoMap.asura?.let { rawValue ->
