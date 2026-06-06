@@ -7,8 +7,6 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
-import java.net.URI
-import java.nio.charset.Charset
 import kotlin.collections.ArrayList
 
 class SeriesDonghuaProvider : MainAPI() {
@@ -101,7 +99,6 @@ class SeriesDonghuaProvider : MainAPI() {
         }
     }
 
-    // ========== search ==========
     override suspend fun search(query: String): List<SearchResponse> {
         val searchUrl = "$mainUrl/busquedas/${java.net.URLEncoder.encode(query, "UTF-8")}"
         return app.get(searchUrl, timeout = 120L).document
@@ -118,7 +115,6 @@ class SeriesDonghuaProvider : MainAPI() {
             }
     }
 
-    // ========== load ==========
     override suspend fun load(url: String): LoadResponse {
         val seriesUrl = if (url.contains("-episodio-")) {
             convertEpisodeToSeriesUrl(url)
@@ -167,22 +163,17 @@ class SeriesDonghuaProvider : MainAPI() {
 
         if (episodes.isEmpty() && tvType == TvType.AnimeMovie) {
             return newMovieLoadResponse(title, seriesUrl, TvType.AnimeMovie, seriesUrl) {
-                posterUrl = poster
-                plot = description
-                tags = genres
+                posterUrl = poster; plot = description; tags = genres
             }
         }
 
         return newAnimeLoadResponse(title, seriesUrl, tvType) {
             posterUrl = poster
             addEpisodes(DubStatus.Subbed, episodes.sortedBy { it.episode })
-            showStatus = status
-            plot = description
-            tags = genres
+            showStatus = status; plot = description; tags = genres
         }
     }
 
-    // ========== Modelo VIDEO_MAP_JSON ==========
     data class VideoMapJson(
         val asura: String? = null,
         val skadi: String? = null,
@@ -194,134 +185,126 @@ class SeriesDonghuaProvider : MainAPI() {
     // ================================================================
     //  DECODIFICADOR DEL JAVASCRIPT OFUSCADO (Smart Packer)
     // ================================================================
-    // El sitio usa eval(function(h,u,n,t,e,r){...}(encoded,base,charset,offset,delimIdx,...))
-    // para ofuscar VIDEO_MAP_JSON. Este decodificador reimplementa el algoritmo en Kotlin.
+    // El sitio usa eval(function(h,u,n,t,e,r){...}(args)) para
+    // ocultar VIDEO_MAP_JSON. No aparece en el HTML crudo.
     //
-    // Algoritmo:
-    //   1. charset n = "FSUfvxBAu" (ejemplo)
-    //   2. delimiter = n[e] (ej. n[6] = 'B')
-    //   3. Split h por delimiter → tokens
-    //   4. Para cada token: reemplazar cada char por su índice en n → string de dígitos
-    //   5. Convertir de base-e (ej. base-6) a decimal
-    //   6. Restar offset t (ej. 18)
-    //   7. Convertir a byte → concatenar
-    //   8. Decodificar como UTF-8
+    // Estructura de la función JS:
+    //   eval(function(h,u,n,t,e,r){
+    //     r="";
+    //     for(i=0;i<h.length;i++){
+    //       var s="";
+    //       while(h[i]!==n[e]){ s+=h[i]; i++ }  // split por n[e]
+    //       for(j=0;j<n.length;j++)
+    //         s=s.replace(new RegExp(n[j],"g"),j); // charset→dígitos
+    //       r+=String.fromCharCode(_0xe95c(s,e,10)-t)  // base-e→decimal, -offset
+    //     }
+    //     return decodeURIComponent(escape(r))  // UTF-8 decode
+    //   }(h_val, u_val, n_val, t_val, e_val, r_val))
+    //
+    // Parámetros:
+    //   h = string codificado (largo)
+    //   u = número (NO se usa dentro de la función)
+    //   n = charset (string corto, ej "RHFnmrMVI")
+    //   t = offset a restar del charCode
+    //   e = base para la conversión numérica Y índice del delimitador n[e]
+    //   r = número (se sobreescribe con "", NO se usa)
+    //
+    // Función auxiliar _0xe95c(d, e, f):
+    //   Convierte string d de base-e a base-f (en este caso f=10)
+    //   Solo los dígitos que están en h=digits.slice(0,e) contribuyen
+    //   Los demás se ignoran (pero su posición sí cuenta)
     // ================================================================
 
-    /**
-     * Decodifica el JavaScript ofuscado del tipo Smart Packer.
-     * Retorna el texto decodificado, o null si falla.
-     */
     private fun decodeSmartPacker(
-        encodedStr: String,
-        base: Int,
-        charset: String,
-        offset: Int,
-        delimIdx: Int
+        encodedStr: String, eParam: Int, charset: String, offset: Int
     ): String? {
-        if (charset.isEmpty() || delimIdx < 0 || delimIdx >= charset.length) return null
-        if (base < 2 || base > 64) return null
+        if (charset.isEmpty() || eParam < 2 || eParam > 62) return null
+        if (eParam >= charset.length) return null
 
-        val delimiter = charset[delimIdx]
-
-        // Digitos para la conversión de base (estándar: 0-9, a-z, A-Z, +, /)
+        val delimiter = charset[eParam]
         val digits = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"
+        val hDigits = digits.substring(0, eParam)  // dígitos válidos para base eParam
 
-        // Split por delimiter
         val tokens = encodedStr.split(delimiter)
-
         val bytes = ArrayList<Byte>()
+
         for (token in tokens) {
             if (token.isEmpty()) continue
 
-            // Reemplazar cada char por su índice en el charset → string de dígitos
-            val digitStr = StringBuilder()
+            // Reemplazar cada char por su índice en el charset
+            var digitStr = ""
             for (c in token) {
                 val idx = charset.indexOf(c)
-                if (idx < 0) return null  // Carácter no reconocido
-                digitStr.append(digits[idx])
+                if (idx < 0) return null
+                digitStr += idx.toString()
             }
 
-            // Convertir de base-e a decimal usando los digitos estándar
+            // Convertir de base eParam a decimal (misma lógica que JS _0xe95c)
+            // El JS hace .reverse().reduce() — procesa de derecha a izquierda
+            // con posición que incrementa incluso para dígitos fuera de rango
+            val reversed = digitStr.reversed()
             var num = 0L
-            for (c in digitStr.toString()) {
-                val digitVal = digits.indexOf(c)
-                if (digitVal < 0 || digitVal >= base) return null
-                num = num * base + digitVal
+            for ((pos, ch) in reversed.withIndex()) {
+                val idx = hDigits.indexOf(ch)
+                if (idx >= 0) {
+                    var power = 1L
+                    repeat(pos) { power *= eParam }
+                    num += idx * power
+                }
             }
 
-            // Restar offset y convertir a byte
             val charCode = num - offset
             if (charCode < 0 || charCode > 255) return null
             bytes.add(charCode.toByte())
         }
 
-        // Decodificar como UTF-8 (equivalente a decodeURIComponent(escape(r)))
         return try {
-            String(bytes.toByteArray(), Charset.forName("UTF-8"))
+            String(bytes.toByteArray(), Charsets.UTF_8)
         } catch (_: Exception) {
             String(bytes.toByteArray(), Charsets.ISO_8859_1)
         }
     }
 
     /**
-     * Busca y decodifica el eval() ofuscado en el HTML de la página de episodio.
-     * Retorna el texto decodificado que contiene VIDEO_MAP_JSON, o null si falla.
+     * Busca y decodifica el eval() ofuscado en el HTML.
+     * Patrón: eval(function(h,u,n,t,e,r){...}("encoded",u_val,"charset",t_val,e_val,r_val))
+     *
+     * MAPEO CORRECTO de parámetros:
+     *   Grupo 1 = h (string codificado)
+     *   Grupo 2 = u (NO usado)
+     *   Grupo 3 = n (charset)
+     *   Grupo 4 = t (offset)
+     *   Grupo 5 = e (base Y delimiter index) ← CLAVE
+     *   Grupo 6 = r (NO usado, se sobreescribe)
      */
     private fun decodeObfuscatedScript(html: String): String? {
-        // Patrón 1: eval(function(h,u,n,t,e,r){...}("encoded", 44, "FSUfvxBAu", 18, 6, 11))
-        // El patrón captura: encoded_str, base, charset, offset, delimIdx
-        val evalPatterns = listOf(
-            // Formato Smart Packer con parámetros posicionales
-            Regex("""eval\(function\s*\(\s*h\s*,\s*u\s*,\s*n\s*,\s*t\s*,\s*e\s*,\s*r\s*\)\s*\{[^}]+\}\s*\(\s*"([^"]+)"\s*,\s*(\d+)\s*,\s*"([^"]+)"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)"""),
-            // Variante con comillas simples
-            Regex("""eval\(function\s*\(\s*h\s*,\s*u\s*,\s*n\s*,\s*t\s*,\s*e\s*,\s*r\s*\)\s*\{[^}]+\}\s*\(\s*'([^']+)'\s*,\s*(\d+)\s*,\s*'([^']+)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)"""),
+        val argPatterns = listOf(
+            // Con comillas dobles - encoded string de 20+ chars
+            Regex("""\(\s*"([^"]{20,})"\s*,\s*(\d+)\s*,\s*"([^"]{2,20})"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)"""),
+            // Con comillas simples
+            Regex("""\(\s*'([^']{20,})'\s*,\s*(\d+)\s*,\s*'([^']{2,20})'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)"""),
         )
 
-        for (pattern in evalPatterns) {
-            val match = pattern.find(html)
-            if (match != null) {
-                val encodedStr = match.destructured.component1()
-                val base = match.destructured.component2().toIntOrNull() ?: continue
-                val charset = match.destructured.component3()
-                val offset = match.destructured.component4().toIntOrNull() ?: continue
-                val delimIdx = match.destructured.component5().toIntOrNull() ?: continue
-                // component6 is the unused 'r' parameter
+        for (pattern in argPatterns) {
+            for (match in pattern.findAll(html)) {
+                try {
+                    val encodedStr = match.destructured.component1()  // h
+                    // component2() = u (NO usado)
+                    val charset = match.destructured.component3()     // n
+                    val offset = match.destructured.component4().toInt()  // t
+                    val eParam = match.destructured.component5().toInt()  // e (base + delim)
 
-                val decoded = decodeSmartPacker(encodedStr, base, charset, offset, delimIdx)
-                if (decoded != null && decoded.contains("VIDEO_MAP_JSON")) {
-                    return decoded
-                }
-            }
-        }
-
-        // Fallback: buscar patrones más flexibles del eval call
-        // Intentar con regex que captura toda la llamada eval
-        val flexiblePattern = Regex(
-            """eval\(function\s*\(\s*\w+\s*,\s*\w+\s*,\s*\w+\s*,\s*\w+\s*,\s*\w+\s*,\s*\w+\s*\)\s*\{.*?\}\s*\(\s*["']([^"']+)["']\s*,\s*(\d+)\s*,\s*["']([^"']+)["']\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\\)""",
-            RegexOption.DOT_MATCHES_ALL
-        )
-        val flexMatch = flexiblePattern.find(html)
-        if (flexMatch != null) {
-            val encodedStr = flexMatch.destructured.component1()
-            val base = flexMatch.destructured.component2().toIntOrNull() ?: return null
-            val charset = flexMatch.destructured.component3()
-            val offset = flexMatch.destructured.component4().toIntOrNull() ?: return null
-            val delimIdx = flexMatch.destructured.component5().toIntOrNull() ?: return null
-
-            val decoded = decodeSmartPacker(encodedStr, base, charset, offset, delimIdx)
-            if (decoded != null && decoded.contains("VIDEO_MAP_JSON")) {
-                return decoded
+                    val decoded = decodeSmartPacker(encodedStr, eParam, charset, offset)
+                    if (decoded != null && decoded.contains("VIDEO_MAP_JSON")) {
+                        return decoded
+                    }
+                } catch (_: Exception) { continue }
             }
         }
 
         return null
     }
 
-    /**
-     * Extrae VIDEO_MAP_JSON del texto decodificado.
-     * Retorna el string JSON de VIDEO_MAP_JSON, o null si no se encuentra.
-     */
     private fun extractVideoMapJson(decodedScript: String): String? {
         val patterns = listOf(
             Regex("""const\s+VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
@@ -330,19 +313,15 @@ class SeriesDonghuaProvider : MainAPI() {
         )
         for (pattern in patterns) {
             val match = pattern.find(decodedScript)
-            if (match != null) {
-                return match.destructured.component1()
-            }
+            if (match != null) return match.destructured.component1()
         }
         return null
     }
 
     // ========== loadLinks ==========
     override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
+        data: String, isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ): Boolean {
         val response = app.get(data, timeout = 120L)
         val doc = response.document
@@ -350,28 +329,22 @@ class SeriesDonghuaProvider : MainAPI() {
 
         var foundLinks = false
 
-        // ====== PASO 1: Decodificar el JavaScript ofuscado ======
-        // VIDEO_MAP_JSON NO está en el HTML crudo — se inyecta vía eval() ofuscado
+        // ====== PASO 1: Decodificar JavaScript ofuscado ======
         val decodedScript = decodeObfuscatedScript(html)
         val videoMapJsonStr = if (decodedScript != null) {
             extractVideoMapJson(decodedScript)
         } else {
-            // Fallback: buscar directamente en los scripts (por si la ofuscación cambia)
+            // Fallback: buscar VIDEO_MAP_JSON directamente (por si no está ofuscado)
             var found: String? = null
             for (script in doc.select("script")) {
                 val scriptData = script.data()
                 if (scriptData.contains("VIDEO_MAP_JSON")) {
-                    val patterns = listOf(
+                    for (pattern in listOf(
                         Regex("""const\s+VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
                         Regex("""VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
-                        Regex("""VIDEO_MAP_JSON\s*=\s*(\{.*?\})\s*;?"""),
-                    )
-                    for (pattern in patterns) {
+                    )) {
                         val match = pattern.find(scriptData)
-                        if (match != null) {
-                            found = match.destructured.component1()
-                            break
-                        }
+                        if (match != null) { found = match.destructured.component1(); break }
                     }
                     if (found != null) break
                 }
@@ -379,16 +352,14 @@ class SeriesDonghuaProvider : MainAPI() {
             found
         }
 
-        // ====== PASO 2: Parsear VIDEO_MAP_JSON y extraer enlaces ======
+        // ====== PASO 2: Parsear y extraer enlaces ======
         if (videoMapJsonStr != null) {
             val videoMap: VideoMapJson? = try {
                 parseJson<VideoMapJson>(videoMapJsonStr)
-            } catch (_: Exception) {
-                null
-            }
+            } catch (_: Exception) { null }
 
             if (videoMap != null) {
-                // ===== Asura → Dailymotion =====
+                // Asura → Dailymotion (el valor es un ID de video)
                 videoMap.asura?.let { rawValue ->
                     val videoId = decodeDoubleEncoded(rawValue)
                     if (videoId.isNotEmpty()) {
@@ -396,60 +367,44 @@ class SeriesDonghuaProvider : MainAPI() {
                     }
                 }
 
-                // ===== Skadi → ok.ru =====
+                // Skadi → ok.ru
                 videoMap.skadi?.let { rawValue ->
                     val url = decodeDoubleEncoded(rawValue)
                     if (url.startsWith("http")) {
-                        try {
-                            loadExtractor(url, data, subtitleCallback, callback)
-                            foundLinks = true
-                        } catch (_: Exception) {
+                        try { loadExtractor(url, data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {
                             foundLinks = extractOkRu(url, data, "ok.ru", callback) || foundLinks
                         }
                     }
                 }
 
-                // ===== Fembed → Rumble / StreamSB / genérico =====
+                // Fembed → Rumble / StreamSB / genérico
                 videoMap.fembed?.let { rawValue ->
                     val url = decodeDoubleEncoded(rawValue)
                     if (url.startsWith("http")) {
-                        try {
-                            loadExtractor(url, data, subtitleCallback, callback)
-                            foundLinks = true
-                        } catch (_: Exception) {
+                        try { loadExtractor(url, data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {
                             when {
-                                url.contains("rumble.com") ->
-                                    foundLinks = extractRumble(url, data, "Rumble", callback) || foundLinks
-                                url.contains("likessb.com") || url.contains("streamsb") ->
-                                    foundLinks = extractGenericVideo(url, data, "StreamSB", callback) || foundLinks
-                                else ->
-                                    foundLinks = extractGenericVideo(url, data, "Server", callback) || foundLinks
+                                url.contains("rumble.com") -> foundLinks = extractRumble(url, data, "Rumble", callback) || foundLinks
+                                else -> foundLinks = extractGenericVideo(url, data, "Server", callback) || foundLinks
                             }
                         }
                     }
                 }
 
-                // ===== Tape → Odysee =====
+                // Tape → Odysee
                 videoMap.tape?.let { rawValue ->
                     val url = decodeDoubleEncoded(rawValue)
                     if (url.startsWith("http")) {
-                        try {
-                            loadExtractor(url, data, subtitleCallback, callback)
-                            foundLinks = true
-                        } catch (_: Exception) {
+                        try { loadExtractor(url, data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {
                             foundLinks = extractOdysee(url, data, "Odysee", callback) || foundLinks
                         }
                     }
                 }
 
-                // ===== Amagi → Voe.sx =====
+                // Amagi → Voe.sx
                 videoMap.amagi?.let { rawValue ->
                     val url = decodeDoubleEncoded(rawValue)
                     if (url.startsWith("http")) {
-                        try {
-                            loadExtractor(url, data, subtitleCallback, callback)
-                            foundLinks = true
-                        } catch (_: Exception) {
+                        try { loadExtractor(url, data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {
                             foundLinks = extractVoe(url, data, "Voe", callback) || foundLinks
                         }
                     }
@@ -457,53 +412,28 @@ class SeriesDonghuaProvider : MainAPI() {
             }
         }
 
-        // ====== Fallback 1: Buscar iframes directamente ======
+        // Fallback 1: iframes
         if (!foundLinks) {
             doc.select("iframe").amap { iframe ->
-                val src = listOf("src", "data-src")
-                    .map { iframe.attr(it).trim() }
-                    .firstOrNull { it.isNotBlank() }
+                val src = listOf("src", "data-src").map { iframe.attr(it).trim() }.firstOrNull { it.isNotBlank() }
                 if (src != null) {
                     val fullSrc = resolveUrl(src)
                     if (fullSrc.startsWith("http")) {
-                        try {
-                            loadExtractor(fullSrc, data, subtitleCallback, callback)
-                            foundLinks = true
-                        } catch (_: Exception) {}
+                        try { loadExtractor(fullSrc, data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {}
                     }
                 }
             }
         }
 
-        // ====== Fallback 2: Buscar URLs de video en el HTML completo ======
+        // Fallback 2: URLs de video en el HTML
         if (!foundLinks) {
-            val iframePatterns = listOf(
+            for (pattern in listOf(
                 Regex("""(https?://[^"'\s<>]*dailymotion\.com/[^"'\s<>]+)"""),
-                Regex("""(https?://[^"'\s<>]*rumble\.com/embed/[^"'\s<>]+)"""),
                 Regex("""(https?://[^"'\s<>]*ok\.ru/videoembed/[^"'\s<>]+)"""),
                 Regex("""(https?://[^"'\s<>]*voe\.sx/e/[^"'\s<>]+)"""),
-                Regex("""(https?://[^"'\s<>]*odysee\.com/[^"'\s<>]+)"""),
-            )
-            for (pattern in iframePatterns) {
+            )) {
                 for (match in pattern.findAll(html)) {
-                    try {
-                        loadExtractor(match.value, data, subtitleCallback, callback)
-                        foundLinks = true
-                    } catch (_: Exception) {}
-                }
-                if (foundLinks) break
-            }
-        }
-
-        // ====== Fallback 3: player.php proxy ======
-        if (!foundLinks) {
-            for (match in Regex("""player\.php\?url=(https?://[^"'\s<>]+)""").findAll(html)) {
-                val proxyUrl = match.destructured.component1()
-                try {
-                    loadExtractor(proxyUrl, data, subtitleCallback, callback)
-                    foundLinks = true
-                } catch (_: Exception) {
-                    foundLinks = extractGenericVideo(proxyUrl, data, "Proxy", callback) || foundLinks
+                    try { loadExtractor(match.value, data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {}
                 }
                 if (foundLinks) break
             }
@@ -515,112 +445,76 @@ class SeriesDonghuaProvider : MainAPI() {
     // ========== Decodificador de valores doble-encoded ==========
     private fun decodeDoubleEncoded(value: String): String {
         var result = value.trim()
-        if (result.startsWith("\"") && result.endsWith("\"")) {
-            result = result.substring(1, result.length - 1)
-        }
-        result = result.replace("\\/", "/")
-            .replace("\\\"", "\"")
-            .replace("\\\\", "\\")
-        if (result.startsWith("\"") && result.endsWith("\"")) {
-            result = result.substring(1, result.length - 1)
-        }
+        if (result.startsWith("\"") && result.endsWith("\"")) result = result.substring(1, result.length - 1)
+        result = result.replace("\\/", "/").replace("\\\"", "\"").replace("\\\\", "\\")
+        if (result.startsWith("\"") && result.endsWith("\"")) result = result.substring(1, result.length - 1)
         return result.trim()
     }
 
-    // ========== Extractores de video ==========
+    // ========== Extractores ==========
 
     private suspend fun extractDailymotion(
         videoId: String, referer: String, serverName: String,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Método 1: loadExtractor
+        // 1) loadExtractor
+        try { loadExtractor("https://www.dailymotion.com/embed/video/$videoId", referer, subtitleCallback, callback); return true } catch (_: Exception) {}
+        // 2) API metadata
         try {
-            loadExtractor("https://www.dailymotion.com/embed/video/$videoId", referer, subtitleCallback, callback)
-            return true
-        } catch (_: Exception) {}
-
-        // Método 2: API de metadata del player
-        try {
-            val apiUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
-            val jsonText = app.get(apiUrl,
+            val jsonText = app.get("https://www.dailymotion.com/player/metadata/video/$videoId",
                 referer = "https://www.dailymotion.com/embed/video/$videoId",
-                headers = mapOf("User-Agent" to USER_AGENT, "Accept" to "application/json"),
-                timeout = 15L
-            ).text
-
-            for (match in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(jsonText)) {
-                try { generateM3u8(serverName, match.value, "https://www.dailymotion.com").forEach(callback); return true } catch (_: Exception) {}
+                headers = mapOf("User-Agent" to USER_AGENT, "Accept" to "application/json"), timeout = 15L).text
+            for (m in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(jsonText)) {
+                try { generateM3u8(serverName, m.value, "https://www.dailymotion.com").forEach(callback); return true } catch (_: Exception) {}
             }
-            val mp4Urls = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(jsonText).map { it.value }.distinct().toList()
-            if (mp4Urls.isNotEmpty()) {
-                for (url in mp4Urls) {
-                    val quality = when {
-                        url.contains("1080") -> Qualities.P1080.value
-                        url.contains("720") -> Qualities.P720.value
-                        url.contains("480") -> Qualities.P480.value
-                        url.contains("380") || url.contains("360") -> Qualities.P360.value
-                        else -> Qualities.Unknown.value
-                    }
-                    callback(newExtractorLink(source = serverName, name = "$serverName ${quality/1000}p", url = url) {
-                        this.referer = "https://www.dailymotion.com"; this.quality = quality
-                    })
+            val mp4s = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(jsonText).map { it.value }.distinct().toList()
+            if (mp4s.isNotEmpty()) {
+                for (url in mp4s) {
+                    val q = when { url.contains("1080") -> Qualities.P1080.value; url.contains("720") -> Qualities.P720.value; url.contains("480") -> Qualities.P480.value; else -> Qualities.Unknown.value }
+                    callback(newExtractorLink(source = serverName, name = "$serverName ${q/1000}p", url = url) { this.referer = "https://www.dailymotion.com"; this.quality = q })
                 }
                 return true
             }
         } catch (_: Exception) {}
-
-        // Método 3: Scrape embed page
+        // 3) Scrape embed page
         try {
             val embedUrl = "https://www.dailymotion.com/embed/video/$videoId"
             val embedHtml = app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
-            for (match in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(embedHtml)) {
-                try { generateM3u8(serverName, match.value, embedUrl).forEach(callback); return true } catch (_: Exception) {}
+            for (m in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(embedHtml)) {
+                try { generateM3u8(serverName, m.value, embedUrl).forEach(callback); return true } catch (_: Exception) {}
             }
-            for (match in Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(embedHtml)) {
-                callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
-                    this.referer = embedUrl; this.quality = Qualities.Unknown.value
-                })
+            for (m in Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(embedHtml)) {
+                callback(newExtractorLink(source = serverName, name = serverName, url = m.value) { this.referer = embedUrl; this.quality = Qualities.Unknown.value })
                 return true
             }
         } catch (_: Exception) {}
-
         return false
     }
 
-    private suspend fun extractOkRu(
-        videoUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    private suspend fun extractOkRu(videoUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit): Boolean {
         try {
             val html = app.get(videoUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
             val dataMatch = Regex("""data-options="([^"]+)"""").find(html)
             if (dataMatch != null) {
                 val optionsJson = dataMatch.destructured.component1().replace("&quot;", "\"").replace("&amp;", "&")
-                for (match in Regex("""(https?://[^"]+\.(?:mp4|m3u8)[^"]*)""").findAll(optionsJson)) {
-                    callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
-                        this.referer = videoUrl; this.quality = Qualities.Unknown.value
-                    })
+                for (m in Regex("""(https?://[^"]+\.(?:mp4|m3u8)[^"]*)""").findAll(optionsJson)) {
+                    callback(newExtractorLink(source = serverName, name = serverName, url = m.value) { this.referer = videoUrl; this.quality = Qualities.Unknown.value })
                     return true
                 }
             }
             Regex("""<meta\s+property=["']og:video(?::url)?["']\s+content=["']([^"']+)["']""").find(html)?.let { m ->
-                callback(newExtractorLink(source = serverName, name = serverName, url = m.destructured.component1()) {
-                    this.referer = videoUrl; this.quality = Qualities.Unknown.value
-                })
+                callback(newExtractorLink(source = serverName, name = serverName, url = m.destructured.component1()) { this.referer = videoUrl; this.quality = Qualities.Unknown.value })
                 return true
             }
-            for (match in Regex("""(https?://[^"'\s<>]+\.(?:mp4|m3u8)[^"'\s<>]*)""").findAll(html)) {
-                callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
-                    this.referer = videoUrl; this.quality = Qualities.Unknown.value
-                })
+            for (m in Regex("""(https?://[^"'\s<>]+\.(?:mp4|m3u8)[^"'\s<>]*)""").findAll(html)) {
+                callback(newExtractorLink(source = serverName, name = serverName, url = m.value) { this.referer = videoUrl; this.quality = Qualities.Unknown.value })
                 return true
             }
         } catch (_: Exception) {}
         return false
     }
 
-    private suspend fun extractRumble(
-        embedUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    private suspend fun extractRumble(embedUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit): Boolean {
         try {
             val html = app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 30L).text
             val jsonMatch = Regex(""""ua":\s*\{[^}]*"mp4":\s*\[([^\]]+)\]""").find(html)
@@ -629,14 +523,8 @@ class SeriesDonghuaProvider : MainAPI() {
                 var found = false
                 Regex(""""(https?://[^"]+\.mp4[^"]*)"""").findAll(mp4Array).forEach { match ->
                     val url = match.destructured.component1()
-                    val quality = when {
-                        url.contains("1080") -> Qualities.P1080.value; url.contains("720") -> Qualities.P720.value
-                        url.contains("480") -> Qualities.P480.value; url.contains("360") -> Qualities.P360.value
-                        else -> Qualities.Unknown.value
-                    }
-                    callback(newExtractorLink(source = serverName, name = "$serverName ${quality/1000}p", url = url) {
-                        this.referer = referer; this.quality = quality
-                    })
+                    val q = when { url.contains("1080") -> Qualities.P1080.value; url.contains("720") -> Qualities.P720.value; url.contains("480") -> Qualities.P480.value; else -> Qualities.Unknown.value }
+                    callback(newExtractorLink(source = serverName, name = "$serverName ${q/1000}p", url = url) { this.referer = referer; this.quality = q })
                     found = true
                 }
                 if (found) return true
@@ -648,9 +536,7 @@ class SeriesDonghuaProvider : MainAPI() {
             }
             for (pattern in listOf(Regex("""["'](https?://[^"']+?rmbl\.ws[^"']*?\.mp4[^"']*)["']"""), Regex("""["'](https?://[^"']+\.mp4[^"']*)["']"""))) {
                 pattern.find(html)?.let { match ->
-                    callback(newExtractorLink(source = serverName, name = serverName, url = match.destructured.component1()) {
-                        this.referer = referer; this.quality = Qualities.Unknown.value
-                    })
+                    callback(newExtractorLink(source = serverName, name = serverName, url = match.destructured.component1()) { this.referer = referer; this.quality = Qualities.Unknown.value })
                     return true
                 }
             }
@@ -658,71 +544,51 @@ class SeriesDonghuaProvider : MainAPI() {
         return false
     }
 
-    private suspend fun extractOdysee(
-        embedUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    private suspend fun extractOdysee(embedUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit): Boolean {
         try {
             val streamUrl = embedUrl.replace("/$/embed/", "/$/stream/").replace("/embed/", "/stream/")
-            callback(newExtractorLink(source = serverName, name = serverName, url = streamUrl) {
-                this.referer = referer; this.quality = Qualities.Unknown.value
-            })
+            callback(newExtractorLink(source = serverName, name = serverName, url = streamUrl) { this.referer = referer; this.quality = Qualities.Unknown.value })
             return true
         } catch (_: Exception) {}
         try {
             val html = app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
-            for (match in Regex("""(https?://[^"'\s<>]+\.(?:mp4|m3u8)[^"'\s<>]*)""").findAll(html)) {
-                callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
-                    this.referer = embedUrl; this.quality = Qualities.Unknown.value
-                })
+            for (m in Regex("""(https?://[^"'\s<>]+\.(?:mp4|m3u8)[^"'\s<>]*)""").findAll(html)) {
+                callback(newExtractorLink(source = serverName, name = serverName, url = m.value) { this.referer = embedUrl; this.quality = Qualities.Unknown.value })
                 return true
             }
         } catch (_: Exception) {}
         return false
     }
 
-    private suspend fun extractVoe(
-        videoUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    private suspend fun extractVoe(videoUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit): Boolean {
         try {
             val html = app.get(videoUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
-            for (match in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(html)) {
-                try { generateM3u8(serverName, match.value, videoUrl).forEach(callback); return true } catch (_: Exception) {}
+            for (m in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(html)) {
+                try { generateM3u8(serverName, m.value, videoUrl).forEach(callback); return true } catch (_: Exception) {}
             }
-            for (match in Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(html)) {
-                callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
-                    this.referer = videoUrl; this.quality = Qualities.Unknown.value
-                })
+            for (m in Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(html)) {
+                callback(newExtractorLink(source = serverName, name = serverName, url = m.value) { this.referer = videoUrl; this.quality = Qualities.Unknown.value })
                 return true
             }
-            for (match in Regex("""(?:source|src|url|hls)["']?\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE).findAll(html)) {
-                val url = match.destructured.component1()
+            for (m in Regex("""(?:source|src|url|hls)["']?\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE).findAll(html)) {
+                val url = m.destructured.component1()
                 if (url.startsWith("http") && (url.contains(".m3u8") || url.contains(".mp4"))) {
-                    if (url.contains(".m3u8")) {
-                        try { generateM3u8(serverName, url, videoUrl).forEach(callback); return true } catch (_: Exception) {}
-                    } else {
-                        callback(newExtractorLink(source = serverName, name = serverName, url = url) {
-                            this.referer = videoUrl; this.quality = Qualities.Unknown.value
-                        })
-                        return true
-                    }
+                    if (url.contains(".m3u8")) { try { generateM3u8(serverName, url, videoUrl).forEach(callback); return true } catch (_: Exception) {} }
+                    else { callback(newExtractorLink(source = serverName, name = serverName, url = url) { this.referer = videoUrl; this.quality = Qualities.Unknown.value }); return true }
                 }
             }
         } catch (_: Exception) {}
         return false
     }
 
-    private suspend fun extractGenericVideo(
-        videoUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    private suspend fun extractGenericVideo(videoUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit): Boolean {
         try {
             val text = app.get(videoUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
-            for (match in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(text)) {
-                try { generateM3u8(serverName, match.value, videoUrl).forEach(callback); return true } catch (_: Exception) {}
+            for (m in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(text)) {
+                try { generateM3u8(serverName, m.value, videoUrl).forEach(callback); return true } catch (_: Exception) {}
             }
-            for (match in Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(text)) {
-                callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
-                    this.referer = videoUrl; this.quality = Qualities.Unknown.value
-                })
+            for (m in Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(text)) {
+                callback(newExtractorLink(source = serverName, name = serverName, url = m.value) { this.referer = videoUrl; this.quality = Qualities.Unknown.value })
                 return true
             }
         } catch (_: Exception) {}
