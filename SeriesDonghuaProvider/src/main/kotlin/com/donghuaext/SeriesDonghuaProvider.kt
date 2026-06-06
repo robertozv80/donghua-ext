@@ -7,6 +7,8 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
+import java.net.URI
+import java.nio.charset.Charset
 import kotlin.collections.ArrayList
 
 class SeriesDonghuaProvider : MainAPI() {
@@ -40,6 +42,7 @@ class SeriesDonghuaProvider : MainAPI() {
         }
     }
 
+    // ========== getMainPage ==========
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val isHomePage = request.data == "$mainUrl/"
         val url = if (page > 1) {
@@ -86,10 +89,6 @@ class SeriesDonghuaProvider : MainAPI() {
         )
     }
 
-    /**
-     * Convierte URL de episodio a URL de serie
-     * /{slug}-episodio-{N}/ → /{slug}/
-     */
     private fun convertEpisodeToSeriesUrl(href: String): String {
         val fullUrl = resolveUrl(href)
         val path = fullUrl.substringAfter(mainUrl).trim('/')
@@ -102,6 +101,7 @@ class SeriesDonghuaProvider : MainAPI() {
         }
     }
 
+    // ========== search ==========
     override suspend fun search(query: String): List<SearchResponse> {
         val searchUrl = "$mainUrl/busquedas/${java.net.URLEncoder.encode(query, "UTF-8")}"
         return app.get(searchUrl, timeout = 120L).document
@@ -118,6 +118,7 @@ class SeriesDonghuaProvider : MainAPI() {
             }
     }
 
+    // ========== load ==========
     override suspend fun load(url: String): LoadResponse {
         val seriesUrl = if (url.contains("-episodio-")) {
             convertEpisodeToSeriesUrl(url)
@@ -181,7 +182,7 @@ class SeriesDonghuaProvider : MainAPI() {
         }
     }
 
-    // ========== MODELO PARA VIDEO_MAP_JSON ==========
+    // ========== Modelo VIDEO_MAP_JSON ==========
     data class VideoMapJson(
         val asura: String? = null,
         val skadi: String? = null,
@@ -190,42 +191,195 @@ class SeriesDonghuaProvider : MainAPI() {
         val amagi: String? = null,
     )
 
+    // ================================================================
+    //  DECODIFICADOR DEL JAVASCRIPT OFUSCADO (Smart Packer)
+    // ================================================================
+    // El sitio usa eval(function(h,u,n,t,e,r){...}(encoded,base,charset,offset,delimIdx,...))
+    // para ofuscar VIDEO_MAP_JSON. Este decodificador reimplementa el algoritmo en Kotlin.
+    //
+    // Algoritmo:
+    //   1. charset n = "FSUfvxBAu" (ejemplo)
+    //   2. delimiter = n[e] (ej. n[6] = 'B')
+    //   3. Split h por delimiter → tokens
+    //   4. Para cada token: reemplazar cada char por su índice en n → string de dígitos
+    //   5. Convertir de base-e (ej. base-6) a decimal
+    //   6. Restar offset t (ej. 18)
+    //   7. Convertir a byte → concatenar
+    //   8. Decodificar como UTF-8
+    // ================================================================
+
+    /**
+     * Decodifica el JavaScript ofuscado del tipo Smart Packer.
+     * Retorna el texto decodificado, o null si falla.
+     */
+    private fun decodeSmartPacker(
+        encodedStr: String,
+        base: Int,
+        charset: String,
+        offset: Int,
+        delimIdx: Int
+    ): String? {
+        if (charset.isEmpty() || delimIdx < 0 || delimIdx >= charset.length) return null
+        if (base < 2 || base > 64) return null
+
+        val delimiter = charset[delimIdx]
+
+        // Digitos para la conversión de base (estándar: 0-9, a-z, A-Z, +, /)
+        val digits = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"
+
+        // Split por delimiter
+        val tokens = encodedStr.split(delimiter)
+
+        val bytes = ArrayList<Byte>()
+        for (token in tokens) {
+            if (token.isEmpty()) continue
+
+            // Reemplazar cada char por su índice en el charset → string de dígitos
+            val digitStr = StringBuilder()
+            for (c in token) {
+                val idx = charset.indexOf(c)
+                if (idx < 0) return null  // Carácter no reconocido
+                digitStr.append(digits[idx])
+            }
+
+            // Convertir de base-e a decimal usando los digitos estándar
+            var num = 0L
+            for (c in digitStr.toString()) {
+                val digitVal = digits.indexOf(c)
+                if (digitVal < 0 || digitVal >= base) return null
+                num = num * base + digitVal
+            }
+
+            // Restar offset y convertir a byte
+            val charCode = num - offset
+            if (charCode < 0 || charCode > 255) return null
+            bytes.add(charCode.toByte())
+        }
+
+        // Decodificar como UTF-8 (equivalente a decodeURIComponent(escape(r)))
+        return try {
+            String(bytes.toByteArray(), Charset.forName("UTF-8"))
+        } catch (_: Exception) {
+            String(bytes.toByteArray(), Charsets.ISO_8859_1)
+        }
+    }
+
+    /**
+     * Busca y decodifica el eval() ofuscado en el HTML de la página de episodio.
+     * Retorna el texto decodificado que contiene VIDEO_MAP_JSON, o null si falla.
+     */
+    private fun decodeObfuscatedScript(html: String): String? {
+        // Patrón 1: eval(function(h,u,n,t,e,r){...}("encoded", 44, "FSUfvxBAu", 18, 6, 11))
+        // El patrón captura: encoded_str, base, charset, offset, delimIdx
+        val evalPatterns = listOf(
+            // Formato Smart Packer con parámetros posicionales
+            Regex("""eval\(function\s*\(\s*h\s*,\s*u\s*,\s*n\s*,\s*t\s*,\s*e\s*,\s*r\s*\)\s*\{[^}]+\}\s*\(\s*"([^"]+)"\s*,\s*(\d+)\s*,\s*"([^"]+)"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)"""),
+            // Variante con comillas simples
+            Regex("""eval\(function\s*\(\s*h\s*,\s*u\s*,\s*n\s*,\s*t\s*,\s*e\s*,\s*r\s*\)\s*\{[^}]+\}\s*\(\s*'([^']+)'\s*,\s*(\d+)\s*,\s*'([^']+)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)"""),
+        )
+
+        for (pattern in evalPatterns) {
+            val match = pattern.find(html)
+            if (match != null) {
+                val encodedStr = match.destructured.component1()
+                val base = match.destructured.component2().toIntOrNull() ?: continue
+                val charset = match.destructured.component3()
+                val offset = match.destructured.component4().toIntOrNull() ?: continue
+                val delimIdx = match.destructured.component5().toIntOrNull() ?: continue
+                // component6 is the unused 'r' parameter
+
+                val decoded = decodeSmartPacker(encodedStr, base, charset, offset, delimIdx)
+                if (decoded != null && decoded.contains("VIDEO_MAP_JSON")) {
+                    return decoded
+                }
+            }
+        }
+
+        // Fallback: buscar patrones más flexibles del eval call
+        // Intentar con regex que captura toda la llamada eval
+        val flexiblePattern = Regex(
+            """eval\(function\s*\(\s*\w+\s*,\s*\w+\s*,\s*\w+\s*,\s*\w+\s*,\s*\w+\s*,\s*\w+\s*\)\s*\{.*?\}\s*\(\s*["']([^"']+)["']\s*,\s*(\d+)\s*,\s*["']([^"']+)["']\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\\)""",
+            RegexOption.DOT_MATCHES_ALL
+        )
+        val flexMatch = flexiblePattern.find(html)
+        if (flexMatch != null) {
+            val encodedStr = flexMatch.destructured.component1()
+            val base = flexMatch.destructured.component2().toIntOrNull() ?: return null
+            val charset = flexMatch.destructured.component3()
+            val offset = flexMatch.destructured.component4().toIntOrNull() ?: return null
+            val delimIdx = flexMatch.destructured.component5().toIntOrNull() ?: return null
+
+            val decoded = decodeSmartPacker(encodedStr, base, charset, offset, delimIdx)
+            if (decoded != null && decoded.contains("VIDEO_MAP_JSON")) {
+                return decoded
+            }
+        }
+
+        return null
+    }
+
+    /**
+     * Extrae VIDEO_MAP_JSON del texto decodificado.
+     * Retorna el string JSON de VIDEO_MAP_JSON, o null si no se encuentra.
+     */
+    private fun extractVideoMapJson(decodedScript: String): String? {
+        val patterns = listOf(
+            Regex("""const\s+VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
+            Regex("""VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
+            Regex("""VIDEO_MAP_JSON\s*=\s*(\{.*?\})\s*;?"""),
+        )
+        for (pattern in patterns) {
+            val match = pattern.find(decodedScript)
+            if (match != null) {
+                return match.destructured.component1()
+            }
+        }
+        return null
+    }
+
+    // ========== loadLinks ==========
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val doc = app.get(data, timeout = 120L).document
-        val pageText = doc.html()
-
-        // ====== Extraer VIDEO_MAP_JSON de los scripts ======
-        // Formato: const VIDEO_MAP_JSON={"asura":"\"id\"","skadi":"\"url\"",...};
-        var videoMapJsonStr: String? = null
-
-        for (script in doc.select("script")) {
-            val scriptData = script.data()
-            if (scriptData.contains("VIDEO_MAP_JSON")) {
-                // Probar varios patrones de regex
-                val patterns = listOf(
-                    Regex("""const\s+VIDEO_MAP_JSON\s*=\s*(\{[^;]+?\})\s*;"""),
-                    Regex("""VIDEO_MAP_JSON\s*=\s*(\{[^;]+?\})\s*;"""),
-                    Regex("""VIDEO_MAP_JSON\s*=\s*(\{.*?\})\s*;?"""),
-                )
-                for (pattern in patterns) {
-                    val match = pattern.find(scriptData)
-                    if (match != null) {
-                        videoMapJsonStr = match.destructured.component1()
-                        break
-                    }
-                }
-                if (videoMapJsonStr != null) break
-            }
-        }
+        val response = app.get(data, timeout = 120L)
+        val doc = response.document
+        val html = response.text
 
         var foundLinks = false
 
-        // ====== Si encontramos VIDEO_MAP_JSON, parsear y extraer enlaces ======
+        // ====== PASO 1: Decodificar el JavaScript ofuscado ======
+        // VIDEO_MAP_JSON NO está en el HTML crudo — se inyecta vía eval() ofuscado
+        val decodedScript = decodeObfuscatedScript(html)
+        val videoMapJsonStr = if (decodedScript != null) {
+            extractVideoMapJson(decodedScript)
+        } else {
+            // Fallback: buscar directamente en los scripts (por si la ofuscación cambia)
+            var found: String? = null
+            for (script in doc.select("script")) {
+                val scriptData = script.data()
+                if (scriptData.contains("VIDEO_MAP_JSON")) {
+                    val patterns = listOf(
+                        Regex("""const\s+VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
+                        Regex("""VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
+                        Regex("""VIDEO_MAP_JSON\s*=\s*(\{.*?\})\s*;?"""),
+                    )
+                    for (pattern in patterns) {
+                        val match = pattern.find(scriptData)
+                        if (match != null) {
+                            found = match.destructured.component1()
+                            break
+                        }
+                    }
+                    if (found != null) break
+                }
+            }
+            found
+        }
+
+        // ====== PASO 2: Parsear VIDEO_MAP_JSON y extraer enlaces ======
         if (videoMapJsonStr != null) {
             val videoMap: VideoMapJson? = try {
                 parseJson<VideoMapJson>(videoMapJsonStr)
@@ -235,7 +389,6 @@ class SeriesDonghuaProvider : MainAPI() {
 
             if (videoMap != null) {
                 // ===== Asura → Dailymotion =====
-                // El valor de "asura" es un ID de video de Dailymotion (doble-encoded)
                 videoMap.asura?.let { rawValue ->
                     val videoId = decodeDoubleEncoded(rawValue)
                     if (videoId.isNotEmpty()) {
@@ -265,12 +418,12 @@ class SeriesDonghuaProvider : MainAPI() {
                             foundLinks = true
                         } catch (_: Exception) {
                             when {
-                                url.contains("rumble.com") -> {
+                                url.contains("rumble.com") ->
                                     foundLinks = extractRumble(url, data, "Rumble", callback) || foundLinks
-                                }
-                                else -> {
+                                url.contains("likessb.com") || url.contains("streamsb") ->
+                                    foundLinks = extractGenericVideo(url, data, "StreamSB", callback) || foundLinks
+                                else ->
                                     foundLinks = extractGenericVideo(url, data, "Server", callback) || foundLinks
-                                }
                             }
                         }
                     }
@@ -307,8 +460,10 @@ class SeriesDonghuaProvider : MainAPI() {
         // ====== Fallback 1: Buscar iframes directamente ======
         if (!foundLinks) {
             doc.select("iframe").amap { iframe ->
-                val src = iframe.attr("src")?.ifBlank { iframe.attr("data-src") }
-                if (!src.isNullOrEmpty()) {
+                val src = listOf("src", "data-src")
+                    .map { iframe.attr(it).trim() }
+                    .firstOrNull { it.isNotBlank() }
+                if (src != null) {
                     val fullSrc = resolveUrl(src)
                     if (fullSrc.startsWith("http")) {
                         try {
@@ -320,7 +475,7 @@ class SeriesDonghuaProvider : MainAPI() {
             }
         }
 
-        // ====== Fallback 2: Buscar URLs de video en los scripts ======
+        // ====== Fallback 2: Buscar URLs de video en el HTML completo ======
         if (!foundLinks) {
             val iframePatterns = listOf(
                 Regex("""(https?://[^"'\s<>]*dailymotion\.com/[^"'\s<>]+)"""),
@@ -330,7 +485,7 @@ class SeriesDonghuaProvider : MainAPI() {
                 Regex("""(https?://[^"'\s<>]*odysee\.com/[^"'\s<>]+)"""),
             )
             for (pattern in iframePatterns) {
-                for (match in pattern.findAll(pageText)) {
+                for (match in pattern.findAll(html)) {
                     try {
                         loadExtractor(match.value, data, subtitleCallback, callback)
                         foundLinks = true
@@ -340,10 +495,9 @@ class SeriesDonghuaProvider : MainAPI() {
             }
         }
 
-        // ====== Fallback 3: Buscar player.php proxy ======
+        // ====== Fallback 3: player.php proxy ======
         if (!foundLinks) {
-            val proxyRegex = Regex("""player\.php\?url=(https?://[^"'\s<>]+)""")
-            for (match in proxyRegex.findAll(pageText)) {
+            for (match in Regex("""player\.php\?url=(https?://[^"'\s<>]+)""").findAll(html)) {
                 val proxyUrl = match.destructured.component1()
                 try {
                     loadExtractor(proxyUrl, data, subtitleCallback, callback)
@@ -358,279 +512,145 @@ class SeriesDonghuaProvider : MainAPI() {
         return foundLinks
     }
 
-    // ========== FUNCIONES AUXILIARES ==========
-
-    /**
-     * Decodifica un valor doble-encoded de VIDEO_MAP_JSON.
-     * Ejemplo: "\"k4AnYPak3WSvSJGqQxE\"" → "k4AnYPak3WSvSJGqQxE"
-     * Ejemplo: "\"https:\\/\\/ok.ru\\/videoembed\\/123\"" → "https://ok.ru/videoembed/123"
-     */
+    // ========== Decodificador de valores doble-encoded ==========
     private fun decodeDoubleEncoded(value: String): String {
         var result = value.trim()
-        // Quitar comillas exteriores (primer nivel de encoding JSON)
         if (result.startsWith("\"") && result.endsWith("\"")) {
             result = result.substring(1, result.length - 1)
         }
-        // Decodificar escapes JSON: \/ → /, \" → ", \\ → \
         result = result.replace("\\/", "/")
             .replace("\\\"", "\"")
             .replace("\\\\", "\\")
-        // Quitar comillas interiores (segundo nivel de encoding JSON)
         if (result.startsWith("\"") && result.endsWith("\"")) {
             result = result.substring(1, result.length - 1)
         }
         return result.trim()
     }
 
-    /**
-     * Extrae video de Dailymotion usando:
-     * 1) loadExtractor (si CloudStream lo soporta)
-     * 2) API de metadata del player (/player/metadata/video/{id})
-     * 3) Scrape de la página embed
-     */
+    // ========== Extractores de video ==========
+
     private suspend fun extractDailymotion(
-        videoId: String,
-        referer: String,
-        serverName: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
+        videoId: String, referer: String, serverName: String,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Método 1: loadExtractor con la URL embed
+        // Método 1: loadExtractor
         try {
-            val dmUrl = "https://www.dailymotion.com/embed/video/$videoId"
-            loadExtractor(dmUrl, referer, subtitleCallback, callback)
+            loadExtractor("https://www.dailymotion.com/embed/video/$videoId", referer, subtitleCallback, callback)
             return true
         } catch (_: Exception) {}
 
-        // Método 2: API de metadata del player de Dailymotion
+        // Método 2: API de metadata del player
         try {
             val apiUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
-            val response = app.get(
-                apiUrl,
+            val jsonText = app.get(apiUrl,
                 referer = "https://www.dailymotion.com/embed/video/$videoId",
-                headers = mapOf(
-                    "User-Agent" to USER_AGENT,
-                    "Accept" to "application/json, text/plain, */*",
-                    "Origin" to "https://www.dailymotion.com",
-                ),
+                headers = mapOf("User-Agent" to USER_AGENT, "Accept" to "application/json"),
                 timeout = 15L
-            )
-            val jsonText = response.text
+            ).text
 
-            // Buscar m3u8 (HLS) en la respuesta
-            val m3u8Regex = Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""")
-            for (match in m3u8Regex.findAll(jsonText)) {
-                try {
-                    generateM3u8(serverName, match.value, "https://www.dailymotion.com").forEach(callback)
-                    return true
-                } catch (_: Exception) {}
+            for (match in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(jsonText)) {
+                try { generateM3u8(serverName, match.value, "https://www.dailymotion.com").forEach(callback); return true } catch (_: Exception) {}
             }
-
-            // Buscar mp4 en la respuesta (múltiples calidades)
-            val mp4Regex = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""")
-            val mp4Urls = mp4Regex.findAll(jsonText).map { it.value }.distinct().toList()
+            val mp4Urls = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(jsonText).map { it.value }.distinct().toList()
             if (mp4Urls.isNotEmpty()) {
-                var foundAny = false
                 for (url in mp4Urls) {
-                    val quality = when {
-                        url.contains("1080") || url.contains("x1080") -> Qualities.P1080.value
-                        url.contains("720") || url.contains("x720") -> Qualities.P720.value
-                        url.contains("480") || url.contains("x480") -> Qualities.P480.value
-                        url.contains("380") || url.contains("x360") -> Qualities.P360.value
-                        url.contains("240") || url.contains("x240") -> Qualities.P240.value
-                        url.contains("144") -> Qualities.P144.value
-                        else -> Qualities.Unknown.value
-                    }
-                    callback(
-                        newExtractorLink(source = serverName, name = "$serverName ${quality / 1000}p", url = url) {
-                            this.referer = "https://www.dailymotion.com"
-                            this.quality = quality
-                        }
-                    )
-                    foundAny = true
-                }
-                if (foundAny) return true
-            }
-        } catch (_: Exception) {}
-
-        // Método 3: Scrapear la página embed buscando URLs en el fuente
-        try {
-            val embedUrl = "https://www.dailymotion.com/embed/video/$videoId"
-            val response = app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L)
-            val html = response.text
-
-            val m3u8Regex = Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""")
-            for (match in m3u8Regex.findAll(html)) {
-                try {
-                    generateM3u8(serverName, match.value, embedUrl).forEach(callback)
-                    return true
-                } catch (_: Exception) {}
-            }
-
-            val mp4Regex = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""")
-            for (match in mp4Regex.findAll(html)) {
-                callback(
-                    newExtractorLink(source = serverName, name = serverName, url = match.value) {
-                        this.referer = embedUrl
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-                return true
-            }
-        } catch (_: Exception) {}
-
-        return false
-    }
-
-    /**
-     * Extrae video de ok.ru:
-     * Busca URLs de video en data-options, og:video, y el HTML del embed
-     */
-    private suspend fun extractOkRu(
-        videoUrl: String,
-        referer: String,
-        serverName: String,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        try {
-            val response = app.get(videoUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L)
-            val html = response.text
-
-            // Método 1: Buscar data-options con JSON que contiene video URLs
-            val dataOptionsRegex = Regex("""data-options="([^"]+)"""")
-            val dataMatch = dataOptionsRegex.find(html)
-            if (dataMatch != null) {
-                val optionsJson = dataMatch.destructured.component1()
-                    .replace("&quot;", "\"")
-                    .replace("&amp;", "&")
-                val videoUrlRegex = Regex("""(https?://[^"]+\.(?:mp4|m3u8)[^"]*)""")
-                for (match in videoUrlRegex.findAll(optionsJson)) {
-                    val url = match.value
-                    if (url.contains(".m3u8")) {
-                        try {
-                            generateM3u8(serverName, url, videoUrl).forEach(callback)
-                            return true
-                        } catch (_: Exception) {}
-                    } else {
-                        callback(
-                            newExtractorLink(source = serverName, name = serverName, url = url) {
-                                this.referer = videoUrl
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
-                        return true
-                    }
-                }
-            }
-
-            // Método 2: Buscar og:video meta tag
-            val ogRegex = Regex("""<meta\s+property=["']og:video(?::url)?["']\s+content=["']([^"']+)["']""")
-            val ogMatch = ogRegex.find(html)
-            if (ogMatch != null) {
-                callback(
-                    newExtractorLink(source = serverName, name = serverName, url = ogMatch.destructured.component1()) {
-                        this.referer = videoUrl
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-                return true
-            }
-
-            // Método 3: Buscar URLs de video directamente en el HTML
-            val directUrlRegex = Regex("""(https?://[^"'\s<>]+\.(?:mp4|m3u8)[^"'\s<>]*)""")
-            var found = false
-            for (match in directUrlRegex.findAll(html)) {
-                val url = match.value
-                val quality = when {
-                    url.contains("1080") || url.contains("hd1080") -> Qualities.P1080.value
-                    url.contains("720") || url.contains("hd720") -> Qualities.P720.value
-                    url.contains("480") || url.contains("sd480") -> Qualities.P480.value
-                    url.contains("360") || url.contains("sd360") -> Qualities.P360.value
-                    else -> Qualities.Unknown.value
-                }
-                callback(
-                    newExtractorLink(source = serverName, name = "$serverName ${quality / 1000}p", url = url) {
-                        this.referer = videoUrl
-                        this.quality = quality
-                    }
-                )
-                found = true
-            }
-            if (found) return true
-        } catch (_: Exception) {}
-        return false
-    }
-
-    /**
-     * Extrae video de Rumble:
-     * Busca la configuración JSON del player y URLs m3u8/mp4
-     */
-    private suspend fun extractRumble(
-        embedUrl: String,
-        referer: String,
-        serverName: String,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        try {
-            val response = app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 30L)
-            val html = response.text
-
-            // Método 1: Buscar JSON config del player (variable __q o similar)
-            val jsonConfigRegex = Regex(""""ua":\s*\{[^}]*"mp4":\s*\[([^\]]+)\]""")
-            val jsonMatch = jsonConfigRegex.find(html)
-            if (jsonMatch != null) {
-                val mp4Array = jsonMatch.destructured.component1()
-                val urlRegex = Regex(""""(https?://[^"]+\.mp4[^"]*)"""")
-                var found = false
-                urlRegex.findAll(mp4Array).forEach { match ->
-                    val url = match.destructured.component1()
                     val quality = when {
                         url.contains("1080") -> Qualities.P1080.value
                         url.contains("720") -> Qualities.P720.value
                         url.contains("480") -> Qualities.P480.value
-                        url.contains("360") -> Qualities.P360.value
+                        url.contains("380") || url.contains("360") -> Qualities.P360.value
                         else -> Qualities.Unknown.value
                     }
-                    callback(
-                        newExtractorLink(source = serverName, name = "$serverName ${quality / 1000}p", url = url) {
-                            this.referer = referer
-                            this.quality = quality
-                        }
-                    )
+                    callback(newExtractorLink(source = serverName, name = "$serverName ${quality/1000}p", url = url) {
+                        this.referer = "https://www.dailymotion.com"; this.quality = quality
+                    })
+                }
+                return true
+            }
+        } catch (_: Exception) {}
+
+        // Método 3: Scrape embed page
+        try {
+            val embedUrl = "https://www.dailymotion.com/embed/video/$videoId"
+            val embedHtml = app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
+            for (match in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(embedHtml)) {
+                try { generateM3u8(serverName, match.value, embedUrl).forEach(callback); return true } catch (_: Exception) {}
+            }
+            for (match in Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(embedHtml)) {
+                callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
+                    this.referer = embedUrl; this.quality = Qualities.Unknown.value
+                })
+                return true
+            }
+        } catch (_: Exception) {}
+
+        return false
+    }
+
+    private suspend fun extractOkRu(
+        videoUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        try {
+            val html = app.get(videoUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
+            val dataMatch = Regex("""data-options="([^"]+)"""").find(html)
+            if (dataMatch != null) {
+                val optionsJson = dataMatch.destructured.component1().replace("&quot;", "\"").replace("&amp;", "&")
+                for (match in Regex("""(https?://[^"]+\.(?:mp4|m3u8)[^"]*)""").findAll(optionsJson)) {
+                    callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
+                        this.referer = videoUrl; this.quality = Qualities.Unknown.value
+                    })
+                    return true
+                }
+            }
+            Regex("""<meta\s+property=["']og:video(?::url)?["']\s+content=["']([^"']+)["']""").find(html)?.let { m ->
+                callback(newExtractorLink(source = serverName, name = serverName, url = m.destructured.component1()) {
+                    this.referer = videoUrl; this.quality = Qualities.Unknown.value
+                })
+                return true
+            }
+            for (match in Regex("""(https?://[^"'\s<>]+\.(?:mp4|m3u8)[^"'\s<>]*)""").findAll(html)) {
+                callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
+                    this.referer = videoUrl; this.quality = Qualities.Unknown.value
+                })
+                return true
+            }
+        } catch (_: Exception) {}
+        return false
+    }
+
+    private suspend fun extractRumble(
+        embedUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        try {
+            val html = app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 30L).text
+            val jsonMatch = Regex(""""ua":\s*\{[^}]*"mp4":\s*\[([^\]]+)\]""").find(html)
+            if (jsonMatch != null) {
+                val mp4Array = jsonMatch.destructured.component1()
+                var found = false
+                Regex(""""(https?://[^"]+\.mp4[^"]*)"""").findAll(mp4Array).forEach { match ->
+                    val url = match.destructured.component1()
+                    val quality = when {
+                        url.contains("1080") -> Qualities.P1080.value; url.contains("720") -> Qualities.P720.value
+                        url.contains("480") -> Qualities.P480.value; url.contains("360") -> Qualities.P360.value
+                        else -> Qualities.Unknown.value
+                    }
+                    callback(newExtractorLink(source = serverName, name = "$serverName ${quality/1000}p", url = url) {
+                        this.referer = referer; this.quality = quality
+                    })
                     found = true
                 }
                 if (found) return true
             }
-
-            // Método 2: Buscar m3u8 URL
-            val m3u8Patterns = listOf(
-                Regex("""["'](https?://[^"']+\.m3u8[^"']*)["']"""),
-                Regex("""(https?://[^\s"'<>]+?\.m3u8(?:\?[^\s"'<>]*)?)"""),
-            )
-            for (pattern in m3u8Patterns) {
-                val match = pattern.find(html)
-                if (match != null) {
-                    try {
-                        generateM3u8(serverName, match.destructured.component1(), referer).forEach(callback)
-                        return true
-                    } catch (_: Exception) {}
+            for (pattern in listOf(Regex("""["'](https?://[^"']+\.m3u8[^"']*)["']"""), Regex("""(https?://[^\s"'<>]+?\.m3u8(?:\?[^\s"'<>]*)?)"""))) {
+                pattern.find(html)?.let { match ->
+                    try { generateM3u8(serverName, match.destructured.component1(), referer).forEach(callback); return true } catch (_: Exception) {}
                 }
             }
-
-            // Método 3: Buscar mp4 URL (incluyendo rmbl.ws)
-            val mp4Patterns = listOf(
-                Regex("""["'](https?://[^"']+?rmbl\.ws[^"']*?\.mp4[^"']*)["']"""),
-                Regex("""["'](https?://[^"']+\.mp4[^"']*)["']"""),
-            )
-            for (pattern in mp4Patterns) {
-                val match = pattern.find(html)
-                if (match != null) {
-                    callback(
-                        newExtractorLink(source = serverName, name = serverName, url = match.destructured.component1()) {
-                            this.referer = referer
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
+            for (pattern in listOf(Regex("""["'](https?://[^"']+?rmbl\.ws[^"']*?\.mp4[^"']*)["']"""), Regex("""["'](https?://[^"']+\.mp4[^"']*)["']"""))) {
+                pattern.find(html)?.let { match ->
+                    callback(newExtractorLink(source = serverName, name = serverName, url = match.destructured.component1()) {
+                        this.referer = referer; this.quality = Qualities.Unknown.value
+                    })
                     return true
                 }
             }
@@ -638,101 +658,51 @@ class SeriesDonghuaProvider : MainAPI() {
         return false
     }
 
-    /**
-     * Extrae video de Odysee:
-     * Construye la URL de stream a partir de la URL de embed
-     */
     private suspend fun extractOdysee(
-        embedUrl: String,
-        referer: String,
-        serverName: String,
-        callback: (ExtractorLink) -> Unit
+        embedUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
         try {
-            // Método 1: Construir URL de stream reemplazando /embed/ por /stream/
-            val streamUrl = embedUrl.replace("/$/embed/", "/$/stream/")
-                .replace("/embed/", "/stream/")
-            callback(
-                newExtractorLink(source = serverName, name = serverName, url = streamUrl) {
-                    this.referer = referer
-                    this.quality = Qualities.Unknown.value
-                }
-            )
+            val streamUrl = embedUrl.replace("/$/embed/", "/$/stream/").replace("/embed/", "/stream/")
+            callback(newExtractorLink(source = serverName, name = serverName, url = streamUrl) {
+                this.referer = referer; this.quality = Qualities.Unknown.value
+            })
             return true
         } catch (_: Exception) {}
-
-        // Método 2: Scrapear la página de embed buscando URL de video
         try {
-            val response = app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L)
-            val html = response.text
-
-            val videoUrlRegex = Regex("""(https?://[^"'\s<>]+\.(?:mp4|m3u8)[^"'\s<>]*)""")
-            for (match in videoUrlRegex.findAll(html)) {
-                callback(
-                    newExtractorLink(source = serverName, name = serverName, url = match.value) {
-                        this.referer = embedUrl
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
+            val html = app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
+            for (match in Regex("""(https?://[^"'\s<>]+\.(?:mp4|m3u8)[^"'\s<>]*)""").findAll(html)) {
+                callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
+                    this.referer = embedUrl; this.quality = Qualities.Unknown.value
+                })
                 return true
             }
         } catch (_: Exception) {}
         return false
     }
 
-    /**
-     * Extrae video de Voe.sx:
-     * Busca URLs de video en el HTML ofuscado
-     */
     private suspend fun extractVoe(
-        videoUrl: String,
-        referer: String,
-        serverName: String,
-        callback: (ExtractorLink) -> Unit
+        videoUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
         try {
-            val response = app.get(videoUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L)
-            val html = response.text
-
-            // Método 1: Buscar m3u8 URL
-            val m3u8Regex = Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""")
-            for (match in m3u8Regex.findAll(html)) {
-                try {
-                    generateM3u8(serverName, match.value, videoUrl).forEach(callback)
-                    return true
-                } catch (_: Exception) {}
+            val html = app.get(videoUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
+            for (match in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(html)) {
+                try { generateM3u8(serverName, match.value, videoUrl).forEach(callback); return true } catch (_: Exception) {}
             }
-
-            // Método 2: Buscar mp4 URL
-            val mp4Regex = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""")
-            for (match in mp4Regex.findAll(html)) {
-                callback(
-                    newExtractorLink(source = serverName, name = serverName, url = match.value) {
-                        this.referer = videoUrl
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
+            for (match in Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(html)) {
+                callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
+                    this.referer = videoUrl; this.quality = Qualities.Unknown.value
+                })
                 return true
             }
-
-            // Método 3: Buscar URL codificada en base64 o en variables JavaScript
-            // Voe a veces usa patrones como: var source = "..." o hls": "..."
-            val sourceRegex = Regex("""(?:source|src|url|hls)["']?\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-            for (match in sourceRegex.findAll(html)) {
+            for (match in Regex("""(?:source|src|url|hls)["']?\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE).findAll(html)) {
                 val url = match.destructured.component1()
                 if (url.startsWith("http") && (url.contains(".m3u8") || url.contains(".mp4"))) {
                     if (url.contains(".m3u8")) {
-                        try {
-                            generateM3u8(serverName, url, videoUrl).forEach(callback)
-                            return true
-                        } catch (_: Exception) {}
+                        try { generateM3u8(serverName, url, videoUrl).forEach(callback); return true } catch (_: Exception) {}
                     } else {
-                        callback(
-                            newExtractorLink(source = serverName, name = serverName, url = url) {
-                                this.referer = videoUrl
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
+                        callback(newExtractorLink(source = serverName, name = serverName, url = url) {
+                            this.referer = videoUrl; this.quality = Qualities.Unknown.value
+                        })
                         return true
                     }
                 }
@@ -741,35 +711,18 @@ class SeriesDonghuaProvider : MainAPI() {
         return false
     }
 
-    /**
-     * Extracción genérica: busca URLs de video en cualquier página
-     */
     private suspend fun extractGenericVideo(
-        videoUrl: String,
-        referer: String,
-        serverName: String,
-        callback: (ExtractorLink) -> Unit
+        videoUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
         try {
-            val response = app.get(videoUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L)
-            val text = response.text
-
-            val m3u8Regex = Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""")
-            for (match in m3u8Regex.findAll(text)) {
-                try {
-                    generateM3u8(serverName, match.value, videoUrl).forEach(callback)
-                    return true
-                } catch (_: Exception) {}
+            val text = app.get(videoUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
+            for (match in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(text)) {
+                try { generateM3u8(serverName, match.value, videoUrl).forEach(callback); return true } catch (_: Exception) {}
             }
-
-            val mp4Regex = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""")
-            for (match in mp4Regex.findAll(text)) {
-                callback(
-                    newExtractorLink(source = serverName, name = serverName, url = match.value) {
-                        this.referer = videoUrl
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
+            for (match in Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(text)) {
+                callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
+                    this.referer = videoUrl; this.quality = Qualities.Unknown.value
+                })
                 return true
             }
         } catch (_: Exception) {}
