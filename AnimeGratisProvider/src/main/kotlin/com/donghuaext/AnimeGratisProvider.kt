@@ -5,7 +5,6 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
-import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import java.util.*
@@ -27,7 +26,8 @@ class AnimeGratisProvider : MainAPI() {
 
     override val mainPage = mainPageOf(
         "$mainUrl/" to "Nuevos Episodios",
-        "$mainUrl/directorio" to "Directorio",
+        "$mainUrl/donghua" to "Donghuas",
+        "$mainUrl/directorio" to "Directorio Anime",
     )
 
     private fun resolveUrl(url: String): String {
@@ -40,8 +40,8 @@ class AnimeGratisProvider : MainAPI() {
         }
     }
 
-    // NOTA: NO incluir "Accept-Encoding" - NiceHttp lo gestiona automáticamente.
-    // Si forzamos "br" (brotli) y NiceHttp no lo soporta, el HTML llega ilegible.
+    // NO incluir "Accept-Encoding" — NiceHttp lo gestiona automáticamente.
+    // Si forzamos "br" (brotli) y no lo soporta, el HTML llega ilegible.
     private val headers = mapOf(
         "User-Agent" to USER_AGENT,
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -50,6 +50,20 @@ class AnimeGratisProvider : MainAPI() {
         "Sec-Fetch-Mode" to "navigate",
         "Sec-Fetch-Site" to "none",
     )
+
+    // ========== Helpers para atributos de imagen ==========
+    // Jsoup .attr() retorna "" (no null) si el atributo no existe.
+    // Por eso necesitamos .isNotBlank() para que la cadena de fallback funcione.
+
+    private fun org.jsoup.nodes.Element.bestImageUrl(): String {
+        return listOf("data-fb2", "data-fallback", "src")
+            .map { attr -> this.attr(attr).trim() }
+            .firstOrNull { it.isNotBlank() } ?: ""
+    }
+
+    private fun org.jsoup.nodes.Element?.bestImageUrl(): String {
+        return this?.bestImageUrl() ?: ""
+    }
 
     // ========== MODELOS PARA #ssr-init (directorio) ==========
     data class SsrInit(
@@ -60,23 +74,23 @@ class AnimeGratisProvider : MainAPI() {
     )
 
     data class SsrAnime(
-        val t: String? = null,       // title
-        val sl: String? = null,      // slug
-        val sy: String? = null,      // synopsis
-        val sc: Double? = null,      // score
-        val st: String? = null,      // status: "Finalizado"|"En emisión"|"Próximamente"
-        val g: List<SsrGenre>? = null, // genres
-        val ty: String? = null,      // type: "series"|"movie"|"ova"|"ona"|"especial"
-        val im: String? = null,      // image (webp)
-        val fb: String? = null,      // fallback image 1
-        val fb2: String? = null,     // fallback image 2 (jpg)
-        val yr: String? = null,      // year
+        val t: String? = null,
+        val sl: String? = null,
+        val sy: String? = null,
+        val sc: Double? = null,
+        val st: String? = null,
+        val g: List<SsrGenre>? = null,
+        val ty: String? = null,
+        val im: String? = null,
+        val fb: String? = null,
+        val fb2: String? = null,
+        val yr: String? = null,
         val isMovie: Boolean? = null,
     )
 
     data class SsrGenre(
-        val n: String? = null,  // name
-        val s: String? = null,  // slug
+        val n: String? = null,
+        val s: String? = null,
     )
 
     // ========== MODELOS PARA JSON-LD ==========
@@ -88,70 +102,79 @@ class AnimeGratisProvider : MainAPI() {
         val genre: Any? = null,
         val numberOfEpisodes: Int? = null,
         val datePublished: String? = null,
-        val aggregateRating: AggregateRating? = null,
-        val productionCompany: ProductionCompany? = null,
     )
 
-    data class AggregateRating(
-        val ratingValue: Double? = null,
-        val bestRating: Double? = null,
-        val ratingCount: Int? = null,
-    )
-
-    data class ProductionCompany(
-        val name: String? = null,
-    )
-
+    // ========== getMainPage ==========
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val isHomePage = request.data == "$mainUrl/"
-        val url = if (isHomePage) {
-            request.data
-        } else {
-            if (page > 1) "${request.data}?page=$page" else request.data
-        }
+        val isDonghua = request.data == "$mainUrl/donghua"
+        val url = if (page > 1) "${request.data}?page=$page" else request.data
 
         val doc = app.get(url, headers = headers, timeout = 30L).document
 
-        val home = if (isHomePage) {
-            // Homepage: buscar tarjetas de episodios
-            val emisionCards = doc.select("a[data-home-episode-card]")
-            if (emisionCards.isNotEmpty()) {
-                emisionCards.mapNotNull { parseHomeEpisodeCard(it) }
-            } else {
-                // Fallback: buscar enlaces a episodios
-                doc.select("a[href*=\"episodio\"]").mapNotNull { parseHomeEpisodeCard(it) }
+        val home = when {
+            isHomePage -> {
+                // Episodios recientes: a[data-home-episode-card]
+                val emisionCards = doc.select("a[data-home-episode-card]")
+                if (emisionCards.isNotEmpty()) {
+                    emisionCards.mapNotNull { parseHomeEpisodeCard(it) }
+                } else {
+                    doc.select("a[href*=\"episodio\"]").mapNotNull { parseHomeEpisodeCard(it) }
+                }
             }
-        } else {
-            // Directorio: preferir #ssr-init JSON (más confiable)
-            val ssrInit = doc.selectFirst("script#ssr-init")?.data()
-            if (!ssrInit.isNullOrEmpty()) {
-                try {
-                    val ssr = parseJson<SsrInit>(ssrInit)
-                    ssr.animes?.mapNotNull { anime ->
-                        val title = anime.t ?: return@mapNotNull null
-                        val slug = anime.sl ?: return@mapNotNull null
-                        val poster = anime.fb2 ?: anime.fb ?: anime.im ?: ""
-                        val href = "$mainUrl/anime/$slug-anime"
-                        val dubstat = if (title.contains("Latino") || title.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
-                        newAnimeSearchResponse(title, href) {
-                            this.posterUrl = resolveUrl(poster)
-                            addDubStatus(dubstat)
-                        }
-                    } ?: emptyList()
-                } catch (_: Exception) {
+            isDonghua -> {
+                // Donghuas: scrapear tarjetas a[href^="/donghua/"]
+                parseDonghuaCards(doc)
+            }
+            else -> {
+                // Directorio: preferir #ssr-init JSON
+                val ssrInit = doc.selectFirst("script#ssr-init")?.data()
+                if (!ssrInit.isNullOrEmpty()) {
+                    try {
+                        val ssr = parseJson<SsrInit>(ssrInit)
+                        ssr.animes?.mapNotNull { anime ->
+                            val title = anime.t ?: return@mapNotNull null
+                            val slug = anime.sl ?: return@mapNotNull null
+                            val poster = anime.fb2?.takeIf { it.isNotBlank() }
+                                ?: anime.fb?.takeIf { it.isNotBlank() }
+                                ?: anime.im?.takeIf { it.isNotBlank() }
+                                ?: ""
+                            val href = "$mainUrl/anime/$slug-anime"
+                            val dubstat = if (title.contains("Latino") || title.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
+                            newAnimeSearchResponse(title, href) {
+                                this.posterUrl = resolveUrl(poster)
+                                addDubStatus(dubstat)
+                            }
+                        } ?: emptyList()
+                    } catch (_: Exception) {
+                        parseDirectorioHtml(doc)
+                    }
+                } else {
                     parseDirectorioHtml(doc)
                 }
-            } else {
-                parseDirectorioHtml(doc)
             }
         }
 
-        val hasNext = if (isHomePage) false
-            else doc.select("link[rel=\"next\"]").isNotEmpty()
+        val hasNext = doc.select("link[rel=\"next\"]").isNotEmpty() || doc.select("a[href*=\"page=${page + 1}\"]").isNotEmpty()
         return newHomePageResponse(
             list = HomePageList(request.name, home, isHorizontalImages = false),
             hasNext = hasNext
         )
+    }
+
+    private fun parseDonghuaCards(doc: org.jsoup.nodes.Document): List<SearchResponse> {
+        return doc.select("a[href^=\"/donghua/\"]").mapNotNull { link ->
+            val href = link.attr("href")
+            // Evitar links a episodios o URLs extrañas
+            if (href.contains("episodio")) return@mapNotNull null
+            val title = link.selectFirst("h3")?.text()?.trim() ?: return@mapNotNull null
+            val poster = link.selectFirst("img").bestImageUrl()
+            val dubstat = DubStatus.Subbed
+            newAnimeSearchResponse(title, resolveUrl(href)) {
+                this.posterUrl = resolveUrl(poster)
+                addDubStatus(dubstat)
+            }
+        }
     }
 
     private fun parseDirectorioHtml(doc: org.jsoup.nodes.Document): List<SearchResponse> {
@@ -160,12 +183,10 @@ class AnimeGratisProvider : MainAPI() {
             val href = it.selectFirst("h3 a")?.attr("href")
                 ?: it.selectFirst("a:first-child")?.attr("href")
                 ?: return@mapNotNull null
-            val poster = it.selectFirst("img")?.attr("data-fb2")
-                ?: it.selectFirst("img")?.attr("data-fallback")
-                ?: it.selectFirst("img")?.attr("src")
+            val poster = it.selectFirst("img").bestImageUrl()
             val dubstat = if (title.contains("Latino") || title.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
             newAnimeSearchResponse(title, resolveUrl(href)) {
-                this.posterUrl = resolveUrl(poster ?: "")
+                this.posterUrl = resolveUrl(poster)
                 addDubStatus(dubstat)
             }
         }
@@ -176,49 +197,63 @@ class AnimeGratisProvider : MainAPI() {
         if (!href.contains("episodio")) return null
 
         val img = link.selectFirst("img")
-        val title = img?.attr("alt") ?: link.selectFirst("p.home-anime-title")?.text() ?: link.text()
-        val poster = img?.attr("data-fb2") ?: img?.attr("data-fallback") ?: img?.attr("src")
+        val title = img?.attr("alt")?.trim()
+            ?: link.selectFirst("p.home-anime-title")?.text()?.trim()
+            ?: link.text()
+        val poster = img.bestImageUrl()
         val cleanTitle = title.replace(Regex("\\s*Episodio\\s*\\d+"), "").trim()
         val seriesUrl = episodeUrlToSeriesUrl(href)
         val epNum = Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
         val dubstat = if (cleanTitle.contains("Latino") || cleanTitle.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
         return newAnimeSearchResponse(cleanTitle, seriesUrl) {
-            this.posterUrl = resolveUrl(poster ?: "")
+            this.posterUrl = resolveUrl(poster)
             addDubStatus(dubstat, epNum)
         }
     }
 
     /**
      * /anime/{slug}/episodio-{N} → /anime/{slug}-anime
+     * /donghua/{slug}/episodio-{N} → /donghua/{slug}
      */
     private fun episodeUrlToSeriesUrl(epHref: String): String {
         val fullUrl = resolveUrl(epHref)
-        val regex = Regex("/anime/([^/]+)/episodio-\\d+")
-        val match = regex.find(fullUrl)
-        return if (match != null) {
-            val slug = match.destructured.component1()
-            "$mainUrl/anime/$slug-anime"
-        } else {
-            fullUrl
+        // Anime: /anime/{slug}/episodio-{N} → /anime/{slug}-anime
+        val animeRegex = Regex("/anime/([^/]+)/episodio-\\d+")
+        val animeMatch = animeRegex.find(fullUrl)
+        if (animeMatch != null) {
+            val slug = animeMatch.destructured.component1()
+            return "$mainUrl/anime/$slug-anime"
         }
+        // Donghua: /donghua/{slug}/episodio-{N} → /donghua/{slug}
+        val donghuaRegex = Regex("/donghua/([^/]+)/episodio-\\d+")
+        val donghuaMatch = donghuaRegex.find(fullUrl)
+        if (donghuaMatch != null) {
+            val slug = donghuaMatch.destructured.component1()
+            return "$mainUrl/donghua/$slug"
+        }
+        return fullUrl
     }
 
+    // ========== search ==========
     override suspend fun search(query: String): List<SearchResponse> {
         val queryLower = query.lowercase(Locale.getDefault())
         val results = ArrayList<SearchResponse>()
 
-        // Intentar primero con el #ssr-init JSON del directorio
-        val doc = app.get("$mainUrl/directorio", headers = headers, timeout = 30L).document
-        val ssrInit = doc.selectFirst("script#ssr-init")?.data()
-        if (!ssrInit.isNullOrEmpty()) {
-            try {
+        // 1) Buscar en directorio (anime) usando #ssr-init
+        try {
+            val doc = app.get("$mainUrl/directorio", headers = headers, timeout = 30L).document
+            val ssrInit = doc.selectFirst("script#ssr-init")?.data()
+            if (!ssrInit.isNullOrEmpty()) {
                 val ssr = parseJson<SsrInit>(ssrInit)
                 ssr.animes?.filter { anime ->
                     anime.t?.lowercase(Locale.getDefault())?.contains(queryLower) == true
                 }?.mapNotNull { anime ->
                     val title = anime.t ?: return@mapNotNull null
                     val slug = anime.sl ?: return@mapNotNull null
-                    val poster = anime.fb2 ?: anime.fb ?: anime.im ?: ""
+                    val poster = anime.fb2?.takeIf { it.isNotBlank() }
+                        ?: anime.fb?.takeIf { it.isNotBlank() }
+                        ?: anime.im?.takeIf { it.isNotBlank() }
+                        ?: ""
                     val href = "$mainUrl/anime/$slug-anime"
                     val dubstat = if (title.contains("Latino") || title.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
                     results.add(newAnimeSearchResponse(title, href, TvType.Anime) {
@@ -226,34 +261,53 @@ class AnimeGratisProvider : MainAPI() {
                         addDubStatus(dubstat)
                     })
                 }
-                if (results.size >= 20) return results
+            }
+        } catch (_: Exception) {}
+
+        // 2) Buscar en donghua (búsqueda server-side: /donghua?q=...)
+        try {
+            val donghuaUrl = "$mainUrl/donghua?q=${java.net.URLEncoder.encode(query, "UTF-8")}"
+            val doc = app.get(donghuaUrl, headers = headers, timeout = 30L).document
+            val donghuaResults = doc.select("a[href^=\"/donghua/\"]").mapNotNull { link ->
+                val href = link.attr("href")
+                if (href.contains("episodio")) return@mapNotNull null
+                val title = link.selectFirst("h3")?.text()?.trim() ?: return@mapNotNull null
+                val poster = link.selectFirst("img").bestImageUrl()
+                newAnimeSearchResponse(title, resolveUrl(href), TvType.Anime) {
+                    this.posterUrl = resolveUrl(poster)
+                    addDubStatus(DubStatus.Subbed)
+                }
+            }
+            results.addAll(donghuaResults)
+        } catch (_: Exception) {}
+
+        // 3) Fallback: buscar en HTML del directorio si ssr-init no funcionó
+        if (results.isEmpty()) {
+            try {
+                val doc = app.get("$mainUrl/directorio", headers = headers, timeout = 30L).document
+                val pageResults = doc.select("div.anime-card").mapNotNull {
+                    val title = it.selectFirst("h3 a")?.text() ?: return@mapNotNull null
+                    if (!title.lowercase(Locale.getDefault()).contains(queryLower)) return@mapNotNull null
+                    val href = it.selectFirst("h3 a")?.attr("href")
+                        ?: it.selectFirst("a:first-child")?.attr("href")
+                        ?: return@mapNotNull null
+                    val image = it.selectFirst("img").bestImageUrl()
+                    val dubstat = if (title.contains("Latino") || title.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
+                    newAnimeSearchResponse(title, resolveUrl(href), TvType.Anime) {
+                        this.posterUrl = resolveUrl(image)
+                        addDubStatus(dubstat)
+                    }
+                }
+                results.addAll(pageResults)
             } catch (_: Exception) {}
         }
 
-        // Fallback: scrapear HTML si no hay JSON
-        if (results.isEmpty()) {
-            val pageResults = doc.select("div.anime-card").mapNotNull {
-                val title = it.selectFirst("h3 a")?.text() ?: return@mapNotNull null
-                if (!title.lowercase(Locale.getDefault()).contains(queryLower)) return@mapNotNull null
-                val href = it.selectFirst("h3 a")?.attr("href")
-                    ?: it.selectFirst("a:first-child")?.attr("href")
-                    ?: return@mapNotNull null
-                val image = it.selectFirst("img")?.attr("data-fb2")
-                    ?: it.selectFirst("img")?.attr("data-fallback")
-                    ?: it.selectFirst("img")?.attr("src")
-                val dubstat = if (title.contains("Latino") || title.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
-                newAnimeSearchResponse(title, resolveUrl(href), TvType.Anime) {
-                    this.posterUrl = resolveUrl(image ?: "")
-                    addDubStatus(dubstat)
-                }
-            }
-            results.addAll(pageResults)
-        }
-
-        return results
+        return results.distinctBy { it.url }.take(30)
     }
 
+    // ========== load ==========
     override suspend fun load(url: String): LoadResponse {
+        val isDonghua = url.contains("/donghua/")
         val doc = app.get(url, headers = headers, timeout = 30L).document
 
         var jsonLdTitle: String? = null
@@ -288,15 +342,14 @@ class AnimeGratisProvider : MainAPI() {
                 } else null
             }.firstOrNull()
             ?: ""
-        // Poster: JSON-LD → img con data-fb2 → data-fallback → src → og:image
         val poster = jsonLdImage
-            ?: doc.selectFirst("img[data-fb2]")?.attr("data-fb2")
-            ?: doc.selectFirst("img[data-fallback]")?.attr("data-fallback")
-            ?: doc.selectFirst("img[src*=\"cdn.animegratis\"]")?.attr("src")
+            ?: doc.selectFirst("img[data-fb2]")?.attr("data-fb2")?.takeIf { it.isNotBlank() }
+            ?: doc.selectFirst("img[data-fallback]")?.attr("data-fallback")?.takeIf { it.isNotBlank() }
+            ?: doc.selectFirst("img[src*=\"cdn.animegratis\"]")?.attr("src")?.takeIf { it.isNotBlank() }
             ?: doc.selectFirst("head meta[property=og:image]")?.attr("content")
             ?: ""
         val genres = if (jsonLdGenres.isNotEmpty()) jsonLdGenres
-            else doc.select("a[href^=\"/directorio/genero/\"]").map { it.text() }
+            else doc.select("a[href^=\"/directorio/genero/\"], a[href*=\"/genero/\"]").map { it.text() }
 
         val statusText = doc.select("span").map { it.text() }.find {
             it.contains("En emisión") || it.contains("Finalizado") || it.contains("Próximamente")
@@ -318,30 +371,52 @@ class AnimeGratisProvider : MainAPI() {
 
         val episodes = ArrayList<Episode>()
 
-        // Buscar episodios: a.episode-card[data-episode] dentro de #episodes-grid
-        val epCards = doc.select("#episodes-grid a.episode-card[data-episode]")
-        if (epCards.isNotEmpty()) {
-            epCards.amap { epCard ->
-                val href = epCard.attr("href")
-                val epNum = epCard.attr("data-episode")?.toIntOrNull()
-                    ?: Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
-                if (href.isNotEmpty()) {
-                    episodes.add(newEpisode(resolveUrl(href)) { this.episode = epNum })
+        if (isDonghua) {
+            // Donghua: episodios en a[data-episode] o a[href*="episodio"]
+            val epCards = doc.select("#dh-episodes-grid a[data-episode], a[data-episode]")
+            if (epCards.isNotEmpty()) {
+                epCards.amap { epCard ->
+                    val href = epCard.attr("href")
+                    val epNum = epCard.attr("data-episode")?.toIntOrNull()
+                        ?: Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
+                    if (href.isNotEmpty()) {
+                        episodes.add(newEpisode(resolveUrl(href)) { this.episode = epNum })
+                    }
+                }
+            } else {
+                doc.select("a[href*=\"episodio\"]").amap { epCard ->
+                    val href = epCard.attr("href")
+                    val epNum = Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
+                    if (href.isNotEmpty()) {
+                        episodes.add(newEpisode(resolveUrl(href)) { this.episode = epNum })
+                    }
                 }
             }
         } else {
-            // Fallback: buscar cualquier enlace a episodio
-            doc.select("a[href*=\"episodio\"]").amap { epCard ->
-                val href = epCard.attr("href")
-                val epNum = Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
-                if (href.isNotEmpty()) {
-                    episodes.add(newEpisode(resolveUrl(href)) { this.episode = epNum })
+            // Anime: episodios en a.episode-card[data-episode]
+            val epCards = doc.select("#episodes-grid a.episode-card[data-episode], a.episode-card[data-episode]")
+            if (epCards.isNotEmpty()) {
+                epCards.amap { epCard ->
+                    val href = epCard.attr("href")
+                    val epNum = epCard.attr("data-episode")?.toIntOrNull()
+                        ?: Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
+                    if (href.isNotEmpty()) {
+                        episodes.add(newEpisode(resolveUrl(href)) { this.episode = epNum })
+                    }
+                }
+            } else {
+                doc.select("a[href*=\"episodio\"]").amap { epCard ->
+                    val href = epCard.attr("href")
+                    val epNum = Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
+                    if (href.isNotEmpty()) {
+                        episodes.add(newEpisode(resolveUrl(href)) { this.episode = epNum })
+                    }
                 }
             }
         }
 
         // Si JSON-LD indica más episodios de los encontrados, generar URLs
-        if (episodes.size < (jsonLdEpCount ?: 0)) {
+        if (!isDonghua && episodes.size < (jsonLdEpCount ?: 0)) {
             val totalEps = jsonLdEpCount ?: episodes.size
             if (totalEps > episodes.size) {
                 val slugWithAnime = url.substringAfter("/anime/")
@@ -374,6 +449,7 @@ class AnimeGratisProvider : MainAPI() {
         }
     }
 
+    // ========== loadLinks ==========
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -381,16 +457,14 @@ class AnimeGratisProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val doc = app.get(data, headers = headers, timeout = 30L).document
-
         var foundLinks = false
 
-        // ====== Método 1: Extraer URLs de botones de servidor ======
-        // Los botones tienen data-url, data-server, data-lang-group
-        val serverButtons = doc.select("button.server-btn[data-url]")
+        // ====== Método 1: Botones de servidor (data-url) ======
+        val serverButtons = doc.select("button.server-btn[data-url], button.server-tab[data-url]")
         if (serverButtons.isNotEmpty()) {
             serverButtons.amap { btn ->
-                val videoUrl = btn.attr("data-url")
-                val serverName = btn.attr("data-server")?.ifBlank { "Server" } ?: "Server"
+                val videoUrl = btn.attr("data-url").trim()
+                val serverName = btn.text().trim().ifBlank { "Server" }
 
                 if (videoUrl.isNotEmpty() && videoUrl.startsWith("http")) {
                     foundLinks = processVideoUrl(videoUrl, data, serverName, subtitleCallback, callback) || foundLinks
@@ -398,51 +472,44 @@ class AnimeGratisProvider : MainAPI() {
             }
         }
 
-        // ====== Método 2: Buscar data-url en cualquier elemento ======
+        // ====== Método 2: data-url en cualquier elemento ======
         if (!foundLinks) {
             doc.select("[data-url]").amap { el ->
-                val videoUrl = el.attr("data-url")
+                val videoUrl = el.attr("data-url").trim()
                 if (videoUrl.isNotEmpty() && videoUrl.startsWith("http")) {
                     foundLinks = processVideoUrl(videoUrl, data, "Server", subtitleCallback, callback) || foundLinks
                 }
             }
         }
 
-        // ====== Método 3: Buscar iframe del video ======
+        // ====== Método 3: Iframe del video ======
         if (!foundLinks) {
             doc.select("iframe").amap { iframe ->
-                val src = iframe.attr("src")?.ifBlank { iframe.attr("data-src") }
-                if (!src.isNullOrEmpty()) {
+                val src = listOf("src", "data-src")
+                    .map { iframe.attr(it).trim() }
+                    .firstOrNull { it.isNotBlank() }
+                if (src != null) {
                     val fullSrc = resolveUrl(src)
                     if (fullSrc.startsWith("http")) {
-                        foundLinks = processVideoUrl(fullSrc, data, "HLS", subtitleCallback, callback) || foundLinks
+                        foundLinks = processVideoUrl(fullSrc, data, "Player", subtitleCallback, callback) || foundLinks
                     }
                 }
             }
         }
 
-        // ====== Método 4: Buscar URLs en scripts ======
+        // ====== Método 4: URLs en scripts ======
         if (!foundLinks) {
             for (script in doc.select("script")) {
                 val scriptData = script.data()
                 if (scriptData.contains(".m3u8") || scriptData.contains(".mp4")) {
-                    val m3u8Regex = Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""")
-                    m3u8Regex.find(scriptData)?.value?.let { m3u8Url ->
-                        try {
-                            generateM3u8("Server", m3u8Url, data).forEach(callback)
-                            foundLinks = true
-                            return@let
-                        } catch (_: Exception) {}
+                    Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""").find(scriptData)?.value?.let { url ->
+                        try { generateM3u8("Server", url, data).forEach(callback); foundLinks = true } catch (_: Exception) {}
                     }
                     if (!foundLinks) {
-                        val mp4Regex = Regex("""(https?://[^\s"'<>]+\.mp4[^\s"'<>]*)""")
-                        mp4Regex.find(scriptData)?.value?.let { mp4Url ->
-                            callback(
-                                newExtractorLink(source = "Server", name = "Server", url = mp4Url) {
-                                    this.referer = data
-                                    this.quality = Qualities.Unknown.value
-                                }
-                            )
+                        Regex("""(https?://[^\s"'<>]+\.mp4[^\s"'<>]*)""").find(scriptData)?.value?.let { url ->
+                            callback(newExtractorLink(source = "Server", name = "Server", url = url) {
+                                this.referer = data; this.quality = Qualities.Unknown.value
+                            })
                             foundLinks = true
                         }
                     }
@@ -454,271 +521,133 @@ class AnimeGratisProvider : MainAPI() {
         return foundLinks
     }
 
-    /**
-     * Procesa una URL de video: intenta loadExtractor primero, luego extracción manual
-     */
     private suspend fun processVideoUrl(
-        videoUrl: String,
-        referer: String,
-        serverName: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
+        videoUrl: String, referer: String, serverName: String,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ): Boolean {
         var found = false
-
-        // Intentar loadExtractor (CloudStream tiene extractores integrados para muchos servidores)
-        try {
-            loadExtractor(videoUrl, referer, subtitleCallback, callback)
-            found = true
-        } catch (_: Exception) {}
-
-        // Si loadExtractor falló, intentar extracción manual según el servidor
+        try { loadExtractor(videoUrl, referer, subtitleCallback, callback); found = true } catch (_: Exception) {}
         if (!found) {
             when {
-                // zilla-networks: extraer de la página del player
-                videoUrl.contains("zilla-networks.com") || videoUrl.contains("player.zilla") -> {
+                videoUrl.contains("zilla-networks.com") || videoUrl.contains("player.zilla") ->
                     found = extractFromPlayerPage(videoUrl, referer, serverName, callback)
-                }
-                // Dailymotion: usar API de metadata
                 videoUrl.contains("dailymotion.com") -> {
-                    val videoId = Regex("dailymotion\\.com/(?:embed/)?video/([a-zA-Z0-9]+)").find(videoUrl)?.destructured?.component1()
-                    if (!videoId.isNullOrEmpty()) {
+                    val videoId = Regex("dailymotion\\.com/(?:embed/)?video/([a-zA-Z0-9]+)")
+                        .find(videoUrl)?.destructured?.component1()
+                    if (!videoId.isNullOrEmpty())
                         found = extractDailymotionApi(videoId, referer, serverName, callback)
-                    }
                 }
-                // ok.ru: intentar extraer del HTML del embed
-                videoUrl.contains("ok.ru") -> {
+                videoUrl.contains("ok.ru") ->
                     found = extractOkRu(videoUrl, referer, serverName, callback)
-                }
-                // streamwish, streamtape, mixdrop, filemoon, etc.: reintentar loadExtractor con diferentes parámetros
-                else -> {
-                    // Último intento: buscar URLs de video en la página
+                else ->
                     found = extractFromPlayerPage(videoUrl, referer, serverName, callback)
-                }
             }
         }
-
         return found
     }
 
-    /**
-     * Extrae URLs de video (m3u8/mp4) de una página de player genérica
-     */
     private suspend fun extractFromPlayerPage(
-        playerUrl: String,
-        referer: String,
-        serverName: String,
-        callback: (ExtractorLink) -> Unit
+        playerUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
-        var found = false
         try {
-            val response = app.get(playerUrl, referer = referer, headers = headers, timeout = 15L)
-            val text = response.text
-
-            // Buscar m3u8
-            val m3u8Regex = Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""")
-            for (match in m3u8Regex.findAll(text)) {
-                try {
-                    generateM3u8(serverName, match.value, playerUrl).forEach(callback)
-                    found = true
-                    return true
-                } catch (_: Exception) {}
-            }
-
-            // Buscar mp4
-            if (!found) {
-                val mp4Regex = Regex("""(https?://[^\s"'<>]+\.mp4[^\s"'<>]*)""")
-                for (match in mp4Regex.findAll(text)) {
-                    callback(
-                        newExtractorLink(source = serverName, name = serverName, url = match.value) {
-                            this.referer = playerUrl
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                    found = true
-                    return true
-                }
-            }
-
-            // Buscar URLs en datos JSON dentro de scripts
-            if (!found) {
-                val urlInJsonRegex = Regex(""""(https?://[^"]+(?:\.m3u8|\.mp4)[^"]*)"""")
-                for (match in urlInJsonRegex.findAll(text)) {
+            val text = app.get(playerUrl, referer = referer, headers = headers, timeout = 15L).text
+            for (regex in listOf(
+                Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)"""),
+                Regex(""""(https?://[^"]+(?:\.m3u8|\.mp4)[^"]*)"""")
+            )) {
+                for (match in regex.findAll(text)) {
                     val url = match.destructured.component1()
                     if (url.contains(".m3u8")) {
-                        try {
-                            generateM3u8(serverName, url, playerUrl).forEach(callback)
-                            found = true
-                            return true
-                        } catch (_: Exception) {}
-                    } else if (url.contains(".mp4")) {
-                        callback(
-                            newExtractorLink(source = serverName, name = serverName, url = url) {
-                                this.referer = playerUrl
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
-                        found = true
+                        try { generateM3u8(serverName, url, playerUrl).forEach(callback); return true } catch (_: Exception) {}
+                    } else {
+                        callback(newExtractorLink(source = serverName, name = serverName, url = url) {
+                            this.referer = playerUrl; this.quality = Qualities.Unknown.value
+                        })
                         return true
                     }
                 }
             }
-        } catch (_: Exception) {}
-        return found
-    }
-
-    /**
-     * Extracción de Dailymotion usando la API de metadata del player
-     * GET https://www.dailymotion.com/player/metadata/video/{videoId}
-     */
-    private suspend fun extractDailymotionApi(
-        videoId: String,
-        referer: String,
-        serverName: String,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        var found = false
-
-        // Método 1: API de metadata del player
-        try {
-            val apiUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
-            val response = app.get(
-                apiUrl,
-                referer = "https://www.dailymotion.com/embed/video/$videoId",
-                headers = mapOf(
-                    "User-Agent" to USER_AGENT,
-                    "Accept" to "application/json",
-                ),
-                timeout = 15L
-            )
-            val jsonText = response.text
-
-            // Buscar m3u8 en la respuesta JSON
-            val m3u8Regex = Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""")
-            for (match in m3u8Regex.findAll(jsonText)) {
-                try {
-                    generateM3u8(serverName, match.value, "https://www.dailymotion.com").forEach(callback)
-                    found = true
-                    return true
-                } catch (_: Exception) {}
-            }
-
-            // Buscar mp4 en la respuesta JSON
-            if (!found) {
-                val mp4Regex = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""")
-                val mp4Urls = mp4Regex.findAll(jsonText).map { it.value }.distinct().toList()
-                for (url in mp4Urls) {
-                    val quality = when {
-                        url.contains("1080") || url.contains("x1080") -> Qualities.P1080.value
-                        url.contains("720") || url.contains("x720") -> Qualities.P720.value
-                        url.contains("480") || url.contains("x480") -> Qualities.P480.value
-                        url.contains("380") || url.contains("x360") -> Qualities.P360.value
-                        url.contains("240") || url.contains("x240") -> Qualities.P240.value
-                        else -> Qualities.Unknown.value
-                    }
-                    callback(
-                        newExtractorLink(source = serverName, name = "$serverName ${quality / 1000}p", url = url) {
-                            this.referer = "https://www.dailymotion.com"
-                            this.quality = quality
-                        }
-                    )
-                    found = true
-                }
-                if (found) return true
-            }
-        } catch (_: Exception) {}
-
-        // Método 2: Scrapear la página embed
-        if (!found) {
-            try {
-                val embedUrl = "https://www.dailymotion.com/embed/video/$videoId"
-                val response = app.get(embedUrl, referer = referer, headers = headers, timeout = 15L)
-                val html = response.text
-
-                val m3u8Regex = Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""")
-                for (match in m3u8Regex.findAll(html)) {
-                    try {
-                        generateM3u8(serverName, match.value, embedUrl).forEach(callback)
-                        found = true
-                        return true
-                    } catch (_: Exception) {}
-                }
-
-                val mp4Regex = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""")
-                for (match in mp4Regex.findAll(html)) {
-                    callback(
-                        newExtractorLink(source = serverName, name = serverName, url = match.value) {
-                            this.referer = embedUrl
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                    found = true
-                    return true
-                }
-            } catch (_: Exception) {}
-        }
-
-        return found
-    }
-
-    /**
-     * Extracción de ok.ru: buscar URL de video en la página embed
-     */
-    private suspend fun extractOkRu(
-        videoUrl: String,
-        referer: String,
-        serverName: String,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        var found = false
-        try {
-            val response = app.get(videoUrl, referer = referer, headers = headers, timeout = 15L)
-            val html = response.text
-
-            // Buscar data-options con JSON que contiene video URLs
-            val dataOptionsRegex = Regex("""data-options="([^"]+)"""")
-            val dataMatch = dataOptionsRegex.find(html)
-            if (dataMatch != null) {
-                val optionsJson = dataMatch.destructured.component1()
-                    .replace("&quot;", "\"")
-                    .replace("&amp;", "&")
-                val videoUrlInOptions = Regex("""(https?://[^"]+\.(?:mp4|m3u8)[^"]*)""").find(optionsJson)?.value
-                if (!videoUrlInOptions.isNullOrEmpty()) {
-                    callback(
-                        newExtractorLink(source = serverName, name = serverName, url = videoUrlInOptions) {
-                            this.referer = videoUrl
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                    return true
-                }
-            }
-
-            // Buscar og:video meta tag
-            val ogRegex = Regex("""<meta\s+property=["']og:video(?::url)?["']\s+content=["']([^"']+)["']""")
-            val ogMatch = ogRegex.find(html)
-            if (ogMatch != null) {
-                callback(
-                    newExtractorLink(source = serverName, name = serverName, url = ogMatch.destructured.component1()) {
-                        this.referer = videoUrl
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
+            Regex("""(https?://[^\s"'<>]+\.mp4[^\s"'<>]*)""").find(text)?.value?.let { url ->
+                callback(newExtractorLink(source = serverName, name = serverName, url = url) {
+                    this.referer = playerUrl; this.quality = Qualities.Unknown.value
+                })
                 return true
             }
+        } catch (_: Exception) {}
+        return false
+    }
 
-            // Buscar URLs de video directamente en el HTML
-            val videoUrlRegex = Regex("""(https?://[^"'\s<>]+\.(?:mp4|m3u8)[^"'\s<>]*)""")
-            for (match in videoUrlRegex.findAll(html)) {
-                callback(
-                    newExtractorLink(source = serverName, name = serverName, url = match.value) {
-                        this.referer = videoUrl
-                        this.quality = Qualities.Unknown.value
+    private suspend fun extractDailymotionApi(
+        videoId: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        // API de metadata del player
+        try {
+            val apiUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
+            val jsonText = app.get(apiUrl, referer = "https://www.dailymotion.com/embed/video/$videoId",
+                headers = mapOf("User-Agent" to USER_AGENT, "Accept" to "application/json"), timeout = 15L).text
+            for (match in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(jsonText)) {
+                try { generateM3u8(serverName, match.value, "https://www.dailymotion.com").forEach(callback); return true } catch (_: Exception) {}
+            }
+            val mp4Urls = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(jsonText).map { it.value }.distinct().toList()
+            if (mp4Urls.isNotEmpty()) {
+                for (url in mp4Urls) {
+                    val quality = when {
+                        url.contains("1080") -> Qualities.P1080.value; url.contains("720") -> Qualities.P720.value
+                        url.contains("480") -> Qualities.P480.value; url.contains("380") || url.contains("360") -> Qualities.P360.value
+                        else -> Qualities.Unknown.value
                     }
-                )
-                found = true
+                    callback(newExtractorLink(source = serverName, name = "$serverName ${quality/1000}p", url = url) {
+                        this.referer = "https://www.dailymotion.com"; this.quality = quality
+                    })
+                }
+                return true
             }
         } catch (_: Exception) {}
-        return found
+        // Fallback: scrape embed page
+        try {
+            val embedUrl = "https://www.dailymotion.com/embed/video/$videoId"
+            val html = app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
+            for (match in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(html)) {
+                try { generateM3u8(serverName, match.value, embedUrl).forEach(callback); return true } catch (_: Exception) {}
+            }
+            for (match in Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(html)) {
+                callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
+                    this.referer = embedUrl; this.quality = Qualities.Unknown.value
+                })
+                return true
+            }
+        } catch (_: Exception) {}
+        return false
+    }
+
+    private suspend fun extractOkRu(
+        videoUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        try {
+            val html = app.get(videoUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
+            val dataMatch = Regex("""data-options="([^"]+)"""").find(html)
+            if (dataMatch != null) {
+                val optionsJson = dataMatch.destructured.component1().replace("&quot;", "\"").replace("&amp;", "&")
+                for (match in Regex("""(https?://[^"]+\.(?:mp4|m3u8)[^"]*)""").findAll(optionsJson)) {
+                    callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
+                        this.referer = videoUrl; this.quality = Qualities.Unknown.value
+                    })
+                    return true
+                }
+            }
+            Regex("""<meta\s+property=["']og:video(?::url)?["']\s+content=["']([^"']+)["']""").find(html)?.let { match ->
+                callback(newExtractorLink(source = serverName, name = serverName, url = match.destructured.component1()) {
+                    this.referer = videoUrl; this.quality = Qualities.Unknown.value
+                })
+                return true
+            }
+            for (match in Regex("""(https?://[^"'\s<>]+\.(?:mp4|m3u8)[^"'\s<>]*)""").findAll(html)) {
+                callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
+                    this.referer = videoUrl; this.quality = Qualities.Unknown.value
+                })
+                return true
+            }
+        } catch (_: Exception) {}
+        return false
     }
 }
