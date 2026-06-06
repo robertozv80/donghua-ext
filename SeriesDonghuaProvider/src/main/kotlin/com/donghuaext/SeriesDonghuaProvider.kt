@@ -183,22 +183,31 @@ class SeriesDonghuaProvider : MainAPI() {
     )
 
     // ================================================================
-    //  DECODIFICADOR DEL JAVASCRIPT OFUSCADO (Smart Packer)
+    //  SMART PACKER DECODER
     // ================================================================
     // El sitio usa eval(function(h,u,n,t,e,r){...}(args)) para
-    // ocultar VIDEO_MAP_JSON. No aparece en el HTML crudo.
+    // ocultar VIDEO_MAP_JSON dentro de un document.write().
     //
-    // El resultado decodificado ahora contiene guard conditions + document.write:
+    // Parámetros (en orden de aparición en la llamada):
+    //   h = string codificado (largo)
+    //   u = número (NO se usa dentro de la función)
+    //   n = charset (string corto, ej "uRfZNtQnw")
+    //   t = offset a restar del charCode
+    //   e = base para la conversión Y índice del delimitador n[e]
+    //   r = número (se sobreescribe con "", NO se usa)
+    //
+    // El resultado decodificado contiene:
     //   if(timestamp < T){if(hostname === 'seriesdonghua.com'){
-    //     document.write('<script>const VIDEO_MAP_JSON={...};</script>');
+    //     document.write('<script>const VIDEO_MAP_JSON={...};...</script>');
     //   }}
     //
-    // Función auxiliar _0xe98c(d, e, f):
-    //   Convierte string d de base-e a decimal
-    //   Usa el set estándar "0123456789abc...+/" slice(0,e) como dígitos válidos
-    //   Los caracteres fuera de este set causan NaN (reduce bug)
-    //   Pero el packer solo usa los primeros e chars del charset para codificar,
-    //   así que los tokens solo contienen índices 0..e-1, todos válidos.
+    // Los valores del VIDEO_MAP_JSON están doble-codificados:
+    //   "asura":"\"k7kfQJoj2LJJEqGt63g\""  → JSON.parse → "k7kfQJoj2LJJEqGt63g"
+    //   "skadi":"\"https:\/\/ok.ru\/...\""   → JSON.parse → "https://ok.ru/..."
+    //
+    // IMPORTANTE: El contenido de document.write('...') contiene comillas
+    // simples escapadas (\') que ROMPEN la extracción por regex simple.
+    // Se debe usar parsing carácter por carácter.
     // ================================================================
 
     private fun decodeSmartPacker(
@@ -217,16 +226,15 @@ class SeriesDonghuaProvider : MainAPI() {
         for (token in tokens) {
             if (token.isEmpty()) continue
 
-            // Reemplazar cada char por su índice en el charset (como string decimal)
-            // Esto replica exactamente el JS: s=s.replace(new RegExp(n[j],"g"),j)
+            // Reemplazar cada char por su índice en el charset
+            // (replica exactamente el JS: s=s.replace(new RegExp(n[j],"g"),j))
             var replacedStr = token
             for (j in charset.indices) {
                 replacedStr = replacedStr.replace(charset[j].toString(), j.toString())
             }
 
-            // Convertir de base eParam a decimal usando el método posicional
-            // (igual que JS _0xe98c con .reverse().reduce())
-            // Solo los caracteres en validDigits ("0".."e-1") contribuyen al valor
+            // Convertir de base eParam a decimal (mismo método que JS _0xe56c)
+            // Solo los caracteres en validDigits contribuyen al valor
             val reversed = replacedStr.reversed()
             var num = 0L
             for ((pos, ch) in reversed.withIndex()) {
@@ -252,32 +260,27 @@ class SeriesDonghuaProvider : MainAPI() {
 
     /**
      * Busca y decodifica el eval() ofuscado en el HTML.
-     * Patrón: eval(function(h,u,n,t,e,r){...}("encoded",u_val,"charset",t_val,e_val,r_val))
-     *
-     * MAPEO CORRECTO de parámetros:
+     * Mapeo de parámetros del regex:
      *   Grupo 1 = h (string codificado)
      *   Grupo 2 = u (NO usado)
      *   Grupo 3 = n (charset)
      *   Grupo 4 = t (offset)
      *   Grupo 5 = e (base Y delimiter index)
-     *   Grupo 6 = r (NO usado, se sobreescribe)
+     *   Grupo 6 = r (NO usado)
      */
     private fun decodeObfuscatedScript(html: String): String? {
         val argPatterns = listOf(
-            // Con comillas dobles - encoded string de 20+ chars
             Regex("""\(\s*"([^"]{20,})"\s*,\s*(\d+)\s*,\s*"([^"]{2,20})"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)"""),
-            // Con comillas simples
             Regex("""\(\s*'([^']{20,})'\s*,\s*(\d+)\s*,\s*'([^']{2,20})'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)"""),
         )
 
         for (pattern in argPatterns) {
             for (match in pattern.findAll(html)) {
                 try {
-                    val encodedStr = match.destructured.component1()  // h
-                    // component2() = u (NO usado)
-                    val charset = match.destructured.component3()     // n
-                    val offset = match.destructured.component4().toInt()  // t
-                    val eParam = match.destructured.component5().toInt()  // e (base + delim)
+                    val encodedStr = match.destructured.component1()
+                    val charset = match.destructured.component3()
+                    val offset = match.destructured.component4().toInt()
+                    val eParam = match.destructured.component5().toInt()
 
                     val decoded = decodeSmartPacker(encodedStr, eParam, charset, offset)
                     if (decoded != null && decoded.contains("VIDEO_MAP_JSON")) {
@@ -291,117 +294,158 @@ class SeriesDonghuaProvider : MainAPI() {
     }
 
     /**
-     * Extrae VIDEO_MAP_JSON del script decodificado.
-     * El resultado decodificado puede venir en varios formatos:
+     * Extrae y desescapa el contenido de document.write('...') del string
+     * decodificado del Smart Packer.
      *
-     * 1) Directo: const VIDEO_MAP_JSON={...};
-     * 2) Con document.write: document.write('<script>const VIDEO_MAP_JSON={...};</script>');
-     * 3) Con guard conditions: if(timestamp){if(hostname){document.write('...');}}
+     * CRÍTICO: Se usa parsing carácter por carácter porque el contenido
+     * contiene comillas simples escapadas (\' ) que ROMPEN la extracción
+     * por regex (el patrón [^']+ se detiene en la comilla del \').
      *
-     * También decodifica entidades HTML (&amp; → &, &lt; → <, etc.)
-     * que pueden aparecer dentro del string de document.write.
+     * Secuencias de escape procesadas:
+     *   \' → '    \" → "    \\ → \    \/ → /    \n → salto de línea
      */
-    private fun extractVideoMapJson(decodedScript: String): String? {
-        // Primero, limpiar el string decodificado:
-        // - Extraer contenido de document.write('...') si existe
-        // - Decodificar entidades HTML
+    private fun extractDocumentWriteContent(decodedScript: String): String? {
+        val startMarker = "document.write('"
+        val startIdx = decodedScript.indexOf(startMarker)
+        if (startIdx < 0) return null
 
-        var cleanScript = decodedScript
+        var pos = startIdx + startMarker.length
+        val content = StringBuilder()
 
-        // Intentar extraer el contenido de document.write('...')
-        val docWritePatterns = listOf(
-            Regex("""document\.write\(\s*'([^']+)'\s*\)"""),
-            Regex("""document\.write\(\s*"([^"]+)"\s*\)"""),
-        )
-        for (pattern in docWritePatterns) {
-            val match = pattern.find(cleanScript)
-            if (match != null) {
-                cleanScript = match.destructured.component1()
+        while (pos < decodedScript.length) {
+            val ch = decodedScript[pos]
+            if (ch == '\\' && pos + 1 < decodedScript.length) {
+                val nextCh = decodedScript[pos + 1]
+                when (nextCh) {
+                    '\'' -> content.append('\'')
+                    '"'  -> content.append('"')
+                    '\\' -> content.append('\\')
+                    '/'  -> content.append('/')
+                    'n'  -> content.append('\n')
+                    'r'  -> content.append('\r')
+                    't'  -> content.append('\t')
+                    else -> content.append(nextCh)
+                }
+                pos += 2
+            } else if (ch == '\'') {
+                // Fin del string de document.write
                 break
+            } else {
+                content.append(ch)
+                pos++
             }
         }
 
-        // Decodificar entidades HTML comunes
-        cleanScript = cleanScript
-            .replace("&amp;", "&")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&#39;", "'")
-            .replace("&apos;", "'")
+        return content.toString()
+    }
 
-        // Extraer el JSON usando conteo de llaves para manejar
-        // URLs que contengan puntos y comas u otros caracteres
-        val jsonStr = extractJsonObject(cleanScript, "VIDEO_MAP_JSON")
-        if (jsonStr != null) return jsonStr
-
-        // Fallback con regex tradicionales
+    /**
+     * Extrae un objeto JSON completo usando conteo de llaves.
+     * Más robusto que regex porque maneja llaves anidadas y caracteres
+     * especiales dentro de strings.
+     */
+    private fun extractJsonObject(text: String, varName: String = "VIDEO_MAP_JSON"): String? {
         val patterns = listOf(
-            Regex("""const\s+VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
-            Regex("""VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
-            Regex("""VIDEO_MAP_JSON\s*=\s*(\{.*?\})\s*;?"""),
+            Regex("""VIDEO_MAP_JSON\s*=\s*\{"""),
         )
         for (pattern in patterns) {
-            val match = pattern.find(cleanScript)
-            if (match != null) return match.destructured.component1()
+            val match = pattern.find(text) ?: continue
+            val braceStart = text.indexOf('{', match.range.first)
+            if (braceStart < 0) continue
+
+            var depth = 0
+            var inString = false
+            var escape = false
+
+            for (i in braceStart until text.length) {
+                val c = text[i]
+                if (escape) { escape = false; continue }
+                if (c == '\\' && inString) { escape = true; continue }
+                if (c == '"') { inString = !inString; continue }
+                if (inString) continue
+                if (c == '{') depth++
+                if (c == '}') {
+                    depth--
+                    if (depth == 0) return text.substring(braceStart, i + 1)
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * Extrae el JSON del VIDEO_MAP_JSON desde el script decodificado.
+     *
+     * Flujo:
+     * 1. Extraer contenido de document.write('...') con parsing carácter por
+     *    carácter (maneja secuencias de escape como \', \", \\, \/)
+     * 2. Extraer JSON con conteo de llaves desde el contenido desescapado
+     * 3. Fallback: buscar directamente en el texto decodificado crudo
+     */
+    private fun extractVideoMapJson(decodedScript: String): String? {
+        // PASO 1: Extraer y desescapar contenido de document.write
+        val dwContent = extractDocumentWriteContent(decodedScript)
+
+        // PASO 2: Intentar extraer JSON desde el contenido desescapado
+        if (dwContent != null) {
+            val jsonFromDw = extractJsonObject(dwContent)
+            if (jsonFromDw != null) return jsonFromDw
+        }
+
+        // PASO 3: Fallback - buscar directamente en el texto decodificado
+        // (menos confiable porque las secuencias de escape no están procesadas)
+        val jsonFromRaw = extractJsonObject(decodedScript)
+        if (jsonFromRaw != null) return jsonFromRaw
+
+        // PASO 4: Último fallback con regex simples
+        val searchTargets = mutableListOf<String>()
+        if (dwContent != null) searchTargets.add(dwContent)
+        searchTargets.add(decodedScript)
+
+        for (target in searchTargets) {
+            for (pattern in listOf(
+                Regex("""const\s+VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
+                Regex("""VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
+                Regex("""VIDEO_MAP_JSON\s*=\s*(\{.*?\})\s*;?"""),
+            )) {
+                val match = pattern.find(target)
+                if (match != null) return match.destructured.component1()
+            }
         }
 
         return null
     }
 
     /**
-     * Extrae un objeto JSON completo usando conteo de llaves.
-     * Esto es más robusto que regex porque maneja llaves anidadas
-     * y caracteres especiales (punto y coma, etc.) dentro de strings.
+     * Decodifica un valor doble-codificado del VIDEO_MAP_JSON.
+     *
+     * Los valores están envueltos en comillas extras (JSON string dentro
+     * de JSON string). El sitio usa JSON.parse(j) para obtener el valor real.
+     * Ejemplo:
+     *   "asura": "\"k7kfQJoj2LJJEqGt63g\"" → JSON.parse → k7kfQJoj2LJJEqGt63g
+     *   "skadi": "\"https:\/\/ok.ru\/...\""  → JSON.parse → https://ok.ru/...
+     *
+     * Se usa parseJson<String> como método principal (equivale a JSON.parse),
+     * con desescapado manual como fallback.
      */
-    private fun extractJsonObject(text: String, varName: String): String? {
-        // Buscar la posición de "VIDEO_MAP_JSON = {" o "VIDEO_MAP_JSON={"
-        val patterns = listOf(
-            Regex("""VIDEO_MAP_JSON\s*=\s*\{"""),
-        )
-        for (pattern in patterns) {
-            val match = pattern.find(text) ?: continue
-            val startIndex = match.range.first
-            // Encontrar la posición de la primera '{' después del nombre
-            val braceStart = text.indexOf('{', startIndex)
-            if (braceStart < 0) continue
-
-            // Contar llaves para encontrar el cierre del objeto
-            var depth = 0
-            var inString = false
-            var escape = false
-            var end = -1
-
-            for (i in braceStart until text.length) {
-                val c = text[i]
-                if (escape) {
-                    escape = false
-                    continue
-                }
-                if (c == '\\' && inString) {
-                    escape = true
-                    continue
-                }
-                if (c == '"') {
-                    inString = !inString
-                    continue
-                }
-                if (inString) continue
-                if (c == '{') depth++
-                if (c == '}') {
-                    depth--
-                    if (depth == 0) {
-                        end = i
-                        break
-                    }
-                }
-            }
-
-            if (end > braceStart) {
-                return text.substring(braceStart, end + 1)
-            }
+    private fun decodeDoubleEncoded(value: String): String {
+        val trimmed = value.trim()
+        // Si el valor empieza con comilla, es un JSON string que necesita parseo adicional
+        if (trimmed.startsWith("\"")) {
+            try {
+                return parseJson<String>(trimmed)
+            } catch (_: Exception) {}
         }
-        return null
+        // Fallback: desescapado manual
+        var result = trimmed
+        if (result.startsWith("\"") && result.endsWith("\"")) {
+            result = result.substring(1, result.length - 1)
+        }
+        result = result.replace("\\/", "/").replace("\\\"", "\"").replace("\\\\", "\\")
+        if (result.startsWith("\"") && result.endsWith("\"")) {
+            result = result.substring(1, result.length - 1)
+        }
+        return result.trim()
     }
 
     // ========== loadLinks ==========
@@ -412,7 +456,6 @@ class SeriesDonghuaProvider : MainAPI() {
         return try {
             loadLinksInternal(data, isCasting, subtitleCallback, callback)
         } catch (_: Exception) {
-            // Evitar que cualquier excepción no capturada crashee el reproductor
             false
         }
     }
@@ -437,14 +480,13 @@ class SeriesDonghuaProvider : MainAPI() {
             for (script in doc.select("script")) {
                 val scriptData = script.data()
                 if (scriptData.contains("VIDEO_MAP_JSON")) {
-                    found = extractJsonObject(scriptData, "VIDEO_MAP_JSON")
+                    found = extractJsonObject(scriptData)
                         ?: try {
-                            val patterns = listOf(
+                            var result: String? = null
+                            for (pattern in listOf(
                                 Regex("""const\s+VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
                                 Regex("""VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
-                            )
-                            var result: String? = null
-                            for (pattern in patterns) {
+                            )) {
                                 val match = pattern.find(scriptData)
                                 if (match != null) { result = match.destructured.component1(); break }
                             }
@@ -470,7 +512,7 @@ class SeriesDonghuaProvider : MainAPI() {
                         decoded.contains("dailymotion.com") ->
                             Regex("dailymotion\\.com/(?:embed/)?video/([a-zA-Z0-9]+)")
                                 .find(decoded)?.destructured?.component1() ?: decoded
-                        else -> decoded  // Asumir que es un ID directo
+                        else -> decoded
                     }
                     if (videoId.isNotEmpty()) {
                         try {
@@ -559,21 +601,6 @@ class SeriesDonghuaProvider : MainAPI() {
         }
 
         return foundLinks
-    }
-
-    // ========== Decodificador de valores doble-encoded ==========
-    private fun decodeDoubleEncoded(value: String): String {
-        var result = value.trim()
-        // Quitar comillas dobles externas
-        if (result.startsWith("\"") && result.endsWith("\"")) result = result.substring(1, result.length - 1)
-        // Unescape JSON
-        result = result.replace("\\/", "/").replace("\\\"", "\"").replace("\\\\", "\\")
-        // Segunda capa de comillas (double-encoded)
-        if (result.startsWith("\"") && result.endsWith("\"")) result = result.substring(1, result.length - 1)
-        // Decodificar entidades HTML que pueden estar dentro de document.write
-        result = result.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-            .replace("&quot;", "\"").replace("&#39;", "'")
-        return result.trim()
     }
 
     // ========== Extractores ==========
