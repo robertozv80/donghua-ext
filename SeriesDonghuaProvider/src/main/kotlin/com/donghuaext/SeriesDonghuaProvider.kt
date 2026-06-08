@@ -25,7 +25,7 @@ class SeriesDonghuaProvider : MainAPI() {
 
     override val mainPage = mainPageOf(
         "$mainUrl/" to "Nuevos Episodios",
-        "$mainUrl/todos-los-donghuas" to "Todos los Donghuas",
+        "$mainUrl/##masvistos" to "Donghuas Más Vistos",
         "$mainUrl/donghuas-en-emision" to "En Emisión",
         "$mainUrl/donghuas-finalizados" to "Finalizados",
     )
@@ -43,48 +43,119 @@ class SeriesDonghuaProvider : MainAPI() {
     // ========== getMainPage ==========
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val isHomePage = request.data == "$mainUrl/"
-        val url = if (page > 1) {
-            if (isHomePage) request.data else "${request.data}?pag=$page"
+        val isMasVistos = request.data == "$mainUrl/##masvistos"
+        val url = if (isHomePage || isMasVistos) {
+            "$mainUrl/"
         } else {
-            request.data
+            if (page > 1) "${request.data}?pag=$page" else request.data
         }
         val doc = app.get(url, timeout = 120L).document
 
-        val home = if (isHomePage) {
-            doc.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").mapNotNull { link ->
-                val titleEl = link.selectFirst("h5") ?: return@mapNotNull null
-                val title = titleEl.text().trim()
-                val poster = link.selectFirst("div.img img")?.attr("src")
-                val href = link.attr("href") ?: return@mapNotNull null
-                if (!href.contains("episodio")) return@mapNotNull null
-                val seriesUrl = convertEpisodeToSeriesUrl(href)
-                val epNum = Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
-                val cleanTitle = title.replace(Regex("\\s*Episodio\\s*\\d+"), "").trim()
-                val dubstat = if (title.contains("Latino") || title.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
-                newAnimeSearchResponse(cleanTitle, seriesUrl) {
-                    this.posterUrl = resolveUrl(poster ?: "")
-                    addDubStatus(dubstat, epNum)
+        val home = when {
+            isHomePage -> {
+                // Página principal: sección "Nuevos Episodios"
+                doc.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").mapNotNull { link ->
+                    val titleEl = link.selectFirst("h5") ?: return@mapNotNull null
+                    val title = titleEl.text().trim()
+                    val poster = link.selectFirst("div.img img")?.attr("src")
+                    val href = link.attr("href") ?: return@mapNotNull null
+                    if (!href.contains("episodio")) return@mapNotNull null
+                    val seriesUrl = convertEpisodeToSeriesUrl(href)
+                    val epNum = Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
+                    val cleanTitle = title.replace(Regex("\\s*Episodio\\s*\\d+"), "").trim()
+                    val dubstat = if (title.contains("Latino") || title.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
+                    newAnimeSearchResponse(cleanTitle, seriesUrl) {
+                        this.posterUrl = resolveUrl(poster ?: "")
+                        addDubStatus(dubstat, epNum)
+                    }
                 }
             }
-        } else {
-            doc.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").mapNotNull { link ->
-                val title = link.selectFirst("h5")?.text() ?: return@mapNotNull null
-                val poster = link.selectFirst("div.img img")?.attr("src")
-                val href = link.attr("href") ?: return@mapNotNull null
-                if (href.contains("episodio")) return@mapNotNull null
-                val dubstat = if (title.contains("Latino") || title.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
-                newAnimeSearchResponse(title, resolveUrl(href)) {
-                    this.posterUrl = resolveUrl(poster ?: "")
-                    addDubStatus(dubstat)
+            isMasVistos -> {
+                // Sidebar widget "Donghuas Más Vistos" - solo en homepage, sin paginación
+                parseMasVistos(doc)
+            }
+            else -> {
+                doc.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").mapNotNull { link ->
+                    val title = link.selectFirst("h5")?.text() ?: return@mapNotNull null
+                    val poster = link.selectFirst("div.img img")?.attr("src")
+                    val href = link.attr("href") ?: return@mapNotNull null
+                    if (href.contains("episodio")) return@mapNotNull null
+                    val dubstat = if (title.contains("Latino") || title.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
+                    newAnimeSearchResponse(title, resolveUrl(href)) {
+                        this.posterUrl = resolveUrl(poster ?: "")
+                        addDubStatus(dubstat)
+                    }
                 }
             }
         }
 
-        val hasNext = doc.select("ul.pagination li a").any { it.attr("href").contains("pag=${page + 1}") }
+        val hasNext = if (isHomePage || isMasVistos) {
+            false
+        } else {
+            doc.select("ul.pagination li a").any { it.attr("href").contains("pag=${page + 1}") }
+        }
         return newHomePageResponse(
             list = HomePageList(request.name, home, isHorizontalImages = false),
             hasNext = hasNext
         )
+    }
+
+    /**
+     * Parse the "Donghuas Más Vistos" sidebar widget from the homepage.
+     * Structure: div.youplay-side-news rows with a.angled-img (image) and h4 > a (title+link)
+     */
+    private fun parseMasVistos(doc: org.jsoup.nodes.Document): List<SearchResponse> {
+        val items = mutableListOf<SearchResponse>()
+
+        // Method 1: Look for the sidebar widget by heading
+        val heading = doc.select("h4").firstOrNull { h ->
+            h.text().trim().contains("Donghuas Más Vistos", ignoreCase = true)
+        }
+
+        if (heading != null) {
+            // Navigate to the parent container and find all youplay-side-news rows
+            var container: org.jsoup.nodes.Element? = heading.parent()
+            while (container != null) {
+                val rows = container.select("div.youplay-side-news")
+                if (rows.isNotEmpty()) {
+                    for (row in rows) {
+                        val titleLink = row.selectFirst("h4 a") ?: row.selectFirst("a[title]")
+                        val title = titleLink?.attr("title")?.takeIf { it.isNotEmpty() }
+                            ?: titleLink?.text()?.trim()
+                            ?: continue
+                        val href = titleLink.attr("href") ?: continue
+                        val poster = row.selectFirst("a.angled-img img")?.attr("src")
+                            ?: row.selectFirst("img")?.attr("src")
+                        val dubstat = if (title.contains("Latino") || title.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
+                        items.add(newAnimeSearchResponse(title, resolveUrl(href)) {
+                            this.posterUrl = resolveUrl(poster ?: "")
+                            addDubStatus(dubstat)
+                        })
+                    }
+                    return items
+                }
+                container = container.parent()
+            }
+        }
+
+        // Method 2: Direct selector for youplay-side-news rows
+        doc.select("div.youplay-side-news").forEach { row ->
+            val titleLink = row.selectFirst("h4 a") ?: row.selectFirst("a[title]")
+            val title = titleLink?.attr("title")?.takeIf { it.isNotEmpty() }
+                ?: titleLink?.text()?.trim()
+                ?: return@forEach
+            val href = titleLink.attr("href") ?: return@forEach
+            if (href.contains("episodio")) return@forEach
+            val poster = row.selectFirst("a.angled-img img")?.attr("src")
+                ?: row.selectFirst("img")?.attr("src")
+            val dubstat = if (title.contains("Latino") || title.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
+            items.add(newAnimeSearchResponse(title, resolveUrl(href)) {
+                this.posterUrl = resolveUrl(poster ?: "")
+                addDubStatus(dubstat)
+            })
+        }
+
+        return items
     }
 
     private fun convertEpisodeToSeriesUrl(href: String): String {
@@ -182,34 +253,6 @@ class SeriesDonghuaProvider : MainAPI() {
         val amagi: String? = null,
     )
 
-    // ================================================================
-    //  SMART PACKER DECODER
-    // ================================================================
-    // El sitio usa eval(function(h,u,n,t,e,r){...}(args)) para
-    // ocultar VIDEO_MAP_JSON dentro de un document.write().
-    //
-    // Parámetros (en orden de aparición en la llamada):
-    //   h = string codificado (largo)
-    //   u = número (NO se usa dentro de la función)
-    //   n = charset (string corto, ej "uRfZNtQnw")
-    //   t = offset a restar del charCode
-    //   e = base para la conversión Y índice del delimitador n[e]
-    //   r = número (se sobreescribe con "", NO se usa)
-    //
-    // El resultado decodificado contiene:
-    //   if(timestamp < T){if(hostname === 'seriesdonghua.com'){
-    //     document.write('<script>const VIDEO_MAP_JSON={...};...</script>');
-    //   }}
-    //
-    // Los valores del VIDEO_MAP_JSON están doble-codificados:
-    //   "asura":"\"k7kfQJoj2LJJEqGt63g\""  → JSON.parse → "k7kfQJoj2LJJEqGt63g"
-    //   "skadi":"\"https:\/\/ok.ru\/...\""   → JSON.parse → "https://ok.ru/..."
-    //
-    // IMPORTANTE: El contenido de document.write('...') contiene comillas
-    // simples escapadas (\') que ROMPEN la extracción por regex simple.
-    // Se debe usar parsing carácter por carácter.
-    // ================================================================
-
     private fun decodeSmartPacker(
         encodedStr: String, eParam: Int, charset: String, offset: Int
     ): String? {
@@ -217,8 +260,8 @@ class SeriesDonghuaProvider : MainAPI() {
         if (eParam >= charset.length) return null
 
         val delimiter = charset[eParam]
-        val standardDigits = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"
-        val validDigits = standardDigits.substring(0, eParam)
+        val digits = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"
+        val hDigits = digits.substring(0, eParam)
 
         val tokens = encodedStr.split(delimiter)
         val bytes = ArrayList<Byte>()
@@ -226,23 +269,21 @@ class SeriesDonghuaProvider : MainAPI() {
         for (token in tokens) {
             if (token.isEmpty()) continue
 
-            // Reemplazar cada char por su índice en el charset
-            // (replica exactamente el JS: s=s.replace(new RegExp(n[j],"g"),j))
-            var replacedStr = token
-            for (j in charset.indices) {
-                replacedStr = replacedStr.replace(charset[j].toString(), j.toString())
+            var digitStr = ""
+            for (c in token) {
+                val idx = charset.indexOf(c)
+                if (idx < 0) return null
+                digitStr += idx.toString()
             }
 
-            // Convertir de base eParam a decimal (mismo método que JS _0xe56c)
-            // Solo los caracteres en validDigits contribuyen al valor
-            val reversed = replacedStr.reversed()
+            val reversed = digitStr.reversed()
             var num = 0L
             for ((pos, ch) in reversed.withIndex()) {
-                val digitValue = validDigits.indexOf(ch)
-                if (digitValue >= 0) {
+                val idx = hDigits.indexOf(ch)
+                if (idx >= 0) {
                     var power = 1L
                     repeat(pos) { power *= eParam }
-                    num += digitValue * power
+                    num += idx * power
                 }
             }
 
@@ -258,16 +299,6 @@ class SeriesDonghuaProvider : MainAPI() {
         }
     }
 
-    /**
-     * Busca y decodifica el eval() ofuscado en el HTML.
-     * Mapeo de parámetros del regex:
-     *   Grupo 1 = h (string codificado)
-     *   Grupo 2 = u (NO usado)
-     *   Grupo 3 = n (charset)
-     *   Grupo 4 = t (offset)
-     *   Grupo 5 = e (base Y delimiter index)
-     *   Grupo 6 = r (NO usado)
-     */
     private fun decodeObfuscatedScript(html: String): String? {
         val argPatterns = listOf(
             Regex("""\(\s*"([^"]{20,})"\s*,\s*(\d+)\s*,\s*"([^"]{2,20})"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)"""),
@@ -293,174 +324,21 @@ class SeriesDonghuaProvider : MainAPI() {
         return null
     }
 
-    /**
-     * Extrae y desescapa el contenido de document.write('...') del string
-     * decodificado del Smart Packer.
-     *
-     * CRÍTICO: Se usa parsing carácter por carácter porque el contenido
-     * contiene comillas simples escapadas (\' ) que ROMPEN la extracción
-     * por regex (el patrón [^']+ se detiene en la comilla del \').
-     *
-     * Secuencias de escape procesadas:
-     *   \' → '    \" → "    \\ → \    \/ → /    \n → salto de línea
-     */
-    private fun extractDocumentWriteContent(decodedScript: String): String? {
-        val startMarker = "document.write('"
-        val startIdx = decodedScript.indexOf(startMarker)
-        if (startIdx < 0) return null
-
-        var pos = startIdx + startMarker.length
-        val content = StringBuilder()
-
-        while (pos < decodedScript.length) {
-            val ch = decodedScript[pos]
-            if (ch == '\\' && pos + 1 < decodedScript.length) {
-                val nextCh = decodedScript[pos + 1]
-                when (nextCh) {
-                    '\'' -> content.append('\'')
-                    '"'  -> content.append('"')
-                    '\\' -> content.append('\\')
-                    '/'  -> content.append('/')
-                    'n'  -> content.append('\n')
-                    'r'  -> content.append('\r')
-                    't'  -> content.append('\t')
-                    else -> content.append(nextCh)
-                }
-                pos += 2
-            } else if (ch == '\'') {
-                // Fin del string de document.write
-                break
-            } else {
-                content.append(ch)
-                pos++
-            }
-        }
-
-        return content.toString()
-    }
-
-    /**
-     * Extrae un objeto JSON completo usando conteo de llaves.
-     * Más robusto que regex porque maneja llaves anidadas y caracteres
-     * especiales dentro de strings.
-     */
-    private fun extractJsonObject(text: String, varName: String = "VIDEO_MAP_JSON"): String? {
+    private fun extractVideoMapJson(decodedScript: String): String? {
         val patterns = listOf(
-            Regex("""VIDEO_MAP_JSON\s*=\s*\{"""),
+            Regex("""const\s+VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
+            Regex("""VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
+            Regex("""VIDEO_MAP_JSON\s*=\s*(\{.*?\})\s*;?"""),
         )
         for (pattern in patterns) {
-            val match = pattern.find(text) ?: continue
-            val braceStart = text.indexOf('{', match.range.first)
-            if (braceStart < 0) continue
-
-            var depth = 0
-            var inString = false
-            var escape = false
-
-            for (i in braceStart until text.length) {
-                val c = text[i]
-                if (escape) { escape = false; continue }
-                if (c == '\\' && inString) { escape = true; continue }
-                if (c == '"') { inString = !inString; continue }
-                if (inString) continue
-                if (c == '{') depth++
-                if (c == '}') {
-                    depth--
-                    if (depth == 0) return text.substring(braceStart, i + 1)
-                }
-            }
+            val match = pattern.find(decodedScript)
+            if (match != null) return match.destructured.component1()
         }
         return null
-    }
-
-    /**
-     * Extrae el JSON del VIDEO_MAP_JSON desde el script decodificado.
-     *
-     * Flujo:
-     * 1. Extraer contenido de document.write('...') con parsing carácter por
-     *    carácter (maneja secuencias de escape como \', \", \\, \/)
-     * 2. Extraer JSON con conteo de llaves desde el contenido desescapado
-     * 3. Fallback: buscar directamente en el texto decodificado crudo
-     */
-    private fun extractVideoMapJson(decodedScript: String): String? {
-        // PASO 1: Extraer y desescapar contenido de document.write
-        val dwContent = extractDocumentWriteContent(decodedScript)
-
-        // PASO 2: Intentar extraer JSON desde el contenido desescapado
-        if (dwContent != null) {
-            val jsonFromDw = extractJsonObject(dwContent)
-            if (jsonFromDw != null) return jsonFromDw
-        }
-
-        // PASO 3: Fallback - buscar directamente en el texto decodificado
-        // (menos confiable porque las secuencias de escape no están procesadas)
-        val jsonFromRaw = extractJsonObject(decodedScript)
-        if (jsonFromRaw != null) return jsonFromRaw
-
-        // PASO 4: Último fallback con regex simples
-        val searchTargets = mutableListOf<String>()
-        if (dwContent != null) searchTargets.add(dwContent)
-        searchTargets.add(decodedScript)
-
-        for (target in searchTargets) {
-            for (pattern in listOf(
-                Regex("""const\s+VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
-                Regex("""VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
-                Regex("""VIDEO_MAP_JSON\s*=\s*(\{.*?\})\s*;?"""),
-            )) {
-                val match = pattern.find(target)
-                if (match != null) return match.destructured.component1()
-            }
-        }
-
-        return null
-    }
-
-    /**
-     * Decodifica un valor doble-codificado del VIDEO_MAP_JSON.
-     *
-     * Los valores están envueltos en comillas extras (JSON string dentro
-     * de JSON string). El sitio usa JSON.parse(j) para obtener el valor real.
-     * Ejemplo:
-     *   "asura": "\"k7kfQJoj2LJJEqGt63g\"" → JSON.parse → k7kfQJoj2LJJEqGt63g
-     *   "skadi": "\"https:\/\/ok.ru\/...\""  → JSON.parse → https://ok.ru/...
-     *
-     * Se usa parseJson<String> como método principal (equivale a JSON.parse),
-     * con desescapado manual como fallback.
-     */
-    private fun decodeDoubleEncoded(value: String): String {
-        val trimmed = value.trim()
-        // Si el valor empieza con comilla, es un JSON string que necesita parseo adicional
-        if (trimmed.startsWith("\"")) {
-            try {
-                return parseJson<String>(trimmed)
-            } catch (_: Exception) {}
-        }
-        // Fallback: desescapado manual
-        var result = trimmed
-        if (result.startsWith("\"") && result.endsWith("\"")) {
-            result = result.substring(1, result.length - 1)
-        }
-        result = result.replace("\\/", "/").replace("\\\"", "\"").replace("\\\\", "\\")
-        if (result.startsWith("\"") && result.endsWith("\"")) {
-            result = result.substring(1, result.length - 1)
-        }
-        return result.trim()
     }
 
     // ========== loadLinks ==========
     override suspend fun loadLinks(
-        data: String, isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        return try {
-            loadLinksInternal(data, isCasting, subtitleCallback, callback)
-        } catch (_: Exception) {
-            false
-        }
-    }
-
-    private suspend fun loadLinksInternal(
         data: String, isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ): Boolean {
@@ -470,110 +348,81 @@ class SeriesDonghuaProvider : MainAPI() {
 
         var foundLinks = false
 
-        // ====== PASO 1: Decodificar JavaScript ofuscado ======
         val decodedScript = decodeObfuscatedScript(html)
         val videoMapJsonStr = if (decodedScript != null) {
             extractVideoMapJson(decodedScript)
         } else {
-            // Fallback: buscar VIDEO_MAP_JSON directamente (por si no está ofuscado)
             var found: String? = null
             for (script in doc.select("script")) {
                 val scriptData = script.data()
                 if (scriptData.contains("VIDEO_MAP_JSON")) {
-                    found = extractJsonObject(scriptData)
-                        ?: try {
-                            var result: String? = null
-                            for (pattern in listOf(
-                                Regex("""const\s+VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
-                                Regex("""VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
-                            )) {
-                                val match = pattern.find(scriptData)
-                                if (match != null) { result = match.destructured.component1(); break }
-                            }
-                            result
-                        } catch (_: Exception) { null }
+                    for (pattern in listOf(
+                        Regex("""const\s+VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
+                        Regex("""VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
+                    )) {
+                        val match = pattern.find(scriptData)
+                        if (match != null) { found = match.destructured.component1(); break }
+                    }
                     if (found != null) break
                 }
             }
             found
         }
 
-        // ====== PASO 2: Parsear y extraer enlaces ======
         if (videoMapJsonStr != null) {
             val videoMap: VideoMapJson? = try {
                 parseJson<VideoMapJson>(videoMapJsonStr)
             } catch (_: Exception) { null }
 
             if (videoMap != null) {
-                // Asura → Dailymotion (puede ser ID de video o URL completa)
                 videoMap.asura?.let { rawValue ->
-                    val decoded = decodeDoubleEncoded(rawValue)
-                    val videoId = when {
-                        decoded.contains("dailymotion.com") ->
-                            Regex("dailymotion\\.com/(?:embed/)?video/([a-zA-Z0-9]+)")
-                                .find(decoded)?.destructured?.component1() ?: decoded
-                        else -> decoded
-                    }
+                    val videoId = decodeDoubleEncoded(rawValue)
                     if (videoId.isNotEmpty()) {
-                        try {
-                            foundLinks = extractDailymotion(videoId, data, "Dailymotion", subtitleCallback, callback) || foundLinks
-                        } catch (_: Exception) {}
+                        foundLinks = extractDailymotion(videoId, data, "Dailymotion", subtitleCallback, callback) || foundLinks
                     }
                 }
 
-                // Skadi → ok.ru
                 videoMap.skadi?.let { rawValue ->
                     val url = decodeDoubleEncoded(rawValue)
                     if (url.startsWith("http")) {
                         try { loadExtractor(url, data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {
-                            try { foundLinks = extractOkRu(url, data, "ok.ru", callback) || foundLinks } catch (_: Exception) {}
+                            foundLinks = extractOkRu(url, data, "ok.ru", callback) || foundLinks
                         }
                     }
                 }
 
-                // Fembed → Rumble / vid-guard / genérico
                 videoMap.fembed?.let { rawValue ->
                     val url = decodeDoubleEncoded(rawValue)
                     if (url.startsWith("http")) {
                         try { loadExtractor(url, data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {
-                            try {
-                                when {
-                                    url.contains("rumble.com") -> foundLinks = extractRumble(url, data, "Rumble", callback) || foundLinks
-                                    else -> foundLinks = extractGenericVideo(url, data, "Server", callback) || foundLinks
-                                }
-                            } catch (_: Exception) {}
+                            when {
+                                url.contains("rumble.com") -> foundLinks = extractRumble(url, data, "Rumble", callback) || foundLinks
+                                else -> foundLinks = extractGenericVideo(url, data, "Server", callback) || foundLinks
+                            }
                         }
                     }
                 }
 
-                // Tape → Odysee / FileMoon
                 videoMap.tape?.let { rawValue ->
                     val url = decodeDoubleEncoded(rawValue)
                     if (url.startsWith("http")) {
                         try { loadExtractor(url, data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {
-                            try {
-                                when {
-                                    url.contains("odysee.com") -> foundLinks = extractOdysee(url, data, "Odysee", callback) || foundLinks
-                                    else -> foundLinks = extractGenericVideo(url, data, "Server", callback) || foundLinks
-                                }
-                            } catch (_: Exception) {}
+                            foundLinks = extractOdysee(url, data, "Odysee", callback) || foundLinks
                         }
                     }
                 }
 
-                // Amagi → Voe.sx
                 videoMap.amagi?.let { rawValue ->
                     val url = decodeDoubleEncoded(rawValue)
                     if (url.startsWith("http")) {
                         try { loadExtractor(url, data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {
-                            try { foundLinks = extractVoe(url, data, "Voe", callback) || foundLinks } catch (_: Exception) {}
+                            foundLinks = extractVoe(url, data, "Voe", callback) || foundLinks
                         }
                     }
                 }
             }
         }
 
-        // Fallback 1: iframes
         if (!foundLinks) {
             doc.select("iframe").amap { iframe ->
                 val src = listOf("src", "data-src").map { iframe.attr(it).trim() }.firstOrNull { it.isNotBlank() }
@@ -586,7 +435,6 @@ class SeriesDonghuaProvider : MainAPI() {
             }
         }
 
-        // Fallback 2: URLs de video en el HTML
         if (!foundLinks) {
             for (pattern in listOf(
                 Regex("""(https?://[^"'\s<>]*dailymotion\.com/[^"'\s<>]+)"""),
@@ -603,15 +451,19 @@ class SeriesDonghuaProvider : MainAPI() {
         return foundLinks
     }
 
-    // ========== Extractores ==========
+    private fun decodeDoubleEncoded(value: String): String {
+        var result = value.trim()
+        if (result.startsWith("\"") && result.endsWith("\"")) result = result.substring(1, result.length - 1)
+        result = result.replace("\\/", "/").replace("\\\"", "\"").replace("\\\\", "\\")
+        if (result.startsWith("\"") && result.endsWith("\"")) result = result.substring(1, result.length - 1)
+        return result.trim()
+    }
 
     private suspend fun extractDailymotion(
         videoId: String, referer: String, serverName: String,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // 1) loadExtractor con URL completa
         try { loadExtractor("https://www.dailymotion.com/embed/video/$videoId", referer, subtitleCallback, callback); return true } catch (_: Exception) {}
-        // 2) API metadata
         try {
             val jsonText = app.get("https://www.dailymotion.com/player/metadata/video/$videoId",
                 referer = "https://www.dailymotion.com/embed/video/$videoId",
@@ -628,7 +480,6 @@ class SeriesDonghuaProvider : MainAPI() {
                 return true
             }
         } catch (_: Exception) {}
-        // 3) Scrape embed page
         try {
             val embedUrl = "https://www.dailymotion.com/embed/video/$videoId"
             val embedHtml = app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text

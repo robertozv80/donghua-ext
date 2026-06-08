@@ -21,91 +21,60 @@ class DonghuaWorldProvider : MainAPI() {
         /** Regex to match episode numbers or ranges like "Episode 263" or "Episode 254-255" */
         private val EPISODE_NUM_REGEX = Regex("""Episode\s+(\d+(?:-\d+)?)""", RegexOption.IGNORE_CASE)
 
-        /** Languages to include as subtitles (Spanish primary, English fallback) */
-        private val SUBTITLE_LANGUAGES = setOf("Spanish", "English")
+        /** Subtitle label keywords to match (case-insensitive check) */
+        private val SPANISH_KEYWORDS = listOf("spanish", "español", "espanol", "castilian", "castellano")
+        private val ENGLISH_KEYWORDS = listOf("english", "inglés", "ingles")
     }
 
     // ==================== MAIN PAGE ====================
+    // Using /anime/?order=... pages because homepage cards link to
+    // episode URLs (not /anime/ URLs), which causes the detail page to fail.
+    // The /anime/ listing pages have proper /anime/ URLs.
 
     override val mainPage = mainPageOf(
-        "$mainUrl/" to "Hot Series Update",
-        "$mainUrl/##latest" to "Latest Release",
-        "$mainUrl/##recommendation" to "Recommendation"
+        "$mainUrl/anime/?order=update" to "Hot Series Update",
+        "$mainUrl/anime/?order=latest" to "Latest Release",
+        "$mainUrl/anime/?order=popular" to "Popular Series"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val sectionName = request.name
-        val sectionUrl = request.data
-
-        val document = if (page == 1) {
-            app.get(sectionUrl.substringBefore("##")).document
+        val url = if (page > 1) {
+            "$mainUrl/anime/page/$page/?order=${request.data.substringAfter("order=")}"
         } else {
-            if (sectionUrl.contains("latest")) {
-                app.get("$mainUrl/page/$page/").document
-            } else {
-                return newHomePageResponse(emptyList(), hasNext = false)
-            }
+            request.data
         }
 
-        val items = when {
-            sectionName == "Hot Series Update" -> parseSectionByHeading(document, "Series Update")
-            sectionName == "Latest Release" -> parseSectionByHeading(document, "Latest Release")
-            sectionName == "Recommendation" -> parseSectionByHeading(document, "Recommendation")
-            else -> emptyList()
+        val document = app.get(url).document
+        val items = document.select("article.bs").mapNotNull { article ->
+            parseAnimeCard(article)
         }
+
+        val hasNext = document.select("a.next.page-numbers, .pagination a.next").isNotEmpty()
+                || document.select("a.page-numbers").any { it.attr("href").contains("page/${page + 1}") }
 
         return newHomePageResponse(
-            listOf(HomePageList(sectionName, items)),
-            hasNext = sectionName == "Latest Release" && items.isNotEmpty()
+            listOf(HomePageList(request.name, items)),
+            hasNext = hasNext
         )
     }
 
     /**
-     * Generic section parser: finds the heading matching [headingText],
-     * then scans sibling elements for article cards.
+     * Parse an anime card from the /anime/ listing page.
+     * These cards link to /anime/ URLs (not episode URLs).
      */
-    private fun parseSectionByHeading(
-        document: org.jsoup.nodes.Document,
-        headingText: String
-    ): List<SearchResponse> {
-        val items = mutableListOf<SearchResponse>()
-
-        val heading = document.select("h3, h2").firstOrNull { h ->
-            h.text().trim().equals(headingText, ignoreCase = true)
-        } ?: return emptyList()
-
-        var sibling: org.jsoup.nodes.Element? = heading.parent()
-        var attempts = 0
-
-        while (sibling != null && attempts < 10) {
-            val articles = sibling.select("article")
-            if (articles.isNotEmpty()) {
-                articles.forEach { article ->
-                    parseArticleCard(article)?.let { items.add(it) }
-                }
-                return items
-            }
-            sibling = sibling.nextElementSibling()
-            attempts++
-        }
-
-        return items
-    }
-
-    /**
-     * Parse a single article card into a SearchResponse.
-     */
-    private fun parseArticleCard(article: org.jsoup.nodes.Element): SearchResponse? {
-        val linkEl = article.selectFirst("a[href]") ?: return null
+    private fun parseAnimeCard(article: org.jsoup.nodes.Element): SearchResponse? {
+        val linkEl = article.selectFirst(".bsx a[itemprop=url]") ?: article.selectFirst("a[href]") ?: return null
         val url = linkEl.attr("abs:href")
-        if (url.isEmpty()) return null
+        if (url.isEmpty() || !url.contains("/anime/")) return null
 
-        val title = linkEl.attr("title").takeIf { it.isNotEmpty() }
-            ?: linkEl.selectFirst(".eggtitle")?.text()?.trim()
-            ?: linkEl.selectFirst("h2")?.text()?.trim()
+        val title = linkEl.selectFirst("h2[itemprop=headline]")?.text()?.trim()
+            ?: article.selectFirst(".tt")?.text()?.trim()
+            ?: linkEl.attr("title").takeIf { it.isNotEmpty() }
             ?: return null
 
-        val img = linkEl.selectFirst("img")?.let { imgEl ->
+        val img = linkEl.selectFirst("img.ts-post-image")?.let { imgEl ->
+            imgEl.attr("data-src").takeIf { it.isNotEmpty() } ?: imgEl.attr("src")
+        } ?: article.selectFirst("img")?.let { imgEl ->
             imgEl.attr("data-src").takeIf { it.isNotEmpty() } ?: imgEl.attr("src")
         } ?: ""
 
@@ -121,18 +90,21 @@ class DonghuaWorldProvider : MainAPI() {
         val items = mutableListOf<SearchResponse>()
         val seenUrls = mutableSetOf<String>()
 
-        document.select("article").forEach { article ->
-            val linkEl = article.selectFirst("a[href]") ?: return@forEach
+        document.select("article.bs").forEach { article ->
+            val linkEl = article.selectFirst(".bsx a[itemprop=url]") ?: article.selectFirst("a[href]") ?: return@forEach
             val url = linkEl.attr("abs:href")
 
             if (!url.contains("/anime/")) return@forEach
             if (!seenUrls.add(url)) return@forEach
 
-            val title = linkEl.attr("title").takeIf { it.isNotEmpty() }
-                ?: article.selectFirst("h2")?.text()?.trim()
+            val title = linkEl.selectFirst("h2[itemprop=headline]")?.text()?.trim()
+                ?: article.selectFirst(".tt")?.text()?.trim()
+                ?: linkEl.attr("title").takeIf { it.isNotEmpty() }
                 ?: return@forEach
 
-            val img = article.selectFirst("img")?.let { imgEl ->
+            val img = linkEl.selectFirst("img.ts-post-image")?.let { imgEl ->
+                imgEl.attr("data-src").takeIf { it.isNotEmpty() } ?: imgEl.attr("src")
+            } ?: article.selectFirst("img")?.let { imgEl ->
                 imgEl.attr("data-src").takeIf { it.isNotEmpty() } ?: imgEl.attr("src")
             } ?: ""
 
@@ -146,29 +118,24 @@ class DonghuaWorldProvider : MainAPI() {
     // ==================== DETAIL ====================
 
     override suspend fun load(url: String): LoadResponse {
-        // If URL is an episode page (not /anime/), extract the series URL from breadcrumb
-        val seriesUrl = if (url.contains("/anime/")) {
-            url
-        } else {
-            resolveSeriesUrlFromEpisode(url)
-        }
-
-        val document = app.get(seriesUrl).document
+        val document = app.get(url).document
 
         // Extract title
-        val title = document.selectFirst("h1")?.text()?.trim() ?: "Unknown"
+        val title = document.selectFirst("h1.entry-title")?.text()?.trim()
+            ?: document.selectFirst("h1")?.text()?.trim()
+            ?: "Unknown"
 
         // Extract poster image
-        val poster = document.selectFirst(".thumb img")?.let { getImgSrc(it) }
-            ?: document.selectFirst(".bigcontent .ts-post-image")?.let { getImgSrc(it) }
-            ?: document.selectFirst(".ts-post-image")?.let { getImgSrc(it) }
+        val poster = document.selectFirst(".bigcontent .thumbook .thumb img.ts-post-image")?.let { getImgSrc(it) }
+            ?: document.selectFirst(".thumb img")?.let { getImgSrc(it) }
+            ?: document.selectFirst("img.ts-post-image")?.let { getImgSrc(it) }
             ?: ""
 
         // Extract description
-        val description = document.selectFirst(".mindes, .alldes, .entry-content, .desc")?.text()?.trim() ?: ""
+        val description = document.selectFirst(".synp .entry-content, .entry-content, .mindes, .alldes, .desc")?.text()?.trim() ?: ""
 
         // Extract genres
-        val genres = document.select(".genxed a, .series-gen a").mapNotNull { it.text().trim() }
+        val genres = document.select(".genxed a, .infox .genxed a").mapNotNull { it.text().trim() }
 
         // Extract status
         val showStatus = document.selectFirst(".spe span:contains(Status)")?.nextElementSibling()?.text()?.trim()
@@ -188,22 +155,40 @@ class DonghuaWorldProvider : MainAPI() {
         val episodes = mutableListOf<Episode>()
         val seenUrls = mutableSetOf<String>()
 
-        // Method 1: Look for episode links in the bxcl/episode list container
-        document.select(".bxcl a[href*=episode], .epl a[href*=episode], .episodelist a[href*=episode]").forEach { linkEl ->
+        // Primary: .eplister episode list (standard on /anime/ pages)
+        document.select(".eplister ul li a[href]").forEach { linkEl ->
             val epUrl = linkEl.attr("abs:href")
-            if (epUrl.isEmpty() || !epUrl.contains("episode", ignoreCase = true)) return@forEach
+            if (epUrl.isEmpty()) return@forEach
             if (!seenUrls.add(epUrl)) return@forEach
 
-            val epText = linkEl.text().trim()
-            val epNum = extractEpisodeNumber(epText)
+            val epNum = linkEl.selectFirst(".epl-num")?.text()?.trim()?.toIntOrNull()
+                ?: extractEpisodeNumber(linkEl.text())
+            val epTitle = linkEl.selectFirst(".epl-title")?.text()?.trim()
 
             episodes.add(newEpisode(epUrl) {
-                this.name = epText.takeIf { it.isNotEmpty() }
+                this.name = epTitle?.takeIf { it.isNotEmpty() }
                 this.episode = epNum
             })
         }
 
-        // Method 2: Fallback - search for all episode links
+        // Fallback: .bxcl episode links
+        if (episodes.isEmpty()) {
+            document.select(".bxcl a[href*=episode], .epl a[href*=episode], .episodelist a[href*=episode]").forEach { linkEl ->
+                val epUrl = linkEl.attr("abs:href")
+                if (epUrl.isEmpty() || !epUrl.contains("episode", ignoreCase = true)) return@forEach
+                if (!seenUrls.add(epUrl)) return@forEach
+
+                val epText = linkEl.text().trim()
+                val epNum = extractEpisodeNumber(epText)
+
+                episodes.add(newEpisode(epUrl) {
+                    this.name = epText.takeIf { it.isNotEmpty() }
+                    this.episode = epNum
+                })
+            }
+        }
+
+        // Fallback 2: any episode links
         if (episodes.isEmpty()) {
             document.select("a[href*=episode]").forEach { linkEl ->
                 val epUrl = linkEl.attr("abs:href")
@@ -220,32 +205,13 @@ class DonghuaWorldProvider : MainAPI() {
             }
         }
 
-        // Reverse so episode 1 is first
-        episodes.reverse()
-
-        return newAnimeLoadResponse(title, seriesUrl, TvType.Anime) {
+        return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster
             this.plot = description
             this.tags = genres
             this.showStatus = showStatus
             this.year = year
             addEpisodes(DubStatus.Subbed, episodes)
-        }
-    }
-
-    /**
-     * Given an episode page URL, load it and extract the series URL from the breadcrumb.
-     */
-    private suspend fun resolveSeriesUrlFromEpisode(episodeUrl: String): String {
-        return try {
-            val epDoc = app.get(episodeUrl).document
-            epDoc.select("a[href*=/anime/]").firstOrNull()?.attr("abs:href")?.takeIf { it.isNotEmpty() }
-                ?: epDoc.select(".breadcrumb a, .breadcrumbs a").firstOrNull {
-                    it.attr("abs:href").contains("/anime/")
-                }?.attr("abs:href")
-                ?: episodeUrl
-        } catch (_: Exception) {
-            episodeUrl
         }
     }
 
@@ -339,6 +305,7 @@ class DonghuaWorldProvider : MainAPI() {
 
     /**
      * Extract and parse subtitle tracks from the player HTML.
+     * Broadened matching: checks for Spanish/English keywords in label (case-insensitive).
      */
     private fun extractAndParseTracks(html: String, subtitleCallback: (SubtitleFile) -> Unit) {
         val tracksMatch = Regex("""(?:const|var|let)\s+tracks\s*=\s*(\[[\s\S]*?\])\s*;""").find(html)
@@ -346,6 +313,7 @@ class DonghuaWorldProvider : MainAPI() {
 
         val tracksStr = tracksMatch.groupValues[1]
 
+        // Match track objects with "file" and "label" properties
         val trackPattern = Regex("""\{\s*"file"\s*:\s*"([^"]+)"\s*,\s*"label"\s*:\s*"([^"]+)"\s*\}""")
         val tracks = trackPattern.findAll(tracksStr).mapNotNull { match ->
             val file = match.groupValues[1]
@@ -356,7 +324,11 @@ class DonghuaWorldProvider : MainAPI() {
         }.toList()
 
         for ((file, label) in tracks) {
-            if (label in SUBTITLE_LANGUAGES) {
+            val labelLower = label.lowercase()
+            val isSpanish = SPANISH_KEYWORDS.any { labelLower.contains(it) }
+            val isEnglish = ENGLISH_KEYWORDS.any { labelLower.contains(it) }
+
+            if (isSpanish || isEnglish) {
                 subtitleCallback.invoke(
                     SubtitleFile(
                         lang = label,
