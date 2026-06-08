@@ -1,4 +1,3 @@
-cat > settings.gradle.kts << 'EOF'
 pluginManagement {
     repositories {
         google()
@@ -21,4 +20,3 @@ include(":SeriesDonghuaProvider")
 include(":DonghuaLifeProvider")
 include(":AnimeGratisProvider")
 include(":DonghuaWorldProvider")
-EOF
