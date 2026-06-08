@@ -1,9 +1,11 @@
 package com.donghuaworld
 
-import android.content.Context
+import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
+import android.content.Context
 
-class DonghuaWorldPlugin : Plugin() {
+@CloudstreamPlugin
+class DonghuaWorldProviderPlugin : Plugin() {
     override fun load(context: Context) {
         registerMainAPI(DonghuaWorldProvider())
     }
