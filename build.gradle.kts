@@ -1,21 +1,14 @@
+cat > build.gradle.kts << 'EOF'
 import com.android.build.api.dsl.LibraryExtension
 import com.lagradost.cloudstream3.gradle.CloudstreamExtension
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
-buildscript {
-    repositories {
-        google()
-        mavenCentral()
-        maven("https://jitpack.io")
-    }
-
-    dependencies {
-        classpath("com.android.tools.build:gradle:9.1.1")
-        classpath("com.github.recloudstream:gradle:81b1d424d2")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.21")
-    }
+plugins {
+    id("com.android.library") version "9.1.1" apply false
+    id("com.lagradost.cloudstream3.gradle") version "81b1d424d2" apply false
+    id("org.jetbrains.kotlin.android") version "2.3.21" apply false
 }
 
 subprojects {
@@ -97,3 +90,4 @@ subprojects {
 tasks.register<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
 }
+EOF

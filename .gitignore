@@ -10,4 +10,4 @@
 local.properties
 *.apk
 *.cs3
-/builds/
+/builds/local.properties

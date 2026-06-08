@@ -1,0 +1,8 @@
+com.donghuaext.DonghuaWorldProvider-pngs-0 D:\GitHub\donghua-ext\DonghuaWorldProvider\build\generated\res\pngs\release
+com.donghuaext.DonghuaWorldProvider-updated_navigation_xml-1 D:\GitHub\donghua-ext\DonghuaWorldProvider\build\generated\updated_navigation_xml\release
+com.donghuaext.DonghuaWorldProvider-mergeReleaseResources-2 D:\GitHub\donghua-ext\DonghuaWorldProvider\build\intermediates\incremental\release\mergeReleaseResources\merged.dir
+com.donghuaext.DonghuaWorldProvider-mergeReleaseResources-3 D:\GitHub\donghua-ext\DonghuaWorldProvider\build\intermediates\incremental\release\mergeReleaseResources\stripped.dir
+com.donghuaext.DonghuaWorldProvider-release-4 D:\GitHub\donghua-ext\DonghuaWorldProvider\build\intermediates\merged_res\release\mergeReleaseResources
+com.donghuaext.DonghuaWorldProvider-release-5 D:\GitHub\donghua-ext\DonghuaWorldProvider\build\intermediates\packaged_res\release\packageReleaseResources
+com.donghuaext.DonghuaWorldProvider-main-6 D:\GitHub\donghua-ext\DonghuaWorldProvider\src\main\res
+com.donghuaext.DonghuaWorldProvider-release-7 D:\GitHub\donghua-ext\DonghuaWorldProvider\src\release\res
