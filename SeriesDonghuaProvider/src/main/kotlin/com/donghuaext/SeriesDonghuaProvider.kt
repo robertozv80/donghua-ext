@@ -123,7 +123,7 @@ class SeriesDonghuaProvider : MainAPI() {
                         val title = titleLink?.attr("title")?.takeIf { it.isNotEmpty() }
                             ?: titleLink?.text()?.trim()
                             ?: continue
-                        val href = titleLink.attr("href") ?: continue
+                        val href = titleLink?.attr("href") ?: continue
                         val poster = row.selectFirst("a.angled-img img")?.attr("src")
                             ?: row.selectFirst("img")?.attr("src")
                         val dubstat = if (title.contains("Latino") || title.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
@@ -144,7 +144,7 @@ class SeriesDonghuaProvider : MainAPI() {
             val title = titleLink?.attr("title")?.takeIf { it.isNotEmpty() }
                 ?: titleLink?.text()?.trim()
                 ?: return@forEach
-            val href = titleLink.attr("href") ?: return@forEach
+            val href = titleLink?.attr("href") ?: return@forEach
             if (href.contains("episodio")) return@forEach
             val poster = row.selectFirst("a.angled-img img")?.attr("src")
                 ?: row.selectFirst("img")?.attr("src")
