@@ -40,6 +40,20 @@
     "fileHash": "sha256-fffdecf95c5119135675b6e5ef0466b4f00f8638aa85322952ed998e402fe7b6"
   },
   {
+    "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/DonghuaWorldProvider.cs3",
+    "status": 3,
+    "version": -1,
+    "name": "DonghuaWorldProvider",
+    "internalName": "DonghuaWorldProvider",
+    "authors": [
+      "robertozv80"
+    ],
+    "fileSize": 23377,
+    "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
+    "apiVersion": 1,
+    "fileHash": "sha256-473ab7085f7a73f364c02f2130f762b5d47098a49c3279c57998d14fe0bd5e03"
+  },
+  {
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/MundoDonghuaProvider.cs3",
     "status": 1,
     "version": 1,
