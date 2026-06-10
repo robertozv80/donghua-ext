@@ -27,9 +27,6 @@ class DonghuaWorldProvider : MainAPI() {
     }
 
     // ==================== MAIN PAGE ====================
-    // Using /anime/?order=... pages because homepage cards link to
-    // episode URLs (not /anime/ URLs), which causes the detail page to fail.
-    // The /anime/ listing pages have proper /anime/ URLs.
 
     override val mainPage = mainPageOf(
         "$mainUrl/anime/?order=update" to "Hot Series Update",
@@ -60,7 +57,6 @@ class DonghuaWorldProvider : MainAPI() {
 
     /**
      * Parse an anime card from the /anime/ listing page.
-     * These cards link to /anime/ URLs (not episode URLs).
      */
     private fun parseAnimeCard(article: org.jsoup.nodes.Element): SearchResponse? {
         val linkEl = article.selectFirst(".bsx a[itemprop=url]") ?: article.selectFirst("a[href]") ?: return null
@@ -211,7 +207,7 @@ class DonghuaWorldProvider : MainAPI() {
             this.tags = genres
             this.showStatus = showStatus
             this.year = year
-            addEpisodes(DubStatus.Subbed, episodes)
+            addEpisodes(DubStatus.Subbed, episodes.sortedBy { it.episode ?: 0 })
         }
     }
 
@@ -305,7 +301,6 @@ class DonghuaWorldProvider : MainAPI() {
 
     /**
      * Extract and parse subtitle tracks from the player HTML.
-     * Broadened matching: checks for Spanish/English keywords in label (case-insensitive).
      */
     private fun extractAndParseTracks(html: String, subtitleCallback: (SubtitleFile) -> Unit) {
         val tracksMatch = Regex("""(?:const|var|let)\s+tracks\s*=\s*(\[[\s\S]*?\])\s*;""").find(html)
@@ -313,7 +308,6 @@ class DonghuaWorldProvider : MainAPI() {
 
         val tracksStr = tracksMatch.groupValues[1]
 
-        // Match track objects with "file" and "label" properties
         val trackPattern = Regex("""\{\s*"file"\s*:\s*"([^"]+)"\s*,\s*"label"\s*:\s*"([^"]+)"\s*\}""")
         val tracks = trackPattern.findAll(tracksStr).mapNotNull { match ->
             val file = match.groupValues[1]
