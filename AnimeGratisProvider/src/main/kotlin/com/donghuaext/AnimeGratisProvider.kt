@@ -101,6 +101,7 @@ class AnimeGratisProvider : MainAPI() {
         val image: Any? = null,
         val genre: Any? = null,
         val numberOfEpisodes: Int? = null,
+        val url: String? = null,
     )
 
     // ========== getMainPage ==========
@@ -188,7 +189,13 @@ class AnimeGratisProvider : MainAPI() {
                     val title = anime.t ?: return@mapNotNull null
                     val slug = anime.sl ?: return@mapNotNull null
                     val poster = extractBestImageUrl(anime.im, anime.fb, anime.fb2)
-                    val href = "$mainUrl/anime/$slug"
+                    // FIX: Construir URL correcta según tipo (anime vs donghua)
+                    val contentType = anime.ty?.lowercase() ?: ""
+                    val href = if (contentType.contains("donghua")) {
+                        "$mainUrl/donghua/$slug"
+                    } else {
+                        "$mainUrl/anime/$slug"
+                    }
                     val dubstat = if (title.contains("Latino") || title.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
                     newAnimeSearchResponse(title, href) {
                         this.posterUrl = poster
@@ -288,13 +295,15 @@ class AnimeGratisProvider : MainAPI() {
 
     private fun episodeUrlToSeriesUrl(epHref: String): String {
         val fullUrl = resolveUrl(epHref)
-        val animeMatch = Regex("/anime/([^/]+)/episodio-\\d+").find(fullUrl)
-        if (animeMatch != null) {
-            return "$mainUrl/anime/${animeMatch.destructured.component1()}"
-        }
+        // /donghua/{slug}/episodio-{n} → /donghua/{slug}
         val donghuaMatch = Regex("/donghua/([^/]+)/episodio-\\d+").find(fullUrl)
         if (donghuaMatch != null) {
             return "$mainUrl/donghua/${donghuaMatch.destructured.component1()}"
+        }
+        // /anime/{slug}/episodio-{n} → /anime/{slug}
+        val animeMatch = Regex("/anime/([^/]+)/episodio-\\d+").find(fullUrl)
+        if (animeMatch != null) {
+            return "$mainUrl/anime/${animeMatch.destructured.component1()}"
         }
         return fullUrl
     }
@@ -316,7 +325,13 @@ class AnimeGratisProvider : MainAPI() {
                     val title = anime.t ?: return@mapNotNull null
                     val slug = anime.sl ?: return@mapNotNull null
                     val poster = extractBestImageUrl(anime.im, anime.fb, anime.fb2)
-                    val href = "$mainUrl/anime/$slug"
+                    // FIX: Construir URL correcta según tipo
+                    val contentType = anime.ty?.lowercase() ?: ""
+                    val href = if (contentType.contains("donghua")) {
+                        "$mainUrl/donghua/$slug"
+                    } else {
+                        "$mainUrl/anime/$slug"
+                    }
                     results.add(newAnimeSearchResponse(title, href, TvType.Anime) {
                         this.posterUrl = poster
                         addDubStatus(if (title.contains("Latino") || title.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed)
@@ -363,6 +378,7 @@ class AnimeGratisProvider : MainAPI() {
 
     // ========== load ==========
     override suspend fun load(url: String): LoadResponse {
+        // FIX: Determinar tipo de contenido por la URL
         val isDonghua = url.contains("/donghua/")
         val doc = app.get(url, headers = headers, timeout = 30L).document
 
@@ -371,8 +387,10 @@ class AnimeGratisProvider : MainAPI() {
         var jsonLdImage: String? = null
         var jsonLdGenres: List<String> = emptyList()
         var jsonLdEpCount: Int? = null
+        var jsonLdType: String? = null  // "TVSeries" or "Movie"
+        var jsonLdUrl: String? = null
 
-        doc.select("script[type=application/ld+json]").amap { script ->
+        doc.select("script[type=application/ld+json]").forEach { script ->
             try {
                 val jsonStr = script.data()
                 if (jsonStr.contains("TVSeries") || jsonStr.contains("Movie")) {
@@ -385,10 +403,17 @@ class AnimeGratisProvider : MainAPI() {
                         jsonLdImage = imgVal
                     }
                     jsonLdEpCount = jsonLd.numberOfEpisodes
+                    jsonLdUrl = jsonLd.url
                     jsonLdGenres = when (jsonLd.genre) {
                         is String -> listOf(jsonLd.genre as String)
                         is List<*> -> (jsonLd.genre as List<*>).filterIsInstance<String>()
                         else -> emptyList()
+                    }
+                    // Detectar tipo desde JSON-LD
+                    jsonLdType = when {
+                        jsonStr.contains("\"@type\":\"Movie\"") || jsonStr.contains("\"@type\": \"Movie\"") -> "Movie"
+                        jsonStr.contains("\"@type\":\"TVSeries\"") || jsonStr.contains("\"@type\": \"TVSeries\"") -> "TVSeries"
+                        else -> null
                     }
                 }
             } catch (_: Exception) {}
@@ -396,7 +421,7 @@ class AnimeGratisProvider : MainAPI() {
 
         val title = jsonLdTitle ?: doc.selectFirst("h1")?.text() ?: ""
         val description = jsonLdDescription
-            ?: doc.select("h2").amap { if (it.text().contains("Sinopsis", true)) it.nextElementSibling()?.text() else null }.firstOrNull()
+            ?: doc.select("h2").mapNotNull { if (it.text().contains("Sinopsis", true)) it.nextElementSibling()?.text() else null }.firstOrNull()
             ?: ""
 
         // Poster: Priorizar imágenes CDN reales sobre JSON-LD /api/og/ y og:image
@@ -414,10 +439,14 @@ class AnimeGratisProvider : MainAPI() {
             else -> null
         }
 
+        // FIX: Determinar tipo usando JSON-LD type Y contenido de la página
+        // Verificar si hay sección de película (#ver-pelicula)
+        val hasMovieSection = doc.selectFirst("#ver-pelicula") != null
         val typeText = doc.select("span").map { it.text() }.find {
-            it.contains("Serie") || it.contains("OVA") || it.contains("ONA") || it.contains("Película") || it.contains("Especial")
+            it.contains("Serie") || it.contains("OVA") || it.contains("ONA") || it.contains("Película") || it.contains("Especial") || it.contains("Movie")
         }
         val tvType = when {
+            hasMovieSection || jsonLdType == "Movie" -> TvType.AnimeMovie
             typeText?.contains(Regex("Película|Movie")) == true -> TvType.AnimeMovie
             typeText?.contains(Regex("OVA|Especial")) == true -> TvType.OVA
             else -> TvType.Anime
@@ -425,48 +454,98 @@ class AnimeGratisProvider : MainAPI() {
 
         val episodes = ArrayList<Episode>()
 
-        if (isDonghua) {
-            doc.select("#dh-episodes-grid a[data-episode], a[data-episode]").amap { epCard ->
-                val href = epCard.attr("href")
-                val epNum = epCard.attr("data-episode")?.toIntOrNull()
-                    ?: Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
-                if (href.isNotEmpty()) episodes.add(newEpisode(resolveUrl(href)) { this.episode = epNum })
-            }
-            if (episodes.isEmpty()) {
-                doc.select("a[href*=\"episodio\"]").amap { epCard ->
-                    val href = epCard.attr("href")
-                    val epNum = Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
-                    if (href.isNotEmpty()) episodes.add(newEpisode(resolveUrl(href)) { this.episode = epNum })
-                }
-            }
-        } else {
-            doc.select("#episodes-grid a.episode-card[data-episode], a.episode-card[data-episode]").amap { epCard ->
-                val href = epCard.attr("href")
-                val epNum = epCard.attr("data-episode")?.toIntOrNull()
-                    ?: Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
-                if (href.isNotEmpty()) episodes.add(newEpisode(resolveUrl(href)) { this.episode = epNum })
-            }
-            if (episodes.isEmpty()) {
-                doc.select("a[href*=\"episodio\"]").amap { epCard ->
-                    val href = epCard.attr("href")
-                    val epNum = Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
-                    if (href.isNotEmpty()) episodes.add(newEpisode(resolveUrl(href)) { this.episode = epNum })
-                }
+        if (tvType == TvType.AnimeMovie && doc.selectFirst("#dh-episodes-grid") == null && doc.selectFirst("#episodes-grid") == null) {
+            // Es una película sin grid de episodios
+            // Buscar link de película en #ver-pelicula
+            val movieLink = doc.selectFirst("#ver-pelicula a[href*=\"pelicula\"]")?.attr("href")
+                ?: doc.selectFirst("#ver-pelicula a[href*=\"episodio\"]")?.attr("href")
+                ?: url
+            return newMovieLoadResponse(title, url, TvType.AnimeMovie, resolveUrl(movieLink)) {
+                posterUrl = poster; plot = description; tags = genres
             }
         }
 
-        if (!isDonghua && episodes.size < (jsonLdEpCount ?: 0)) {
-            val totalEps = jsonLdEpCount ?: episodes.size
-            if (totalEps > episodes.size) {
-                val slug = url.substringAfter("/anime/").removeSuffix("-anime").removeSuffix("/")
-                for (ep in 1..totalEps) {
-                    if (!episodes.any { it.episode == ep }) {
-                        episodes.add(newEpisode("$mainUrl/anime/$slug/episodio-$ep") { this.episode = ep })
+        // FIX: Extraer episodios correctamente según tipo (donghua vs anime)
+        if (isDonghua) {
+            // Donghua: buscar en #dh-episodes-grid
+            val epGrid = doc.selectFirst("#dh-episodes-grid")
+            if (epGrid != null) {
+                // Extraer data-slug para construir URLs de episodios
+                val slug = epGrid.attr("data-slug")
+                // Extraer episodios del grid (solo los primeros ~35 están renderizados)
+                epGrid.select("a[data-episode]").forEach { epCard ->
+                    val href = epCard.attr("href")
+                    val epNum = epCard.attr("data-episode")?.toIntOrNull()
+                        ?: Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
+                    if (href.isNotEmpty()) {
+                        episodes.add(newEpisode(resolveUrl(href)) { this.episode = epNum })
+                    }
+                }
+
+                // FIX: Construir URLs para episodios faltantes
+                // El grid solo muestra 35 episodios inicialmente
+                // Extraer número total de episodios del texto "🎬 N episodios"
+                val totalEpText = doc.select("span").map { it.text() }.find { it.contains("episodio") }
+                val totalEps = Regex("(\\d+)\\s*episodio").find(totalEpText ?: "")?.destructured?.component1()?.toIntOrNull()
+                    ?: jsonLdEpCount ?: 0
+
+                if (totalEps > episodes.size && slug.isNotEmpty()) {
+                    for (ep in 1..totalEps) {
+                        if (!episodes.any { it.episode == ep }) {
+                            episodes.add(newEpisode("$mainUrl/donghua/$slug/episodio-$ep") { this.episode = ep })
+                        }
+                    }
+                }
+            }
+
+            // Fallback: buscar a[href*="episodio"] si no se encontró el grid
+            if (episodes.isEmpty()) {
+                doc.select("a[href*=\"episodio\"]").forEach { epCard ->
+                    val href = epCard.attr("href")
+                    val epNum = Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
+                    if (href.isNotEmpty() && href.contains("/donghua/")) {
+                        episodes.add(newEpisode(resolveUrl(href)) { this.episode = epNum })
+                    }
+                }
+            }
+        } else {
+            // Anime: buscar en #episodes-grid
+            val epGrid = doc.selectFirst("#episodes-grid")
+            if (epGrid != null) {
+                epGrid.select("a.episode-card[data-episode], a[data-episode]").forEach { epCard ->
+                    val href = epCard.attr("href")
+                    val epNum = epCard.attr("data-episode")?.toIntOrNull()
+                        ?: Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
+                    if (href.isNotEmpty()) episodes.add(newEpisode(resolveUrl(href)) { this.episode = epNum })
+                }
+            }
+
+            // Fallback: buscar a[href*="episodio"]
+            if (episodes.isEmpty()) {
+                doc.select("a[href*=\"episodio\"]").forEach { epCard ->
+                    val href = epCard.attr("href")
+                    val epNum = Regex("episodio-(\\d+)").find(href)?.destructured?.component1()?.toIntOrNull()
+                    if (href.isNotEmpty() && href.contains("/anime/")) {
+                        episodes.add(newEpisode(resolveUrl(href)) { this.episode = epNum })
+                    }
+                }
+            }
+
+            // Construir episodios faltantes para anime
+            if (episodes.size < (jsonLdEpCount ?: 0)) {
+                val totalEps = jsonLdEpCount ?: episodes.size
+                if (totalEps > episodes.size) {
+                    val slug = url.substringAfter("/anime/").removeSuffix("-anime").removeSuffix("/")
+                    for (ep in 1..totalEps) {
+                        if (!episodes.any { it.episode == ep }) {
+                            episodes.add(newEpisode("$mainUrl/anime/$slug/episodio-$ep") { this.episode = ep })
+                        }
                     }
                 }
             }
         }
 
+        // Si aún no hay episodios y es película
         if (episodes.isEmpty() && tvType == TvType.AnimeMovie) {
             return newMovieLoadResponse(title, url, TvType.AnimeMovie, url) {
                 posterUrl = poster; plot = description; tags = genres
@@ -504,7 +583,7 @@ class AnimeGratisProvider : MainAPI() {
             }
         }
 
-        // 2) Buscar img con data-fallback que no sea CDN
+        // 2) Buscar img con data-fallback que no sea CDN (podría ser de otro dominio)
         val fallbackImg = doc.selectFirst("img[data-fallback]")
         if (fallbackImg != null) {
             val url = fallbackImg.attr("data-fallback").trim()
@@ -536,7 +615,7 @@ class AnimeGratisProvider : MainAPI() {
         var foundLinks = false
 
         // Método 1: Botones de servidor (data-url)
-        doc.select("button.server-btn[data-url], button.server-tab[data-url]").amap { btn ->
+        doc.select("button.server-btn[data-url], button.server-tab[data-url]").forEach { btn ->
             val videoUrl = btn.attr("data-url").trim()
             val serverName = btn.text().trim().ifBlank { "Server" }
             if (videoUrl.isNotEmpty() && videoUrl.startsWith("http")) {
@@ -546,7 +625,7 @@ class AnimeGratisProvider : MainAPI() {
 
         // Método 2: data-url en cualquier elemento
         if (!foundLinks) {
-            doc.select("[data-url]").amap { el ->
+            doc.select("[data-url]").forEach { el ->
                 val videoUrl = el.attr("data-url").trim()
                 if (videoUrl.isNotEmpty() && videoUrl.startsWith("http")) {
                     foundLinks = processVideoUrl(videoUrl, data, "Server", subtitleCallback, callback) || foundLinks
@@ -556,7 +635,7 @@ class AnimeGratisProvider : MainAPI() {
 
         // Método 3: Iframe
         if (!foundLinks) {
-            doc.select("iframe").amap { iframe ->
+            doc.select("iframe").forEach { iframe ->
                 val src = listOf("src", "data-src").map { iframe.attr(it).trim() }.firstOrNull { it.isNotBlank() }
                 if (src != null) {
                     val fullSrc = resolveUrl(src)
@@ -651,6 +730,7 @@ class AnimeGratisProvider : MainAPI() {
                 return true
             }
         } catch (_: Exception) {}
+        // Fallback: scrape embed page
         try {
             val embedUrl = "https://www.dailymotion.com/embed/video/$videoId"
             val html = app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
