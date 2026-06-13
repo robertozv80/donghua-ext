@@ -3,6 +3,7 @@ package com.donghuaworld
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 
 class DonghuaWorldProvider : MainAPI() {
@@ -250,7 +251,7 @@ class DonghuaWorldProvider : MainAPI() {
             this.tags = genres
             this.showStatus = showStatus
             this.year = year
-            this.episodes = mapOf(DubStatus.Subbed to sortedEpisodes)
+            this.episodes = mutableMapOf(DubStatus.Subbed to sortedEpisodes)
         }
     }
 
@@ -422,11 +423,10 @@ class DonghuaWorldProvider : MainAPI() {
                         newExtractorLink(
                             source = "Dark Server",
                             name = "Dark Server (Auto)",
-                            url = file,
-                            referer = "$PLAYER_BASE/"
+                            url = file
                         ) {
+                            this.referer = "$PLAYER_BASE/"
                             this.quality = Qualities.Unknown.value
-                            this.isM3u8 = true
                         }
                     )
                 }
@@ -437,11 +437,10 @@ class DonghuaWorldProvider : MainAPI() {
                         newExtractorLink(
                             source = "Dark Server",
                             name = "Dark Server ($label)",
-                            url = file,
-                            referer = "$PLAYER_BASE/"
+                            url = file
                         ) {
+                            this.referer = "$PLAYER_BASE/"
                             this.quality = quality
-                            this.isM3u8 = true
                         }
                     )
                 }
@@ -452,11 +451,10 @@ class DonghuaWorldProvider : MainAPI() {
                         newExtractorLink(
                             source = "Dark Server",
                             name = "Dark Server ($label)",
-                            url = file,
-                            referer = "$PLAYER_BASE/"
+                            url = file
                         ) {
+                            this.referer = "$PLAYER_BASE/"
                             this.quality = quality
-                            this.isM3u8 = false
                         }
                     )
                 }
@@ -477,11 +475,10 @@ class DonghuaWorldProvider : MainAPI() {
                     newExtractorLink(
                         source = "Dark Server",
                         name = "Dark Server",
-                        url = hlsUrl,
-                        referer = "$PLAYER_BASE/"
+                        url = hlsUrl
                     ) {
+                        this.referer = "$PLAYER_BASE/"
                         this.quality = Qualities.Unknown.value
-                        this.isM3u8 = true
                     }
                 )
             }
@@ -528,11 +525,10 @@ class DonghuaWorldProvider : MainAPI() {
                     newExtractorLink(
                         source = "Eng-Sub Player",
                         name = "Eng-Sub Player",
-                        url = hlsUrl,
-                        referer = "https://www.dailymotion.com/"
+                        url = hlsUrl
                     ) {
+                        this.referer = "https://www.dailymotion.com/"
                         this.quality = Qualities.Unknown.value
-                        this.isM3u8 = true
                     }
                 )
             }
