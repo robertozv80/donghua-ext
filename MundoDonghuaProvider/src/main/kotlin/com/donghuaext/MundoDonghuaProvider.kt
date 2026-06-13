@@ -50,7 +50,6 @@ class MundoDonghuaProvider : MainAPI() {
         val doc = app.get(url, timeout = 120).document
 
         val home = if (isHomePage) {
-            // Página principal: sección "Nuevos Episodios"
             val episodeCards = doc.select("div#nuevos-episodios-grid div.md-card")
             if (episodeCards.isNotEmpty()) {
                 episodeCards.mapNotNull { card -> parseEpisodeCard(card) }
@@ -61,7 +60,6 @@ class MundoDonghuaProvider : MainAPI() {
                 }
             }
         } else {
-            // Listas de donghuas: link a /donghua/
             doc.select("div.md-card").mapNotNull { card ->
                 val title = card.selectFirst("h5.md-card-title, h3.md-card-title")?.text() ?: return@mapNotNull null
                 val poster = card.selectFirst("div.md-card-img img")?.attr("src")
@@ -120,12 +118,7 @@ class MundoDonghuaProvider : MainAPI() {
         }
     }
 
-    /**
-     * FIX: Búsqueda usa /busquedas/{query} (path segment, NO query parameter)
-     * También corrige selectores: h5.md-card-title (no h3)
-     */
     override suspend fun search(query: String): List<SearchResponse> {
-        // URL codificada como path segment (NO como query parameter)
         val encodedQuery = java.net.URLEncoder.encode(query, "UTF-8")
         val searchUrl = "$mainUrl/busquedas/$encodedQuery"
         val doc = app.get(searchUrl, timeout = 120).document
@@ -150,10 +143,12 @@ class MundoDonghuaProvider : MainAPI() {
         }
 
         val doc = app.get(donghuaUrl, timeout = 120).document
-        val poster = doc.selectFirst("div.md-detail-poster > img")?.attr("src")
-            ?: doc.selectFirst("div.md-detail-banner-bg > img")?.attr("src")
-            ?: doc.selectFirst("head meta[property=og:image]")?.attr("content")
-            ?: ""
+        val poster = resolveUrl(
+            doc.selectFirst("div.md-detail-poster > img")?.attr("src")
+                ?: doc.selectFirst("div.md-detail-banner-bg > img")?.attr("src")
+                ?: doc.selectFirst("head meta[property=og:image]")?.attr("content")
+                ?: ""
+        )
         val title = doc.selectFirst("h1.md-detail-title")?.text() ?: ""
         val description = doc.selectFirst("p.md-detail-synopsis")?.text() ?: ""
         val genres = doc.select("a.md-genre-tag").map { it.text() }
@@ -235,47 +230,36 @@ class MundoDonghuaProvider : MainAPI() {
             "TE" to "trailers"
         )
 
-        val serverTabs = doc.select("button.md-server-tab[data-target]").map {
-            it.attr("data-target") to it.text().trim()
-        }
-        val hasTamamo = serverTabs.any { it.first == "tamamo" }
-        val hasAsura = serverTabs.any { it.first == "asura" }
+        var foundLinks = false
 
         for (script in doc.select("script")) {
             val scriptData = script.data()
             if (scriptData.contains("eval(function(p,a,c,k,e")) {
-                val packedRegex = Regex("eval\\(function\\(p,a,c,k,e,.*\\)\\)")
+                val packedRegex = Regex("eval\\(function\\(p,a,c,k,e,.*\\)")
                 val packedList = packedRegex.findAll(scriptData).map { it.value }.toList()
                 for (packed in packedList) {
                     try {
                         val unpack = getAndUnpack(packed)
 
+                        // === Asura Server ===
                         if (unpack.contains("asura_player") || unpack.contains("redirector")) {
                             val redirectorRegex = Regex("redirector\\.php\\?slug=([A-Za-z0-9+/=]+)")
                             val asuraSlug = redirectorRegex.find(unpack)?.destructured?.component1()
                             if (!asuraSlug.isNullOrEmpty()) {
                                 try {
                                     val m3u8Url = "https://www.mdplayer.xyz/nemonicplayer/redirector.php?slug=$asuraSlug"
-                                    val testResp = app.get(m3u8Url, headers = reqHEAD, timeout = 15)
-                                    val text = testResp.text
-                                    if (text.contains("#EXTM3U") || text.contains(".m3u8")) {
-                                        generateM3u8("Asura", m3u8Url, datafix).forEach(callback)
-                                    }
-                                } catch (_: Exception) {
-                                    try {
-                                        val m3u8Url = "https://www.mdplayer.xyz/nemonicplayer/redirector.php?slug=$asuraSlug"
-                                        generateM3u8("Asura", m3u8Url, datafix).forEach(callback)
-                                    } catch (_: Exception) {}
-                                }
+                                    generateM3u8("Asura", m3u8Url, datafix).forEach(callback)
+                                    foundLinks = true
+                                } catch (_: Exception) {}
                             }
-
                             val fileRegex = Regex("""["'](https?://[^"']+\.m3u8[^"']*)["']""")
                             val fileUrl = fileRegex.find(unpack)?.destructured?.component1()
                             if (!fileUrl.isNullOrEmpty()) {
-                                try { generateM3u8("Asura", fileUrl, datafix).forEach(callback) } catch (_: Exception) {}
+                                try { generateM3u8("Asura", fileUrl, datafix).forEach(callback); foundLinks = true } catch (_: Exception) {}
                             }
                         }
 
+                        // === Tamamo/Protea Server (Dailymotion via API) ===
                         if (unpack.contains("protea_tab") || unpack.contains("tamamo") || unpack.contains("api_donghua")) {
                             val slugPatterns = listOf(
                                 Regex("""slug["']?\s*:\s*["']([A-Za-z0-9+/=]+)["']"""),
@@ -299,8 +283,10 @@ class MundoDonghuaProvider : MainAPI() {
                                             for (dmPattern in dmIdPatterns) {
                                                 val vidID = dmPattern.find(playerResp)?.destructured?.component1()
                                                 if (!vidID.isNullOrEmpty()) {
-                                                    val dmUrl = "https://www.dailymotion.com/embed/video/$vidID"
-                                                    loadExtractor(dmUrl, data, subtitleCallback, callback)
+                                                    try {
+                                                        loadExtractor("https://www.dailymotion.com/embed/video/$vidID", data, subtitleCallback, callback)
+                                                        foundLinks = true
+                                                    } catch (_: Exception) {}
                                                     break
                                                 }
                                             }
@@ -311,30 +297,58 @@ class MundoDonghuaProvider : MainAPI() {
                             }
                         }
 
-                        val fmRegex = Regex("bysekoze\\.com/e/([a-zA-Z0-9]+)")
+                        // === Fm Server (bysekoze.com) - URL pattern: /{id}/e ===
+                        val fmRegex = Regex("bysekoze\\.com/([a-zA-Z0-9]+)/e")
                         val fmId = fmRegex.find(unpack)?.destructured?.component1()
                         if (!fmId.isNullOrEmpty()) {
-                            try { loadExtractor("https://bysekoze.com/e/$fmId", data, subtitleCallback, callback) } catch (_: Exception) {}
+                            try { loadExtractor("https://bysekoze.com/$fmId/e", data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {}
+                        }
+                        // Also try alternate pattern /e/{id}
+                        val fmRegex2 = Regex("bysekoze\\.com/e/([a-zA-Z0-9]+)")
+                        val fmId2 = fmRegex2.find(unpack)?.destructured?.component1()
+                        if (!fmId2.isNullOrEmpty()) {
+                            try { loadExtractor("https://bysekoze.com/e/$fmId2", data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {}
                         }
 
+                        // === Vh Server (vidhidepro.com) - URL pattern: /{id}/e ===
+                        val vhRegex = Regex("vidhidepro\\.com/([a-zA-Z0-9]+)/e")
+                        val vhId = vhRegex.find(unpack)?.destructured?.component1()
+                        if (!vhId.isNullOrEmpty()) {
+                            try { loadExtractor("https://vidhidepro.com/$vhId/e", data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {}
+                        }
+                        val vhRegex2 = Regex("vidhidepro\\.com/v/([a-zA-Z0-9]+)")
+                        val vhId2 = vhRegex2.find(unpack)?.destructured?.component1()
+                        if (!vhId2.isNullOrEmpty()) {
+                            try { loadExtractor("https://vidhidepro.com/v/$vhId2", data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {}
+                        }
+
+                        // === Vg Server (vgembed.com) - URL pattern: /{id}/e ===
+                        val vgRegex = Regex("vgembed\\.com/([a-zA-Z0-9]+)/e")
+                        val vgId = vgRegex.find(unpack)?.destructured?.component1()
+                        if (!vgId.isNullOrEmpty()) {
+                            try { loadExtractor("https://vgembed.com/$vgId/e", data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {}
+                        }
+
+                        // === Sw Server (embedwish.com) - URL pattern: /{id}/e ===
+                        val swRegex = Regex("embedwish\\.com/([a-zA-Z0-9]+)/e")
+                        val swId = swRegex.find(unpack)?.destructured?.component1()
+                        if (!swId.isNullOrEmpty()) {
+                            try { loadExtractor("https://embedwish.com/$swId/e", data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {}
+                        }
+                        val swRegex2 = Regex("embedwish\\.com/e/([a-zA-Z0-9]+)")
+                        val swId2 = swRegex2.find(unpack)?.destructured?.component1()
+                        if (!swId2.isNullOrEmpty()) {
+                            try { loadExtractor("https://embedwish.com/e/$swId2", data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {}
+                        }
+
+                        // === Voe Server ===
                         val voeRegex = Regex("voe\\.sx/e/([a-zA-Z0-9]+)")
                         val voeId = voeRegex.find(unpack)?.destructured?.component1()
                         if (!voeId.isNullOrEmpty()) {
-                            try { loadExtractor("https://voe.sx/e/$voeId", data, subtitleCallback, callback) } catch (_: Exception) {}
+                            try { loadExtractor("https://voe.sx/e/$voeId", data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {}
                         }
 
-                        val vhRegex = Regex("vidhidepro\\.com/v/([a-zA-Z0-9]+)")
-                        val vhId = vhRegex.find(unpack)?.destructured?.component1()
-                        if (!vhId.isNullOrEmpty()) {
-                            try { loadExtractor("https://vidhidepro.com/v/$vhId", data, subtitleCallback, callback) } catch (_: Exception) {}
-                        }
-
-                        val swRegex = Regex("embedwish\\.com/e/([a-zA-Z0-9]+)")
-                        val swId = swRegex.find(unpack)?.destructured?.component1()
-                        if (!swId.isNullOrEmpty()) {
-                            try { loadExtractor("https://embedwish.com/e/$swId", data, subtitleCallback, callback) } catch (_: Exception) {}
-                        }
-
+                        // === Generic URL extraction (m3u8/mp4) ===
                         val urlRegex = Regex("""(https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*)""")
                         for (match in urlRegex.findAll(unpack)) {
                             val foundUrl = match.value
@@ -346,18 +360,22 @@ class MundoDonghuaProvider : MainAPI() {
                                         this.referer = datafix; this.quality = Qualities.Unknown.value
                                     })
                                 }
+                                foundLinks = true
                             } catch (_: Exception) {}
                         }
 
+                        // === Generic iframe URL extraction ===
                         val iframeRegexes = listOf(
                             Regex("""(https?://voe\.sx/e/[^\s"'<>]+)"""),
-                            Regex("""(https?://[^\s"'<>]*bysekoze\.com/e/[^\s"'<>]+)"""),
-                            Regex("""(https?://[^\s"'<>]*embedwish\.com/e/[^\s"'<>]+)"""),
-                            Regex("""(https?://[^\s"'<>]*vidhidepro\.com/v/[^\s"'<>]+)"""),
+                            Regex("""(https?://[^\s"'<>]*bysekoze\.com/[^\s"'<>]+/e)"""),
+                            Regex("""(https?://[^\s"'<>]*embedwish\.com/[^\s"'<>]+/e)"""),
+                            Regex("""(https?://[^\s"'<>]*vidhidepro\.com/[^\s"'<>]+/e)"""),
+                            Regex("""(https?://[^\s"'<>]*vgembed\.com/[^\s"'<>]+/e)"""),
+                            Regex("""(https?://[^\s"'<>]*filemoon\.[a-z]+/e/[^\s"'<>]+)"""),
                         )
                         for (regex in iframeRegexes) {
                             for (match in regex.findAll(unpack)) {
-                                try { loadExtractor(match.value, data, subtitleCallback, callback) } catch (_: Exception) {}
+                                try { loadExtractor(match.value, data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {}
                             }
                         }
 
@@ -366,6 +384,6 @@ class MundoDonghuaProvider : MainAPI() {
             }
         }
 
-        return true
+        return foundLinks
     }
 }
