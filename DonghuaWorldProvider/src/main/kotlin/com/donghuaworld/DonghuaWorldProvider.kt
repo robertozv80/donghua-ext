@@ -395,7 +395,7 @@ class DonghuaWorldProvider : MainAPI() {
     /**
      * Extract and parse video sources from the player HTML.
      */
-    private fun extractAndParseSources(html: String, callback: (ExtractorLink) -> Unit) {
+    private suspend fun extractAndParseSources(html: String, callback: (ExtractorLink) -> Unit) {
         val sourcesMatch = Regex("""sources\s*:\s*(\[[\s\S]*?\])\s*,\s*tracks""").find(html)
             ?: return
 
