@@ -63,7 +63,7 @@
       "robertozv80"
     ],
     "description": "MundoDonghua - Donghuas y anime chino en espa\u00f1ol",
-    "fileSize": 48722,
+    "fileSize": 48750,
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
     "language": "es",
     "tvTypes": [
@@ -71,7 +71,7 @@
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=mundodonghua.com&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-a668e57469ebc3a43a32cb12d482eb742b41d144a41050eda3e1e6df627c03b5"
+    "fileHash": "sha256-589a8adc88dc54eb9234218b1532d0f8464af5e2d3acba12c0e771ec638ade66"
   },
   {
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/SeriesDonghuaProvider.cs3",
