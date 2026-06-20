@@ -296,7 +296,18 @@ class SeriesDonghuaProvider : MainAPI() {
         )
         for (pattern in patterns) {
             val match = pattern.find(decodedScript)
-            if (match != null) return match.destructured.component1()
+            if (match != null) {
+                val rawJson = match.destructured.component1()
+                // FIX: El script decodificado está envuelto en document.write('<script>...</script>')
+                // Por eso el JSON contiene secuencias de escape adicionales (\\\" → \", \\/ → \/).
+                // Hay que desescapar antes de que parseJson pueda procesarlo.
+                val unescaped = rawJson
+                    .replace("\\\\", "\u0000")  // proteger \\ temporalmente
+                    .replace("\\\"", "\"")       // \" → "
+                    .replace("\\/", "/")         // \/ → /
+                    .replace("\u0000", "\\")     // restaurar \\ → \
+                return unescaped
+            }
         }
         return null
     }
@@ -317,7 +328,7 @@ class SeriesDonghuaProvider : MainAPI() {
         val videoMapJsonStr = if (decodedScript != null) {
             extractVideoMapJson(decodedScript)
         } else {
-            // Fallback: buscar VIDEO_MAP_JSON directamente
+            // Fallback: buscar VIDEO_MAP_JSON directamente (script no ofuscado)
             var found: String? = null
             for (script in doc.select("script")) {
                 val scriptData = script.data()
@@ -327,7 +338,16 @@ class SeriesDonghuaProvider : MainAPI() {
                         Regex("""VIDEO_MAP_JSON\s*=\s*(\{[^;]+\})\s*;"""),
                     )) {
                         val match = pattern.find(scriptData)
-                        if (match != null) { found = match.destructured.component1(); break }
+                        if (match != null) {
+                            val rawJson = match.destructured.component1()
+                            // Aplicar el mismo desescape por si el script también está envuelto
+                            found = rawJson
+                                .replace("\\\\", "\u0000")
+                                .replace("\\\"", "\"")
+                                .replace("\\/", "/")
+                                .replace("\u0000", "\\")
+                            break
+                        }
                     }
                     if (found != null) break
                 }
