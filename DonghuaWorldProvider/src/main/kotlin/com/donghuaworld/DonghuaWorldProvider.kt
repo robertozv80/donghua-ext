@@ -94,11 +94,14 @@ class DonghuaWorldProvider : MainAPI() {
 
     /**
      * Parse a single article card into a SearchResponse.
-     * FIX 2026-07-28: La home de donghuaworld.com ahora lista URLs de EPISODIOS
+     * FIX 2026-07-29: La home de donghuaworld.com lista URLs de EPISODIOS
      * (https://donghuaworld.com/martial-master-episode-678-...), no URLs de series.
-     * Hay que derivar la URL de la serie (/anime/<slug>/) desde el slug del episodio
-     * para que load() reciba la página correcta. Usamos una heurística basada en el
-     * patrón de URL observado: el slug de la serie es la parte antes de "-episode-".
+     * Pasamos la URL de episodio tal cual a load(); load() la resuelve via
+     * resolveSeriesUrlFromEpisode() leyendo el breadcrumb de la pagina de episodio.
+     * Esto es 1 HTTP request extra pero es 100% confiable: el slug del episodio
+     * a veces NO coincide con el slug de la serie (ej: "swallowed-star-warrior-of-the-galaxy"
+     * → serie real "/anime/swallowed-the-universe-warrior-of-galaxy/").
+     * La heuristica anterior (convertEpisodeUrlToSeriesUrl) producia 404 en esos casos.
      */
     private fun parseArticleCard(article: org.jsoup.nodes.Element): SearchResponse? {
         val linkEl = article.selectFirst("a[href]") ?: return null
@@ -126,12 +129,8 @@ class DonghuaWorldProvider : MainAPI() {
         // Extraer nombre de serie limpio (sin "Episode X" ni indicadores de calidad)
         val cleanTitle = title.replace(Regex("""\s*Episode\s+\d+(?:-\d+)?[^|]*$""", RegexOption.IGNORE_CASE), "").trim()
 
-        // FIX: Convertir URL de episodio a URL de serie
-        // https://donghuaworld.com/martial-master-episode-678-4k-multi-subtitles/
-        // → https://donghuaworld.com/anime/martial-master/
-        val seriesUrl = convertEpisodeUrlToSeriesUrl(episodeUrl)
-
-        return newAnimeSearchResponse(cleanTitle, seriesUrl) {
+        // Pasamos la URL de episodio; load() la resuelve via breadcrumb (ver resolveSeriesUrlFromEpisode)
+        return newAnimeSearchResponse(cleanTitle, episodeUrl) {
             this.posterUrl = img
             addDubStatus(DubStatus.Subbed, epNum)
         }
@@ -223,8 +222,37 @@ class DonghuaWorldProvider : MainAPI() {
             ?: document.selectFirst(".ts-post-image")?.let { getImgSrc(it) }
             ?: ""
 
-        // Extract description
-        val description = document.selectFirst(".mindes, .alldes, .entry-content, .desc")?.text()?.trim() ?: ""
+        // FIX 2026-07-29: Extraer la SINOPSIS real desde .bixbox.synp .entry-content.
+        // Antes se usaba ".mindes, .alldes, .entry-content, .desc" pero:
+        //  - ".mindes" NO existe (la clase real es ".mindesc" con 'c' al final)
+        //  - ".desc" contiene el boilerplate SEO ("Watch streaming <title> English Subbed...")
+        //  - ".entry-content" dentro de .bixbox.synp contiene la SINOPSIS narrativa
+        // Ademas, el usuario pidio ELIMINAR el primer parrafo (boilerplate) y AGREGAR la sinopsis.
+        // Solucion: tomar todos los <p> del .bixbox.synp .entry-content y unirlos con \n.
+        // Si no hay synopsis, caer a los selectores legacy (que devuelven el boilerplate).
+        val description = run {
+            val synopsisBox = document.selectFirst(".bixbox.synp .entry-content")
+                ?: document.selectFirst(".synp .entry-content")
+                ?: document.selectFirst("h2:contains(Synopsis)")?.parent()?.selectFirst(".entry-content")
+            if (synopsisBox != null) {
+                val paragraphs = synopsisBox.select("p")
+                if (paragraphs.isNotEmpty()) {
+                    paragraphs.joinToString("\n\n") { p ->
+                        // Salto de <br> tambien como salto de linea
+                        p.html().replace(Regex("""<br\s*/?>""", RegexOption.IGNORE_CASE), "\n")
+                            .replace(Regex("""<[^>]+>"""), "")
+                            .replace("&amp;", "&").replace("&#8217;", "'")
+                            .replace("&#8230;", "...").replace("&quot;", "\"")
+                            .replace("&nbsp;", " ").trim()
+                    }.trim()
+                } else {
+                    synopsisBox.text().trim()
+                }
+            } else {
+                // Fallback: selectores legacy (incluye el boilerplate .desc)
+                document.selectFirst(".mindesc, .alldes, .entry-content, .desc")?.text()?.trim() ?: ""
+            }
+        }
 
         // Extract genres
         val genres = document.select(".genxed a, .series-gen a").mapNotNull { it.text().trim() }
@@ -260,7 +288,10 @@ class DonghuaWorldProvider : MainAPI() {
             // Priorizar .epl-num y .epl-title (estructura actual del tema)
             val numText = linkEl.selectFirst(".epl-num")?.text()?.trim()
             val titleText = linkEl.selectFirst(".epl-title")?.text()?.trim()
-            val epNum = (numText ?: titleText)?.let { extractEpisodeNumber(it) }
+            // FIX 2026-07-29: Si .epl-num no tiene numero (ej: "Series Haitus"),
+            // caer a titleText que normalmente contiene "Episode X".
+            val epNum = numText?.let { extractEpisodeNumber(it) }
+                ?: titleText?.let { extractEpisodeNumber(it) }
             val name = titleText ?: numText
 
             episodes.add(newEpisode(epUrl) {
@@ -350,12 +381,17 @@ class DonghuaWorldProvider : MainAPI() {
 
     /**
      * Extract episode number from text like "Episode 263" or "Episode 254-255"
+     * FIX 2026-07-29: Para textos como "678 (4K)" o "2 (4K)" (sin "Episode"),
+     * el fallback de digitos ahora toma el PRIMER match (no el ultimo).
+     * Antes: "2 (4K)" → lastOrNull = "4" → epNum=4 (todos los episodios quedaban
+     * con numero 4, CloudStream los deduplicaba y solo mostraba 1).
+     * Ahora: "2 (4K)" → firstOrNull = "2" → epNum=2.
      */
     private fun extractEpisodeNumber(text: String): Int? {
         return EPISODE_NUM_REGEX.find(text)?.groupValues?.get(1)?.let { numStr ->
             numStr.substringBefore("-").toIntOrNull()
         } ?: run {
-            Regex("""(\d+)""").findAll(text).lastOrNull()?.groupValues?.get(1)?.toIntOrNull()
+            Regex("""(\d+)""").findAll(text).firstOrNull()?.groupValues?.get(1)?.toIntOrNull()
         }
     }
 
