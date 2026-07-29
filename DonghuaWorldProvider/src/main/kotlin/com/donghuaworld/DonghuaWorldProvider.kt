@@ -150,9 +150,11 @@ class DonghuaWorldProvider : MainAPI() {
             val segments = path.split("/").filter { it.isNotEmpty() }
             val slug = segments.lastOrNull() ?: return episodeUrl
             // Si no parece URL de episodio, devolver tal cual
-            if (!slug.contains("-episode-", ignoreCase = true)) return episodeUrl
-            // Tomar todo antes de "-episode-"
-            val seriesSlug = slug.substringBefore("-episode-", ignoreCase = true)
+            val lowerSlug = slug.lowercase()
+            val epIdx = lowerSlug.indexOf("-episode-")
+            if (epIdx < 0) return episodeUrl
+            // Tomar todo antes de "-episode-" (case-insensitive, preservando el case original)
+            val seriesSlug = slug.substring(0, epIdx)
             if (seriesSlug.isEmpty()) return episodeUrl
             // Construir URL canónica /anime/<seriesSlug>/
             val scheme = uri.scheme ?: "https"
@@ -298,8 +300,8 @@ class DonghuaWorldProvider : MainAPI() {
                 val epText = linkEl.text().trim()
                 // Limpiar prefijos "New Episode"/"First Episode" si aun llegaran
                 val cleanText = epText
-                    .replace(Regex("^New\s+Episode\s*", RegexOption.IGNORE_CASE), "")
-                    .replace(Regex("^First\s+Episode\s*", RegexOption.IGNORE_CASE), "")
+                    .replace(Regex("""^New\s+Episode\s*""", RegexOption.IGNORE_CASE), "")
+                    .replace(Regex("""^First\s+Episode\s*""", RegexOption.IGNORE_CASE), "")
                     .trim()
                 val epNum = extractEpisodeNumber(cleanText)
 
