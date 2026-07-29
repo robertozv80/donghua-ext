@@ -2,6 +2,7 @@ package com.donghuaext
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
@@ -349,6 +350,10 @@ class DonghuaLifeProvider : MainAPI() {
                         videoUrl.contains("rumble.com") -> {
                             extractRumble(videoUrl, data, serverName, callback)
                         }
+                        // FIX 2026-07-28: Stremeable = streamable.com (nuevo servidor en DonghuaLife)
+                        videoUrl.contains("streamable.com") -> {
+                            extractStreamable(videoUrl, data, serverName, subtitleCallback, callback)
+                        }
                         // Dailymotion: extracción directa via API
                         videoUrl.contains("dailymotion.com") || videoUrl.contains("geo.dailymotion.com") -> {
                             val videoId = Regex("video=([A-Za-z0-9]+)").find(videoUrl)?.destructured?.component1()
@@ -382,6 +387,10 @@ class DonghuaLifeProvider : MainAPI() {
                     when {
                         fullSrc.contains("rumble.com") -> {
                             extractRumble(fullSrc, data, "Rumble", callback)
+                        }
+                        // FIX 2026-07-28: Stremeable en iframe
+                        fullSrc.contains("streamable.com") -> {
+                            extractStreamable(fullSrc, data, "Stremeable", subtitleCallback, callback)
                         }
                         fullSrc.contains("dailymotion.com") || fullSrc.contains("geo.dailymotion.com") -> {
                             val videoId = Regex("video=([A-Za-z0-9]+)").find(fullSrc)?.destructured?.component1()
@@ -467,6 +476,15 @@ class DonghuaLifeProvider : MainAPI() {
      * 4. URLs mp4 genéricas
      * 5. og:video meta tag
      */
+    /**
+     * FIX 2026-07-28: Rumble cambió el formato JSON de su embed.
+     * Antes: "ua":{"mp4":[...]}
+     * Ahora: "hls":{"auto":{"url":"https://rumble.com/hls-vod/<id>/playlist.m3u8"}}
+     *        "ua":{"tar":{"360":{"url":"..."},"480":{"url":"..."},"720":{"url":"..."}}}
+     * Los archivos .tar?r_file=chunklist.m3u8 son HLS envueltos en TAR,
+     * hay que marcarlos como M3U8 (no MP4) o el reproductor falla con
+     * "Error_code_parsing_container_unsupported(3003)".
+     */
     private suspend fun extractRumble(
         embedUrl: String,
         referer: String,
@@ -477,23 +495,75 @@ class DonghuaLifeProvider : MainAPI() {
             val response = app.get(embedUrl, referer = referer, timeout = 30)
             val html = response.text
 
-            // ===== Método 1: Buscar JSON de configuración del video =====
-            // Rumble usa un objeto JSON grande con formato variable
-            // Intentar múltiples patrones para el bloque "ua"/"mp4"
-            val jsonPatterns = listOf(
-                // Patrón original: "ua":{"mp4":[...]}
-                Regex("""\"ua\"\s*:\s*\{[^}]*\"mp4\"\s*:\s*\[([^\]]+)\]"""),
-                // Patrón alternativo: "mp4" puede estar en otro nivel
-                Regex("""\"mp4\"\s*:\s*\[([^\]]+)\]"""),
-                // Patrón con comillas escapadas
-                Regex("""\\"ua\\"\s*:\s*\\\{[^\\}]*\\"mp4\\"\s*:\s*\\\[([^\\\]]+)\\\]"""),
+            // ===== Método 1 (NUEVO): HLS master playlist "hls":{"auto":{"url":"..."}} =====
+            // Es lo más confiable: una playlist m3u8 que el reproductor CS3 maneja nativamente.
+            val hlsAutoPatterns = listOf(
+                Regex(""""hls"\s*:\s*\{[^{}]*"auto"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+)""""),
+                Regex(""""hls"\s*:\s*\{\s*"url"\s*:\s*"([^"]+\.m3u8[^"]*)""""),
+                Regex(""""url"\s*:\s*"(https?://rumble\.com/hls-vod/[^"]+\.m3u8[^"]*)""""),
             )
+            for (pattern in hlsAutoPatterns) {
+                val m = pattern.find(html)
+                if (m != null) {
+                    val url = m.destructured.component1()
+                        .replace("\\/", "/")
+                        .replace("\\u0026", "&")
+                    try {
+                        generateM3u8(serverName, url, referer).forEach(callback)
+                        return
+                    } catch (_: Exception) {}
+                }
+            }
 
+            // ===== Método 2 (NUEVO): "ua":{"tar":{"<quality>":{"url":"..."}}} =====
+            // Cada calidad es un .tar?r_file=chunklist.m3u8 (HLS envuelto en TAR).
+            val tarQualityPattern = Regex(
+                """"(\d{3,4})"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+)""""
+            )
+            val tarBlockMatch = Regex(""""ua"\s*:\s*\{[^{}]*"tar"\s*:\s*(\{[^}]+\})""").find(html)
+            if (tarBlockMatch != null) {
+                val tarBlock = tarBlockMatch.groupValues[1]
+                var foundAny = false
+                tarQualityPattern.findAll(tarBlock).forEach { match ->
+                    val qLabel = match.groupValues[1]
+                    val url = match.groupValues[2]
+                        .replace("\\/", "/")
+                        .replace("\\u0026", "&")
+                    val quality = when (qLabel) {
+                        "2160", "1440" -> Qualities.P2160.value
+                        "1080" -> Qualities.P1080.value
+                        "720" -> Qualities.P720.value
+                        "480" -> Qualities.P480.value
+                        "360" -> Qualities.P360.value
+                        else -> Qualities.Unknown.value
+                    }
+                    callback(
+                        newExtractorLink(
+                            source = serverName,
+                            name = "$serverName ${qLabel}p",
+                            url = url,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = referer
+                            this.quality = quality
+                        }
+                    )
+                    foundAny = true
+                }
+                if (foundAny) return
+            }
+
+            // ===== Método 3 (LEGACY): "ua":{"mp4":[...]} =====
+            // Para compatibilidad con videos antiguos que aún usan el formato mp4 array.
+            val jsonPatterns = listOf(
+                Regex(""""ua"\s*:\s*\{[^}]*"mp4"\s*:\s*\[([^\]]+)\]"""),
+                Regex(""""mp4"\s*:\s*\[([^\]]+)\]"""),
+            )
             for (pattern in jsonPatterns) {
                 val jsonMatch = pattern.find(html)
                 if (jsonMatch != null) {
                     val mp4Array = jsonMatch.destructured.component1()
-                    val urlRegex = Regex("""\"(https?://[^\"]+\.mp4[^\"]*)\"""")
+                    val urlRegex = Regex(""""(https?://[^"]+\.mp4[^"]*)"""")
                     var foundAny = false
                     urlRegex.findAll(mp4Array).forEach { match ->
                         val url = match.destructured.component1()
@@ -508,7 +578,8 @@ class DonghuaLifeProvider : MainAPI() {
                             newExtractorLink(
                                 source = serverName,
                                 name = "$serverName ${quality / 1000}p",
-                                url = url
+                                url = url,
+                                type = ExtractorLinkType.VIDEO
                             ) {
                                 this.referer = referer
                                 this.quality = quality
@@ -520,8 +591,7 @@ class DonghuaLifeProvider : MainAPI() {
                 }
             }
 
-            // ===== Método 2: Buscar URLs CDN de rmbl.ws =====
-            // Rumble usa CDN rmbl.ws para hosting de video
+            // ===== Método 4: URLs CDN de rmbl.ws =====
             val rmblPatterns = listOf(
                 Regex("""["'](https?://[^"']*rmbl\.ws[^"']*\.mp4[^"']*)["']"""),
                 Regex("""(https?://[^\s"'<>]*rmbl\.ws[^\s"'<>]*\.mp4[^\s"'<>]*)"""),
@@ -543,7 +613,8 @@ class DonghuaLifeProvider : MainAPI() {
                             newExtractorLink(
                                 source = serverName,
                                 name = "$serverName ${quality / 1000}p",
-                                url = url
+                                url = url,
+                                type = ExtractorLinkType.VIDEO
                             ) {
                                 this.referer = referer
                                 this.quality = quality
@@ -554,7 +625,7 @@ class DonghuaLifeProvider : MainAPI() {
                 }
             }
 
-            // ===== Método 3: Buscar URL m3u8 (HLS) =====
+            // ===== Método 5: Cualquier URL m3u8 genérica =====
             val m3u8Patterns = listOf(
                 Regex("""["'](https?://[^"']+\.m3u8[^"']*)["']"""),
                 Regex("""(https?://[^\s"'<>]+?\.m3u8(?:\?[^\s"'<>]*)?)"""),
@@ -570,7 +641,7 @@ class DonghuaLifeProvider : MainAPI() {
                 }
             }
 
-            // ===== Método 4: Buscar URLs mp4 genéricas =====
+            // ===== Método 6: URLs mp4 genéricas =====
             val mp4Patterns = listOf(
                 Regex("""["'](https?://[^"']+\.mp4[^"']*)["']"""),
                 Regex("""(https?://[^\s"'<>]+\.mp4[^\s"'<>]*)"""),
@@ -589,7 +660,8 @@ class DonghuaLifeProvider : MainAPI() {
                         newExtractorLink(
                             source = serverName,
                             name = "$serverName ${quality / 1000}p",
-                            url = url
+                            url = url,
+                            type = ExtractorLinkType.VIDEO
                         ) {
                             this.referer = referer
                             this.quality = quality
@@ -599,7 +671,7 @@ class DonghuaLifeProvider : MainAPI() {
                 }
             }
 
-            // ===== Método 5: og:video meta tag =====
+            // ===== Método 7: og:video meta tag =====
             val ogVideoPattern = Regex("""<meta\s+property=["']og:video(?::url)?["']\s+content=["']([^"']+)["']""")
             val ogMatch = ogVideoPattern.find(html)
             if (ogMatch != null) {
@@ -607,12 +679,90 @@ class DonghuaLifeProvider : MainAPI() {
                     newExtractorLink(
                         source = serverName,
                         name = serverName,
-                        url = ogMatch.destructured.component1()
+                        url = ogMatch.destructured.component1(),
+                        type = ExtractorLinkType.VIDEO
                     ) {
                         this.referer = referer
                         this.quality = Qualities.Unknown.value
                     }
                 )
+            }
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * FIX 2026-07-28: Extractor para Stremeable (= streamable.com).
+     * El embed de streamable.com expone el MP4 en:
+     *   <video src="//cdn-cf-east.streamable.com/video/mp4/<id>.mp4?Expires=...&Signature=...&Key-Pair-Id=...">
+     * La URL viene con &amp; en HTML, hay que unescapear a &.
+     */
+    private suspend fun extractStreamable(
+        embedUrl: String,
+        referer: String,
+        serverName: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        try {
+            // Primero intentar loadExtractor nativo (CS3 tiene extractor para streamable)
+            try {
+                loadExtractor(embedUrl, referer, subtitleCallback, callback)
+                return
+            } catch (_: Exception) {}
+
+            // Fallback: scrape del HTML del embed
+            val html = app.get(embedUrl, referer = referer, timeout = 15L).text
+
+            // Buscar <video src="..."> o <source src="...">
+            val srcPatterns = listOf(
+                Regex("""<video[^>]+src="([^"]+streamable\.com/[^"]+\.mp4[^"]*)""""),
+                Regex("""<source[^>]+src="([^"]+streamable\.com/[^"]+\.mp4[^"]*)""""),
+                Regex("""src="(//cdn-cf-[^"]+streamable\.com/video/[^"]+\.mp4[^"]*)""""),
+                Regex("""["'](https?://[^"]*streamable\.com/video/[^"]+\.mp4[^"]*)["']"""),
+            )
+            for (pattern in srcPatterns) {
+                val m = pattern.find(html)
+                if (m != null) {
+                    var url = m.destructured.component1()
+                    // Si es protocol-relative (//), agregar https:
+                    if (url.startsWith("//")) url = "https:$url"
+                    // Unescapear &amp; → &
+                    url = url.replace("&amp;", "&")
+                    callback(
+                        newExtractorLink(
+                            source = serverName,
+                            name = serverName,
+                            url = url,
+                            type = ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = "https://streamable.com/"
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                    return
+                }
+            }
+
+            // Último fallback: extraer el ID de la URL y construir la URL del CDN
+            val idMatch = Regex("""streamable\.com/(?:e/)?([A-Za-z0-9]+)""").find(embedUrl)
+            if (idMatch != null) {
+                val videoId = idMatch.destructured.component1()
+                // Intentar varias zonas CDN
+                val cdnZones = listOf("cdn-cf-east", "cdn-cf-west")
+                for (zone in cdnZones) {
+                    val cdnUrl = "https://$zone.streamable.com/video/mp4/$videoId.mp4"
+                    callback(
+                        newExtractorLink(
+                            source = serverName,
+                            name = serverName,
+                            url = cdnUrl,
+                            type = ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = "https://streamable.com/"
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                }
             }
         } catch (_: Exception) {}
     }
