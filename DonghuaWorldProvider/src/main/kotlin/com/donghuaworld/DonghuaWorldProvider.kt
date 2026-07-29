@@ -3,6 +3,7 @@ package com.donghuaworld
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 
@@ -93,12 +94,16 @@ class DonghuaWorldProvider : MainAPI() {
 
     /**
      * Parse a single article card into a SearchResponse.
-     * FIX: Extraer número de episodio del título y pasarlo a addDubStatus
+     * FIX 2026-07-28: La home de donghuaworld.com ahora lista URLs de EPISODIOS
+     * (https://donghuaworld.com/martial-master-episode-678-...), no URLs de series.
+     * Hay que derivar la URL de la serie (/anime/<slug>/) desde el slug del episodio
+     * para que load() reciba la página correcta. Usamos una heurística basada en el
+     * patrón de URL observado: el slug de la serie es la parte antes de "-episode-".
      */
     private fun parseArticleCard(article: org.jsoup.nodes.Element): SearchResponse? {
         val linkEl = article.selectFirst("a[href]") ?: return null
-        val url = linkEl.attr("abs:href")
-        if (url.isEmpty()) return null
+        val episodeUrl = linkEl.attr("abs:href")
+        if (episodeUrl.isEmpty()) return null
 
         val title = linkEl.attr("title").takeIf { it.isNotEmpty() }
             ?: linkEl.selectFirst(".eggtitle")?.text()?.trim()
@@ -106,13 +111,12 @@ class DonghuaWorldProvider : MainAPI() {
             ?: return null
 
         val img = linkEl.selectFirst("img")?.let { imgEl ->
-            // FIX: Priorizar data-src (lazy loading) sobre src (placeholder base64)
-            imgEl.attr("data-src").takeIf { it.isNotEmpty() && !it.startsWith("data:") } ?: imgEl.attr("src")
+            imgEl.attr("data-src").takeIf { it.isNotEmpty() && !it.startsWith("data:") }
+                ?: imgEl.attr("data-lazy-src").takeIf { it.isNotEmpty() && !it.startsWith("data:") }
+                ?: imgEl.attr("src").takeIf { it.isNotEmpty() && !it.startsWith("data:") }
         } ?: ""
 
         // FIX: Extraer número de episodio del título o del badge
-        // Los títulos tienen formato: "Soul Land 2 ... Episode 157 (4K) Multi-Subtitles"
-        // También hay un badge: <span class="epx">Ep 157 (4K)</span>
         val epNum = EPISODE_NUM_REGEX.find(title)?.groupValues?.get(1)?.let { numStr ->
             numStr.substringBefore("-").toIntOrNull()
         } ?: article.selectFirst(".epx")?.text()?.let { epText ->
@@ -122,9 +126,40 @@ class DonghuaWorldProvider : MainAPI() {
         // Extraer nombre de serie limpio (sin "Episode X" ni indicadores de calidad)
         val cleanTitle = title.replace(Regex("""\s*Episode\s+\d+(?:-\d+)?[^|]*$""", RegexOption.IGNORE_CASE), "").trim()
 
-        return newAnimeSearchResponse(cleanTitle, url) {
+        // FIX: Convertir URL de episodio a URL de serie
+        // https://donghuaworld.com/martial-master-episode-678-4k-multi-subtitles/
+        // → https://donghuaworld.com/anime/martial-master/
+        val seriesUrl = convertEpisodeUrlToSeriesUrl(episodeUrl)
+
+        return newAnimeSearchResponse(cleanTitle, seriesUrl) {
             this.posterUrl = img
             addDubStatus(DubStatus.Subbed, epNum)
+        }
+    }
+
+    /**
+     * FIX 2026-07-28: Convierte una URL de episodio a su URL de serie.
+     * Ej: /martial-master-episode-678-4k-multi-subtitles/ → /anime/martial-master/
+     * Si la URL no contiene "-episode-" se devuelve tal cual (ya es URL de serie).
+     */
+    private fun convertEpisodeUrlToSeriesUrl(episodeUrl: String): String {
+        return try {
+            val uri = java.net.URI(episodeUrl)
+            val path = uri.path ?: return episodeUrl
+            // Extraer el slug: tomar el último segmento del path
+            val segments = path.split("/").filter { it.isNotEmpty() }
+            val slug = segments.lastOrNull() ?: return episodeUrl
+            // Si no parece URL de episodio, devolver tal cual
+            if (!slug.contains("-episode-", ignoreCase = true)) return episodeUrl
+            // Tomar todo antes de "-episode-"
+            val seriesSlug = slug.substringBefore("-episode-", ignoreCase = true)
+            if (seriesSlug.isEmpty()) return episodeUrl
+            // Construir URL canónica /anime/<seriesSlug>/
+            val scheme = uri.scheme ?: "https"
+            val host = uri.host ?: return episodeUrl
+            "$scheme://$host/anime/$seriesSlug/"
+        } catch (_: Exception) {
+            episodeUrl
         }
     }
 
@@ -210,26 +245,33 @@ class DonghuaWorldProvider : MainAPI() {
         val episodes = mutableListOf<Episode>()
         val seenUrls = mutableSetOf<String>()
 
-        // Method 1: Look for episode links in the bxcl/episode list container
-        document.select(".bxcl a[href*=episode], .epl a[href*=episode], .episodelist a[href*=episode]").forEach { linkEl ->
+        // FIX 2026-07-28: Usar el contenedor .eplister (selector correcto del tema actual).
+        // Antes se buscaba en .bxcl/.epl/.episodelist pero la clase real es .eplister.
+        // Además, hay que evitar la zona .lastend (que contiene "First Episode"/"New Episode"
+        // con texto confuso) y leer número/título desde .epl-num y .epl-title en lugar de
+        // linkEl.text() que concatenaba todo y daba "New Episode Episode 678 (4K)".
+        document.select(".eplister li a[href*=episode], .eplister li a[href*=episode-]").forEach { linkEl ->
             val epUrl = linkEl.attr("abs:href")
             if (epUrl.isEmpty() || !epUrl.contains("episode", ignoreCase = true)) return@forEach
             if (!seenUrls.add(epUrl)) return@forEach
 
-            val epText = linkEl.text().trim()
-            val epNum = extractEpisodeNumber(epText)
+            // Priorizar .epl-num y .epl-title (estructura actual del tema)
+            val numText = linkEl.selectFirst(".epl-num")?.text()?.trim()
+            val titleText = linkEl.selectFirst(".epl-title")?.text()?.trim()
+            val epNum = (numText ?: titleText)?.let { extractEpisodeNumber(it) }
+            val name = titleText ?: numText
 
             episodes.add(newEpisode(epUrl) {
-                this.name = epText.takeIf { it.isNotEmpty() }
+                this.name = name?.takeIf { it.isNotEmpty() }
                 this.episode = epNum
             })
         }
 
-        // Method 2: Fallback - search for all episode links
+        // Method 2: Selectores legacy (.bxcl, .epl) por si el tema cambia de vuelta
         if (episodes.isEmpty()) {
-            document.select("a[href*=episode]").forEach { linkEl ->
+            document.select(".bxcl a[href*=episode], .epl a[href*=episode], .episodelist a[href*=episode]").forEach { linkEl ->
                 val epUrl = linkEl.attr("abs:href")
-                if (epUrl.isEmpty()) return@forEach
+                if (epUrl.isEmpty() || !epUrl.contains("episode", ignoreCase = true)) return@forEach
                 if (!seenUrls.add(epUrl)) return@forEach
 
                 val epText = linkEl.text().trim()
@@ -237,6 +279,32 @@ class DonghuaWorldProvider : MainAPI() {
 
                 episodes.add(newEpisode(epUrl) {
                     this.name = epText.takeIf { it.isNotEmpty() }
+                    this.episode = epNum
+                })
+            }
+        }
+
+        // Method 3: Fallback - cualquier link de episodio, EXCLUYENDO los de .lastend
+        // (que tienen "New Episode"/"First Episode" y rompen la secuencia)
+        if (episodes.isEmpty()) {
+            document.select("a[href*=episode]").forEach { linkEl ->
+                // Saltar si está dentro de .lastend (botón "New Episode"/"First Episode")
+                if (linkEl.parents().any { it.hasClass("lastend") }) return@forEach
+
+                val epUrl = linkEl.attr("abs:href")
+                if (epUrl.isEmpty()) return@forEach
+                if (!seenUrls.add(epUrl)) return@forEach
+
+                val epText = linkEl.text().trim()
+                // Limpiar prefijos "New Episode"/"First Episode" si aun llegaran
+                val cleanText = epText
+                    .replace(Regex("^New\s+Episode\s*", RegexOption.IGNORE_CASE), "")
+                    .replace(Regex("^First\s+Episode\s*", RegexOption.IGNORE_CASE), "")
+                    .trim()
+                val epNum = extractEpisodeNumber(cleanText)
+
+                episodes.add(newEpisode(epUrl) {
+                    this.name = cleanText.takeIf { it.isNotEmpty() }
                     this.episode = epNum
                 })
             }
@@ -257,13 +325,20 @@ class DonghuaWorldProvider : MainAPI() {
 
     /**
      * Given an episode page URL, load it and extract the series URL from the breadcrumb.
+     * FIX 2026-07-28: Excluir URLs de filtro como /anime/?status=ongoing que aparecen
+     * antes que la URL de la serie en el HTML. Solo aceptar URLs /anime/<slug>/.
      */
     private suspend fun resolveSeriesUrlFromEpisode(episodeUrl: String): String {
         return try {
             val epDoc = app.get(episodeUrl).document
-            epDoc.select("a[href*=/anime/]").firstOrNull()?.attr("abs:href")?.takeIf { it.isNotEmpty() }
-                ?: epDoc.select(".breadcrumb a, .breadcrumbs a").firstOrNull {
-                    it.attr("abs:href").contains("/anime/")
+            // Buscar specifically /anime/<slug>/ (con path, no query string)
+            epDoc.select("a[href*=/anime/]").firstOrNull { el ->
+                val href = el.attr("abs:href")
+                // Debe ser /anime/<slug>/, NO /anime/?status=... ni /anime/#...
+                href.contains(Regex("""/anime/[a-z0-9][a-z0-9-]*/""", RegexOption.IGNORE_CASE))
+            }?.attr("abs:href")?.takeIf { it.isNotEmpty() }
+                ?: epDoc.select(".ts-breadcrumb a, .breadcrumb a, .breadcrumbs a").firstOrNull {
+                    it.attr("abs:href").contains(Regex("""/anime/[a-z0-9][a-z0-9-]*/""", RegexOption.IGNORE_CASE))
                 }?.attr("abs:href")
                 ?: episodeUrl
         } catch (_: Exception) {
@@ -394,8 +469,15 @@ class DonghuaWorldProvider : MainAPI() {
 
     /**
      * Extract and parse video sources from the player HTML.
+     * FIX 2026-07-28: Marcar como M3U8/HLS los archivos .tar?r_file=chunklist.m3u8.
+     * Antes se etiquetaban como MP4 (isM3u8=false en el lambda anterior ya fue removido),
+     * pero el reproductor intentaba parsearlos como contenedor MP4 y mostraba
+     * "Error_code_parsing_container_unsupported(3003)". Aunque la app ya no usa
+     * isM3u8 explícitamente, debemos pasar estos como type=M3U8 usando ExtractorLinkType
+     * para que el reproductor sepa que son HLS envueltos en .tar.
      */
     private suspend fun extractAndParseSources(html: String, callback: (ExtractorLink) -> Unit) {
+        // Buscar el bloque "sources":[...] (termina antes de "tracks")
         val sourcesMatch = Regex("""sources\s*:\s*(\[[\s\S]*?\])\s*,\s*tracks""").find(html)
             ?: return
 
@@ -416,28 +498,32 @@ class DonghuaWorldProvider : MainAPI() {
             val label = match.groupValues[3]
 
             when {
-                // HLS master playlist
+                // HLS master playlist (type=application/x-mpegURL)
                 type.contains("mpegURL", ignoreCase = true) -> {
                     hasHlsMaster = true
                     callback.invoke(
                         newExtractorLink(
                             source = "Dark Server",
                             name = "Dark Server (Auto)",
-                            url = file
+                            url = file,
+                            type = ExtractorLinkType.M3U8
                         ) {
                             this.referer = "$PLAYER_BASE/"
                             this.quality = Qualities.Unknown.value
                         }
                     )
                 }
-                // Rumble CDN quality-specific HLS streams
-                type.contains("mp4", ignoreCase = true) && file.contains("r_file=") -> {
+                // FIX: Rumble CDN quality-specific HLS streams (.tar?r_file=chunklist.m3u8)
+                // NO son MP4 reales: son contenedores TAR con un chunklist HLS dentro.
+                // Marcarlos como M3U8 evita el error "parsing_container_unsupported(3003)".
+                file.contains("r_file=") || file.contains("chunklist.m3u8") -> {
                     val quality = parseQualityFromLabel(label)
                     callback.invoke(
                         newExtractorLink(
                             source = "Dark Server",
                             name = "Dark Server ($label)",
-                            url = file
+                            url = file,
+                            type = ExtractorLinkType.M3U8
                         ) {
                             this.referer = "$PLAYER_BASE/"
                             this.quality = quality
@@ -451,7 +537,8 @@ class DonghuaWorldProvider : MainAPI() {
                         newExtractorLink(
                             source = "Dark Server",
                             name = "Dark Server ($label)",
-                            url = file
+                            url = file,
+                            type = ExtractorLinkType.VIDEO
                         ) {
                             this.referer = "$PLAYER_BASE/"
                             this.quality = quality
@@ -475,7 +562,8 @@ class DonghuaWorldProvider : MainAPI() {
                     newExtractorLink(
                         source = "Dark Server",
                         name = "Dark Server",
-                        url = hlsUrl
+                        url = hlsUrl,
+                        type = ExtractorLinkType.M3U8
                     ) {
                         this.referer = "$PLAYER_BASE/"
                         this.quality = Qualities.Unknown.value
@@ -525,7 +613,8 @@ class DonghuaWorldProvider : MainAPI() {
                     newExtractorLink(
                         source = "Eng-Sub Player",
                         name = "Eng-Sub Player",
-                        url = hlsUrl
+                        url = hlsUrl,
+                        type = ExtractorLinkType.M3U8
                     ) {
                         this.referer = "https://www.dailymotion.com/"
                         this.quality = Qualities.Unknown.value
