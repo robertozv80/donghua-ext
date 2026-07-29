@@ -1,7 +1,6 @@
-NubePlugins
-Repositorio de plugins en castellano para Cloudstream
+Repositorio de plugins en español para Cloudstream
 
-Note
+Nota:
 
 Este repositorio es un fork de la plantilla para plugins de cloudstream
 
