@@ -460,34 +460,92 @@ class SeriesDonghuaProvider : MainAPI() {
         videoId: String, referer: String, serverName: String,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // 1) loadExtractor
-        try { loadExtractor("https://www.dailymotion.com/embed/video/$videoId", referer, subtitleCallback, callback); return true } catch (_: Exception) {}
-        // 2) API metadata
+        val embedUrl = "https://www.dailymotion.com/embed/video/$videoId"
+        val metaUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
+
+        // 0) Pre-warm session cookies — Dailymotion requires the v1st cookie to be set
+        //    before the metadata API is called. Otherwise the returned cdndirector m3u8 URL
+        //    contains a `dmV1st` token that doesn't match any session cookie, and the
+        //    cdndirector server returns HTTP 403 (player shows ERROR_CODE_IO_BAD_HTTP_STATUS 2004).
+        //    Visiting the embed page first sets the v1st cookie in CloudStream's session,
+        //    so subsequent metadata + m3u8 requests carry the matching cookie.
         try {
-            val jsonText = app.get("https://www.dailymotion.com/player/metadata/video/$videoId",
-                referer = "https://www.dailymotion.com/embed/video/$videoId",
-                headers = mapOf("User-Agent" to USER_AGENT, "Accept" to "application/json"), timeout = 15L).text
-            for (m in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(jsonText)) {
-                try { generateM3u8(serverName, m.value, "https://www.dailymotion.com").forEach(callback); return true } catch (_: Exception) {}
+            app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L)
+        } catch (_: Exception) {}
+
+        // 1) loadExtractor — try CloudStream's native Dailymotion extractor first
+        try { loadExtractor(embedUrl, referer, subtitleCallback, callback); return true } catch (_: Exception) {}
+
+        // 2) API metadata — parse JSON properly to extract qualities.auto[*].url
+        //    Skip advertising.ad_url (returns VMAP XML / empty / JS, not real m3u8).
+        //    Skip URLs with placeholder tokens ([APIFRAMEWORKS], [VASTVERSIONS], etc.) —
+        //    those are template strings the player JS replaces; sending them as-is returns 4xx.
+        try {
+            val jsonText = app.get(metaUrl,
+                referer = embedUrl,
+                headers = mapOf("User-Agent" to USER_AGENT, "Accept" to "application/json"),
+                timeout = 15L).text
+
+            // When called with cookies, Dailymotion returns JSON with `\/` escape sequences
+            // (e.g., `https:\/\/cdndirector...`). Normalize them so the regex matches.
+            val normalizedJson = jsonText.replace("\\/", "/")
+
+            // Strategy A: regex-extract the qualities.auto[*].url directly (most reliable).
+            // Matches: "qualities":{"auto":[{"type":"...","url":"...m3u8..."}]}
+            val qualitiesUrlPattern = Regex(
+                """"qualities"\s*:\s*\{\s*"auto"\s*:\s*\[\s*\{[^}]*?"url"\s*:\s*"([^"]+\.m3u8[^"]*)""""
+            )
+            qualitiesUrlPattern.find(normalizedJson)?.let { match ->
+                val url = match.destructured.component1()
+                try {
+                    generateM3u8(serverName, url, embedUrl).forEach(callback)
+                    return true
+                } catch (_: Exception) {}
             }
-            val mp4s = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(jsonText).map { it.value }.distinct().toList()
+
+            // Strategy B: regex-search all m3u8 URLs, skip advertising / placeholder ones.
+            for (m in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(normalizedJson)) {
+                val u = m.value
+                // Skip advertising CDN (returns VMAP XML / empty body / JS, not m3u8).
+                if (u.contains("dmxleo.dailymotion.com")) continue
+                // Skip URLs with unresolved template placeholders.
+                if (u.contains("[APIFRAMEWORKS]") || u.contains("[VASTVERSIONS]") ||
+                    u.contains("[MEDIAMIME]") || u.contains("[PLAYBACKMETHODS]") ||
+                    u.contains("[ERRORCODE]")) continue
+                try { generateM3u8(serverName, u, embedUrl).forEach(callback); return true } catch (_: Exception) {}
+            }
+
+            // Strategy C: mp4 fallback (rare for current Dailymotion, but kept for safety).
+            val mp4s = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(normalizedJson)
+                .map { it.value }.distinct().toList()
             if (mp4s.isNotEmpty()) {
                 for (url in mp4s) {
-                    val q = when { url.contains("1080") -> Qualities.P1080.value; url.contains("720") -> Qualities.P720.value; url.contains("480") -> Qualities.P480.value; else -> Qualities.Unknown.value }
-                    callback(newExtractorLink(source = serverName, name = "$serverName ${q/1000}p", url = url) { this.referer = "https://www.dailymotion.com"; this.quality = q })
+                    val q = when {
+                        url.contains("1080") -> Qualities.P1080.value
+                        url.contains("720") -> Qualities.P720.value
+                        url.contains("480") -> Qualities.P480.value
+                        else -> Qualities.Unknown.value
+                    }
+                    callback(newExtractorLink(source = serverName, name = "$serverName ${q/1000}p", url = url) {
+                        this.referer = embedUrl; this.quality = q
+                    })
                 }
                 return true
             }
         } catch (_: Exception) {}
-        // 3) Scrape embed page
+
+        // 3) Scrape embed page (last resort — embed HTML rarely contains direct URLs these days).
         try {
-            val embedUrl = "https://www.dailymotion.com/embed/video/$videoId"
             val embedHtml = app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
             for (m in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(embedHtml)) {
-                try { generateM3u8(serverName, m.value, embedUrl).forEach(callback); return true } catch (_: Exception) {}
+                val u = m.value
+                if (u.contains("dmxleo.dailymotion.com")) continue
+                try { generateM3u8(serverName, u, embedUrl).forEach(callback); return true } catch (_: Exception) {}
             }
             for (m in Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(embedHtml)) {
-                callback(newExtractorLink(source = serverName, name = serverName, url = m.value) { this.referer = embedUrl; this.quality = Qualities.Unknown.value })
+                callback(newExtractorLink(source = serverName, name = serverName, url = m.value) {
+                    this.referer = embedUrl; this.quality = Qualities.Unknown.value
+                })
                 return true
             }
         } catch (_: Exception) {}
