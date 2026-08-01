@@ -350,7 +350,7 @@ class DonghuaLifeProvider : MainAPI() {
                         videoUrl.contains("rumble.com") -> {
                             extractRumble(videoUrl, data, serverName, callback)
                         }
-                        // FIX 2026-07-28: Stremeable = streamable.com (nuevo servidor en DonghuaLife)
+                        // Stremeable = streamable.com (FIX 2026-07-30: scraping directo del embed)
                         videoUrl.contains("streamable.com") -> {
                             extractStreamable(videoUrl, data, serverName, subtitleCallback, callback)
                         }
@@ -388,7 +388,7 @@ class DonghuaLifeProvider : MainAPI() {
                         fullSrc.contains("rumble.com") -> {
                             extractRumble(fullSrc, data, "Rumble", callback)
                         }
-                        // FIX 2026-07-28: Stremeable en iframe
+                        // Stremeable en iframe (FIX 2026-07-30: scraping directo del embed)
                         fullSrc.contains("streamable.com") -> {
                             extractStreamable(fullSrc, data, "Stremeable", subtitleCallback, callback)
                         }
@@ -691,10 +691,35 @@ class DonghuaLifeProvider : MainAPI() {
     }
 
     /**
-     * FIX 2026-07-28: Extractor para Stremeable (= streamable.com).
-     * El embed de streamable.com expone el MP4 en:
-     *   <video src="//cdn-cf-east.streamable.com/video/mp4/<id>.mp4?Expires=...&Signature=...&Key-Pair-Id=...">
-     * La URL viene con &amp; en HTML, hay que unescapear a &.
+     * FIX 2026-07-30: Extractor para Stremeable (= streamable.com).
+     *
+     * BUG ANTERIOR (2026-07-28): El código llamaba a `loadExtractor` primero con un
+     * `return` incondicional después. Como `loadExtractor` en CS3 NO lanza excepción
+     * cuando no encuentra enlaces (simplemente no invoca el callback), el `return`
+     * se ejecutaba siempre y el código de scraping NUNCA corría. Resultado: para
+     * episodios que solo tienen servidor Stremeable (ej: Supreme God Emperor 2
+     * ep 479), la app mostraba "Enlaces no Encontrados" aunque el embed sí
+     * contenía el MP4 firmado.
+     *
+     * NUEVO ENFOQUE: scraping directo del HTML del embed, SIN pasar por loadExtractor.
+     *
+     * Streamable expone el MP4 en el embed /e/<id> en dos lugares:
+     *   1. Atributo <video src="//cdn-cf-east.streamable.com/video/mp4/<id>.mp4?Expires=...&amp;Signature=...&amp;Key-Pair-Id=...">
+     *      → URL con &amp; (HTML escape)
+     *   2. JSON embebido: var videoObject = {"files":{"mp4":{"url":"//cdn-cf-...mp4?Expires=...\u0026Signature=..."},
+     *                                            "mp4-mobile":{"url":"//cdn-cf-...mp4-mobile/...?Expires=...\u0026Signature=..."}}
+     *      → URL con \u0026 (JSON escape)
+     *
+     * Dos variantes con firmas distintas:
+     *   - "mp4"        → 1280x720 (720p)
+     *   - "mp4-mobile" →  640x360 (360p)
+     *
+     * Ambas variantes se extraen y se unescapen &amp; → & y \u0026 → &. Se deduplican
+     * URLs idénticas (la URL del <video> y la del JSON "mp4" son la misma tras unescapar).
+     *
+     * Verificado con curl: las URLs MP4 firmadas del CDN devuelven HTTP 200,
+     * content-type video/mp4, content-length ~198MB. El reproductor CS3 las maneja
+     * directamente como ExtractorLinkType.VIDEO.
      */
     private suspend fun extractStreamable(
         embedUrl: String,
@@ -704,50 +729,72 @@ class DonghuaLifeProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ) {
         try {
-            // Primero intentar loadExtractor nativo (CS3 tiene extractor para streamable)
+            // FIX 2026-07-30: scraping directo del HTML del embed (NO loadExtractor primero).
+            // Causa del bug anterior: loadExtractor no lanza excepción cuando no encuentra
+            // enlaces, solo no invoca el callback. Como había un `return` incondicional
+            // después, el código de scraping NUNCA se ejecutaba → "Enlaces no Encontrados".
+            val html = app.get(embedUrl, referer = referer, timeout = 15L).text
+
+            // Set para deduplicar URLs ya procesadas
+            val seen = mutableSetOf<String>()
+
+            // Método 1: Capturar TODAS las URLs MP4 del CDN de streamable.
+            // Patrón único catch-all que atrapa <video src="...">, JSON "url":"...", y
+            // cualquier otra variante. Maneja &amp; (HTML) y \u0026 (JSON) — ambos se
+            // unescapen después del match.
+            val mp4Pattern = Regex("""["'](//cdn-cf-[^"']*streamable\.com/video/[^"']+\.mp4[^"']*)["']""")
+            val mp4Matches = mp4Pattern.findAll(html).toList()
+
+            for (match in mp4Matches) {
+                var url = match.groupValues[1]
+                // Si es protocol-relative (//), agregar https:
+                if (url.startsWith("//")) url = "https:$url"
+                // Unescapar HTML &amp; → &
+                url = url.replace("&amp;", "&")
+                // Unescapar JSON \u0026 → & (en string regular "\\u0026" = literal \u0026)
+                url = url.replace("\\u0026", "&")
+                // Unescapar JSON \/ → / (por si acaso)
+                url = url.replace("\\/", "/")
+
+                if (url in seen) continue
+                seen.add(url)
+
+                // Detectar calidad desde el path:
+                //   /video/mp4/<id>.mp4        → 720p (1280x720 según metadata)
+                //   /video/mp4-mobile/<id>.mp4 → 360p (640x360 según metadata)
+                val quality = when {
+                    url.contains("/video/mp4-mobile/") -> Qualities.P360.value
+                    url.contains("/video/mp4/") -> Qualities.P720.value
+                    else -> Qualities.Unknown.value
+                }
+
+                callback(
+                    newExtractorLink(
+                        source = serverName,
+                        name = "$serverName ${quality / 1000}p",
+                        url = url,
+                        type = ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = "https://streamable.com/"
+                        this.quality = quality
+                    }
+                )
+            }
+
+            if (seen.isNotEmpty()) return
+
+            // Método 2 (fallback): Si scraping no encontró nada (HTML cambió),
+            // intentar con loadExtractor nativo de CS3.
             try {
                 loadExtractor(embedUrl, referer, subtitleCallback, callback)
                 return
             } catch (_: Exception) {}
 
-            // Fallback: scrape del HTML del embed
-            val html = app.get(embedUrl, referer = referer, timeout = 15L).text
-
-            // Buscar <video src="..."> o <source src="...">
-            val srcPatterns = listOf(
-                Regex("""<video[^>]+src="([^"]+streamable\.com/[^"]+\.mp4[^"]*)""""),
-                Regex("""<source[^>]+src="([^"]+streamable\.com/[^"]+\.mp4[^"]*)""""),
-                Regex("""src="(//cdn-cf-[^"]+streamable\.com/video/[^"]+\.mp4[^"]*)""""),
-                Regex("""["'](https?://[^"]*streamable\.com/video/[^"]+\.mp4[^"]*)["']"""),
-            )
-            for (pattern in srcPatterns) {
-                val m = pattern.find(html)
-                if (m != null) {
-                    var url = m.destructured.component1()
-                    // Si es protocol-relative (//), agregar https:
-                    if (url.startsWith("//")) url = "https:$url"
-                    // Unescapear &amp; → &
-                    url = url.replace("&amp;", "&")
-                    callback(
-                        newExtractorLink(
-                            source = serverName,
-                            name = serverName,
-                            url = url,
-                            type = ExtractorLinkType.VIDEO
-                        ) {
-                            this.referer = "https://streamable.com/"
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                    return
-                }
-            }
-
-            // Último fallback: extraer el ID de la URL y construir la URL del CDN
+            // Método 3 (último recurso): Construir URL del CDN sin auth.
+            // Casi seguramente fallará (CloudFront requiere firma), pero lo intentamos.
             val idMatch = Regex("""streamable\.com/(?:e/)?([A-Za-z0-9]+)""").find(embedUrl)
             if (idMatch != null) {
                 val videoId = idMatch.destructured.component1()
-                // Intentar varias zonas CDN
                 val cdnZones = listOf("cdn-cf-east", "cdn-cf-west")
                 for (zone in cdnZones) {
                     val cdnUrl = "https://$zone.streamable.com/video/mp4/$videoId.mp4"
