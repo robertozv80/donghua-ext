@@ -583,13 +583,15 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val doc = app.get(cleanUrl, timeout = 60).document
         val html = doc.html()
 
-        // Identificar el contentId
-        val (idKey, contentUuid) = if (preloadedContentId.isNotBlank()) {
+        // Identificar el contentId (movieId o episodeId)
+        val contentPair = if (preloadedContentId.isNotBlank()) {
             // Para películas, el anchor ya trae el movieId
             "movieId" to preloadedContentId
         } else {
-            extractContentId(html) ?: ("", "")
+            extractContentId(html) ?: ("" to "")
         }
+        val idKey = contentPair.first
+        val contentUuid = contentPair.second
 
         if (contentUuid.isBlank()) {
             // Sin contentId no podemos llamar a /api/sources
@@ -600,14 +602,15 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val servers = extractServerList(html)
 
         // POST a /api/sources con JSON body
+        // CloudStream 3 app.post signature: post(url, json: Map<String,Any>? = null, referer: String?, headers: Map<String,String>, ...)
+        // Pasamos el body como mapa (forma soportada y type-safe)
         val apiUrl = "$mainUrl/api/sources"
-        val bodyJson = """{"$idKey":"$contentUuid"}"""
+        val bodyMap = mapOf<String, Any>(idKey to contentUuid)
         val apiResponse = try {
             app.post(
                 apiUrl,
-                body = bodyJson,
+                json = bodyMap,
                 headers = mapOf(
-                    "Content-Type" to "application/json",
                     "Accept" to "application/json",
                     "Referer" to cleanUrl,
                 ),
