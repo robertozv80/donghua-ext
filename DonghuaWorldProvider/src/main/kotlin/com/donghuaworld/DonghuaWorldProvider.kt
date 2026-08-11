@@ -3,6 +3,8 @@ package com.donghuaworld
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 
 class DonghuaWorldProvider : MainAPI() {
@@ -24,8 +26,6 @@ class DonghuaWorldProvider : MainAPI() {
     }
 
     // ==================== MAIN PAGE ====================
-<<<<<<< HEAD
-=======
     // FIX 2026-08-11: Refactorizado para usar selectores CSS basados en clases en lugar
     // de matching por texto de heading. Mas robusto y menos propenso a romperse si el
     // sitio cambia el texto del heading (ej: "Series Update" → "Hot Series Update").
@@ -44,25 +44,18 @@ class DonghuaWorldProvider : MainAPI() {
     // Para "Completed" (separada): GET /anime/?status=completed&sub=&order=latest
     //   <div class="listupd">...<article>...</article>...</div>                  ← 20 series articles
     //   Paginacion: ?page=N&status=completed&sub=&order=latest
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
 
     override val mainPage = mainPageOf(
         "$mainUrl/" to "Hot Series Update",
         "$mainUrl/##latest" to "Latest Release",
-<<<<<<< HEAD
-        "$mainUrl/##recommendation" to "Recommendation"
-=======
         "$mainUrl/##recommendation" to "Recommendation",
         "$mainUrl/anime/?status=completed&sub=&order=latest" to "Completed"
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val sectionName = request.name
         val sectionUrl = request.data
 
-<<<<<<< HEAD
-=======
         // === Completed section: separate page with its own pagination ===
         if (sectionName == "Completed") {
             // URL: /anime/?status=completed&sub=&order=latest
@@ -87,7 +80,6 @@ class DonghuaWorldProvider : MainAPI() {
         // === Homepage sections (Hot/Latest/Recommendation) ===
         // Solo la primera pagina trae el HTML del homepage; a partir de pagina 2
         // cargamos /page/N/ para la seccion Latest Release.
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
         val document = if (page == 1) {
             app.get(sectionUrl.substringBefore("##")).document
         } else {
@@ -99,15 +91,9 @@ class DonghuaWorldProvider : MainAPI() {
         }
 
         val items = when {
-<<<<<<< HEAD
-            sectionName == "Hot Series Update" -> parseSectionByHeading(document, "Series Update")
-            sectionName == "Latest Release" -> parseSectionByHeading(document, "Latest Release")
-            sectionName == "Recommendation" -> parseSectionByHeading(document, "Recommendation")
-=======
             sectionName == "Hot Series Update" -> document.select(".listupd.popularslider article").mapNotNull { parseArticleCard(it) }
             sectionName == "Latest Release" -> document.select(".listupd.normal article").mapNotNull { parseArticleCard(it) }
             sectionName == "Recommendation" -> document.select(".series-gen article").mapNotNull { parseArticleCard(it) }
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
             else -> emptyList()
         }
 
@@ -118,48 +104,6 @@ class DonghuaWorldProvider : MainAPI() {
     }
 
     /**
-<<<<<<< HEAD
-     * Generic section parser: finds the heading matching [headingText],
-     * then scans sibling elements for article cards.
-     */
-    private fun parseSectionByHeading(
-        document: org.jsoup.nodes.Document,
-        headingText: String
-    ): List<SearchResponse> {
-        val items = mutableListOf<SearchResponse>()
-
-        val heading = document.select("h3, h2").firstOrNull { h ->
-            h.text().trim().equals(headingText, ignoreCase = true)
-        } ?: return emptyList()
-
-        var sibling: org.jsoup.nodes.Element? = heading.parent()
-        var attempts = 0
-
-        while (sibling != null && attempts < 10) {
-            val articles = sibling.select("article")
-            if (articles.isNotEmpty()) {
-                articles.forEach { article ->
-                    parseArticleCard(article)?.let { items.add(it) }
-                }
-                return items
-            }
-            sibling = sibling.nextElementSibling()
-            attempts++
-        }
-
-        return items
-    }
-
-    /**
-     * Parse a single article card into a SearchResponse.
-     * FIX: Extraer número de episodio del título y pasarlo a addDubStatus
-     */
-    private fun parseArticleCard(article: org.jsoup.nodes.Element): SearchResponse? {
-        val linkEl = article.selectFirst("a[href]") ?: return null
-        val url = linkEl.attr("abs:href")
-        if (url.isEmpty()) return null
-
-=======
      * Parse a single article card into a SearchResponse.
      * FIX 2026-07-29: La home de donghuaworld.com lista URLs de EPISODIOS
      * (https://donghuaworld.com/martial-master-episode-678-...), no URLs de series.
@@ -175,29 +119,18 @@ class DonghuaWorldProvider : MainAPI() {
         val episodeUrl = linkEl.attr("abs:href")
         if (episodeUrl.isEmpty()) return null
 
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
         val title = linkEl.attr("title").takeIf { it.isNotEmpty() }
             ?: linkEl.selectFirst(".eggtitle")?.text()?.trim()
             ?: linkEl.selectFirst("h2")?.text()?.trim()
             ?: return null
 
         val img = linkEl.selectFirst("img")?.let { imgEl ->
-<<<<<<< HEAD
-            // FIX: Priorizar data-src (lazy loading) sobre src (placeholder base64)
-            imgEl.attr("data-src").takeIf { it.isNotEmpty() && !it.startsWith("data:") } ?: imgEl.attr("src")
-        } ?: ""
-
-        // FIX: Extraer número de episodio del título o del badge
-        // Los títulos tienen formato: "Soul Land 2 ... Episode 157 (4K) Multi-Subtitles"
-        // También hay un badge: <span class="epx">Ep 157 (4K)</span>
-=======
             imgEl.attr("data-src").takeIf { it.isNotEmpty() && !it.startsWith("data:") }
                 ?: imgEl.attr("data-lazy-src").takeIf { it.isNotEmpty() && !it.startsWith("data:") }
                 ?: imgEl.attr("src").takeIf { it.isNotEmpty() && !it.startsWith("data:") }
         } ?: ""
 
         // FIX: Extraer número de episodio del título o del badge
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
         val epNum = EPISODE_NUM_REGEX.find(title)?.groupValues?.get(1)?.let { numStr ->
             numStr.substringBefore("-").toIntOrNull()
         } ?: article.selectFirst(".epx")?.text()?.let { epText ->
@@ -207,11 +140,6 @@ class DonghuaWorldProvider : MainAPI() {
         // Extraer nombre de serie limpio (sin "Episode X" ni indicadores de calidad)
         val cleanTitle = title.replace(Regex("""\s*Episode\s+\d+(?:-\d+)?[^|]*$""", RegexOption.IGNORE_CASE), "").trim()
 
-<<<<<<< HEAD
-        return newAnimeSearchResponse(cleanTitle, url) {
-            this.posterUrl = img
-            addDubStatus(DubStatus.Subbed, epNum)
-=======
         // Pasamos la URL de episodio; load() la resuelve via breadcrumb (ver resolveSeriesUrlFromEpisode)
         return newAnimeSearchResponse(cleanTitle, episodeUrl) {
             this.posterUrl = img
@@ -244,7 +172,6 @@ class DonghuaWorldProvider : MainAPI() {
             "$scheme://$host/anime/$seriesSlug/"
         } catch (_: Exception) {
             episodeUrl
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
         }
     }
 
@@ -306,10 +233,6 @@ class DonghuaWorldProvider : MainAPI() {
             ?: document.selectFirst(".ts-post-image")?.let { getImgSrc(it) }
             ?: ""
 
-<<<<<<< HEAD
-        // Extract description
-        val description = document.selectFirst(".mindes, .alldes, .entry-content, .desc")?.text()?.trim() ?: ""
-=======
         // FIX 2026-07-29: Extraer la SINOPSIS real desde .bixbox.synp .entry-content.
         // Antes se usaba ".mindes, .alldes, .entry-content, .desc" pero:
         //  - ".mindes" NO existe (la clase real es ".mindesc" con 'c' al final)
@@ -341,7 +264,6 @@ class DonghuaWorldProvider : MainAPI() {
                 document.selectFirst(".mindesc, .alldes, .entry-content, .desc")?.text()?.trim() ?: ""
             }
         }
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
 
         // Extract genres
         val genres = document.select(".genxed a, .series-gen a").mapNotNull { it.text().trim() }
@@ -364,19 +286,6 @@ class DonghuaWorldProvider : MainAPI() {
         val episodes = mutableListOf<Episode>()
         val seenUrls = mutableSetOf<String>()
 
-<<<<<<< HEAD
-        // Method 1: Look for episode links in the bxcl/episode list container
-        document.select(".bxcl a[href*=episode], .epl a[href*=episode], .episodelist a[href*=episode]").forEach { linkEl ->
-            val epUrl = linkEl.attr("abs:href")
-            if (epUrl.isEmpty() || !epUrl.contains("episode", ignoreCase = true)) return@forEach
-            if (!seenUrls.add(epUrl)) return@forEach
-
-            val epText = linkEl.text().trim()
-            val epNum = extractEpisodeNumber(epText)
-
-            episodes.add(newEpisode(epUrl) {
-                this.name = epText.takeIf { it.isNotEmpty() }
-=======
         // FIX 2026-07-28: Usar el contenedor .eplister (selector correcto del tema actual).
         // Antes se buscaba en .bxcl/.epl/.episodelist pero la clase real es .eplister.
         // Además, hay que evitar la zona .lastend (que contiene "First Episode"/"New Episode"
@@ -407,14 +316,10 @@ class DonghuaWorldProvider : MainAPI() {
 
             episodes.add(newEpisode(epUrl) {
                 this.name = name?.takeIf { it.isNotEmpty() }
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
                 this.episode = epNum
             })
         }
 
-<<<<<<< HEAD
-        // Method 2: Fallback - search for all episode links
-=======
         // Method 2: Selectores legacy (.bxcl, .epl) por si el tema cambia de vuelta
         if (episodes.isEmpty()) {
             document.select(".bxcl a[href*=episode], .epl a[href*=episode], .episodelist a[href*=episode], .bxcl a[href*=-movie-], .epl a[href*=-movie-], .episodelist a[href*=-movie-]").forEach { linkEl ->
@@ -435,7 +340,6 @@ class DonghuaWorldProvider : MainAPI() {
 
         // Method 3: Fallback - cualquier link de episodio o movie, EXCLUYENDO los de .lastend
         // (que tienen "New Episode"/"First Episode" y rompen la secuencia)
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
         if (episodes.isEmpty()) {
             document.select("a[href*=episode], a[href*=-movie-]").forEach { linkEl ->
                 // Saltar si está dentro de .lastend (botón "New Episode"/"First Episode")
@@ -469,27 +373,7 @@ class DonghuaWorldProvider : MainAPI() {
             this.tags = genres
             this.showStatus = showStatus
             this.year = year
-<<<<<<< HEAD
-            this.episodes = mapOf(DubStatus.Subbed to sortedEpisodes)
-        }
-    }
-
-    /**
-     * Given an episode page URL, load it and extract the series URL from the breadcrumb.
-     */
-    private suspend fun resolveSeriesUrlFromEpisode(episodeUrl: String): String {
-        return try {
-            val epDoc = app.get(episodeUrl).document
-            epDoc.select("a[href*=/anime/]").firstOrNull()?.attr("abs:href")?.takeIf { it.isNotEmpty() }
-                ?: epDoc.select(".breadcrumb a, .breadcrumbs a").firstOrNull {
-                    it.attr("abs:href").contains("/anime/")
-                }?.attr("abs:href")
-                ?: episodeUrl
-        } catch (_: Exception) {
-            episodeUrl
-=======
             this.episodes = mutableMapOf(DubStatus.Subbed to sortedEpisodes)
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
         }
     }
 
@@ -665,12 +549,8 @@ class DonghuaWorldProvider : MainAPI() {
      * isM3u8 explícitamente, debemos pasar estos como type=M3U8 usando ExtractorLinkType
      * para que el reproductor sepa que son HLS envueltos en .tar.
      */
-<<<<<<< HEAD
-    private fun extractAndParseSources(html: String, callback: (ExtractorLink) -> Unit) {
-=======
     private suspend fun extractAndParseSources(html: String, callback: (ExtractorLink) -> Unit) {
         // Buscar el bloque "sources":[...] (termina antes de "tracks")
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
         val sourcesMatch = Regex("""sources\s*:\s*(\[[\s\S]*?\])\s*,\s*tracks""").find(html)
             ?: return
 
@@ -699,10 +579,10 @@ class DonghuaWorldProvider : MainAPI() {
                             source = "Dark Server",
                             name = "Dark Server (Auto)",
                             url = file,
-                            referer = "$PLAYER_BASE/"
+                            type = ExtractorLinkType.M3U8
                         ) {
+                            this.referer = "$PLAYER_BASE/"
                             this.quality = Qualities.Unknown.value
-                            this.isM3u8 = true
                         }
                     )
                 }
@@ -716,10 +596,10 @@ class DonghuaWorldProvider : MainAPI() {
                             source = "Dark Server",
                             name = "Dark Server ($label)",
                             url = file,
-                            referer = "$PLAYER_BASE/"
+                            type = ExtractorLinkType.M3U8
                         ) {
+                            this.referer = "$PLAYER_BASE/"
                             this.quality = quality
-                            this.isM3u8 = true
                         }
                     )
                 }
@@ -731,10 +611,10 @@ class DonghuaWorldProvider : MainAPI() {
                             source = "Dark Server",
                             name = "Dark Server ($label)",
                             url = file,
-                            referer = "$PLAYER_BASE/"
+                            type = ExtractorLinkType.VIDEO
                         ) {
+                            this.referer = "$PLAYER_BASE/"
                             this.quality = quality
-                            this.isM3u8 = false
                         }
                     )
                 }
@@ -756,10 +636,10 @@ class DonghuaWorldProvider : MainAPI() {
                         source = "Dark Server",
                         name = "Dark Server",
                         url = hlsUrl,
-                        referer = "$PLAYER_BASE/"
+                        type = ExtractorLinkType.M3U8
                     ) {
+                        this.referer = "$PLAYER_BASE/"
                         this.quality = Qualities.Unknown.value
-                        this.isM3u8 = true
                     }
                 )
             }
@@ -807,10 +687,10 @@ class DonghuaWorldProvider : MainAPI() {
                         source = "Eng-Sub Player",
                         name = "Eng-Sub Player",
                         url = hlsUrl,
-                        referer = "https://www.dailymotion.com/"
+                        type = ExtractorLinkType.M3U8
                     ) {
+                        this.referer = "https://www.dailymotion.com/"
                         this.quality = Qualities.Unknown.value
-                        this.isM3u8 = true
                     }
                 )
             }

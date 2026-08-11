@@ -328,11 +328,7 @@ class SeriesDonghuaProvider : MainAPI() {
         val videoMapJsonStr = if (decodedScript != null) {
             extractVideoMapJson(decodedScript)
         } else {
-<<<<<<< HEAD
-            // Fallback: buscar VIDEO_MAP_JSON directamente
-=======
             // Fallback: buscar VIDEO_MAP_JSON directamente (script no ofuscado)
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
             var found: String? = null
             for (script in doc.select("script")) {
                 val scriptData = script.data()
@@ -464,11 +460,6 @@ class SeriesDonghuaProvider : MainAPI() {
         videoId: String, referer: String, serverName: String,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ): Boolean {
-<<<<<<< HEAD
-        // 1) loadExtractor
-        try { loadExtractor("https://www.dailymotion.com/embed/video/$videoId", referer, subtitleCallback, callback); return true } catch (_: Exception) {}
-        // 2) API metadata
-=======
         val embedUrl = "https://www.dailymotion.com/embed/video/$videoId"
         val metaUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
 
@@ -478,7 +469,6 @@ class SeriesDonghuaProvider : MainAPI() {
         //    cdndirector server returns HTTP 403 (player shows ERROR_CODE_IO_BAD_HTTP_STATUS 2004).
         //    Visiting the embed page first sets the v1st cookie in CloudStream's session,
         //    so subsequent metadata + m3u8 requests carry the matching cookie.
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
         try {
             app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L)
         } catch (_: Exception) {}
@@ -543,12 +533,8 @@ class SeriesDonghuaProvider : MainAPI() {
                 return true
             }
         } catch (_: Exception) {}
-<<<<<<< HEAD
-        // 3) Scrape embed page
-=======
 
         // 3) Scrape embed page (last resort — embed HTML rarely contains direct URLs these days).
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
         try {
             val embedHtml = app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
             for (m in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(embedHtml)) {

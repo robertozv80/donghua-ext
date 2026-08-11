@@ -350,13 +350,10 @@ class DonghuaLifeProvider : MainAPI() {
                         videoUrl.contains("rumble.com") -> {
                             extractRumble(videoUrl, data, serverName, callback)
                         }
-<<<<<<< HEAD
-=======
                         // Stremeable = streamable.com (FIX 2026-07-30: scraping directo del embed)
                         videoUrl.contains("streamable.com") -> {
                             extractStreamable(videoUrl, data, serverName, subtitleCallback, callback)
                         }
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
                         // Dailymotion: extracción directa via API
                         videoUrl.contains("dailymotion.com") || videoUrl.contains("geo.dailymotion.com") -> {
                             val videoId = Regex("video=([A-Za-z0-9]+)").find(videoUrl)?.destructured?.component1()
@@ -478,8 +475,6 @@ class DonghuaLifeProvider : MainAPI() {
      * 3. URLs m3u8 (HLS)
      * 4. URLs mp4 genéricas
      * 5. og:video meta tag
-<<<<<<< HEAD
-=======
      */
     /**
      * FIX 2026-07-28: Rumble cambió el formato JSON de su embed.
@@ -489,7 +484,6 @@ class DonghuaLifeProvider : MainAPI() {
      * Los archivos .tar?r_file=chunklist.m3u8 son HLS envueltos en TAR,
      * hay que marcarlos como M3U8 (no MP4) o el reproductor falla con
      * "Error_code_parsing_container_unsupported(3003)".
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
      */
     private suspend fun extractRumble(
         embedUrl: String,
@@ -501,20 +495,6 @@ class DonghuaLifeProvider : MainAPI() {
             val response = app.get(embedUrl, referer = referer, timeout = 30)
             val html = response.text
 
-<<<<<<< HEAD
-            // ===== Método 1: Buscar JSON de configuración del video =====
-            // Rumble usa un objeto JSON grande con formato variable
-            // Intentar múltiples patrones para el bloque "ua"/"mp4"
-            val jsonPatterns = listOf(
-                // Patrón original: "ua":{"mp4":[...]}
-                Regex("""\"ua\"\s*:\s*\{[^}]*\"mp4\"\s*:\s*\[([^\]]+)\]"""),
-                // Patrón alternativo: "mp4" puede estar en otro nivel
-                Regex("""\"mp4\"\s*:\s*\[([^\]]+)\]"""),
-                // Patrón con comillas escapadas
-                Regex("""\\"ua\\"\s*:\s*\\\{[^\\}]*\\"mp4\\"\s*:\s*\\\[([^\\\]]+)\\\]"""),
-            )
-
-=======
             // ===== Método 1 (NUEVO): HLS master playlist "hls":{"auto":{"url":"..."}} =====
             // Es lo más confiable: una playlist m3u8 que el reproductor CS3 maneja nativamente.
             val hlsAutoPatterns = listOf(
@@ -579,16 +559,11 @@ class DonghuaLifeProvider : MainAPI() {
                 Regex(""""ua"\s*:\s*\{[^}]*"mp4"\s*:\s*\[([^\]]+)\]"""),
                 Regex(""""mp4"\s*:\s*\[([^\]]+)\]"""),
             )
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
             for (pattern in jsonPatterns) {
                 val jsonMatch = pattern.find(html)
                 if (jsonMatch != null) {
                     val mp4Array = jsonMatch.destructured.component1()
-<<<<<<< HEAD
-                    val urlRegex = Regex("""\"(https?://[^\"]+\.mp4[^\"]*)\"""")
-=======
                     val urlRegex = Regex(""""(https?://[^"]+\.mp4[^"]*)"""")
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
                     var foundAny = false
                     urlRegex.findAll(mp4Array).forEach { match ->
                         val url = match.destructured.component1()
@@ -603,12 +578,8 @@ class DonghuaLifeProvider : MainAPI() {
                             newExtractorLink(
                                 source = serverName,
                                 name = "$serverName ${quality / 1000}p",
-<<<<<<< HEAD
-                                url = url
-=======
                                 url = url,
                                 type = ExtractorLinkType.VIDEO
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
                             ) {
                                 this.referer = referer
                                 this.quality = quality
@@ -620,12 +591,7 @@ class DonghuaLifeProvider : MainAPI() {
                 }
             }
 
-<<<<<<< HEAD
-            // ===== Método 2: Buscar URLs CDN de rmbl.ws =====
-            // Rumble usa CDN rmbl.ws para hosting de video
-=======
             // ===== Método 4: URLs CDN de rmbl.ws =====
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
             val rmblPatterns = listOf(
                 Regex("""["'](https?://[^"']*rmbl\.ws[^"']*\.mp4[^"']*)["']"""),
                 Regex("""(https?://[^\s"'<>]*rmbl\.ws[^\s"'<>]*\.mp4[^\s"'<>]*)"""),
@@ -647,12 +613,8 @@ class DonghuaLifeProvider : MainAPI() {
                             newExtractorLink(
                                 source = serverName,
                                 name = "$serverName ${quality / 1000}p",
-<<<<<<< HEAD
-                                url = url
-=======
                                 url = url,
                                 type = ExtractorLinkType.VIDEO
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
                             ) {
                                 this.referer = referer
                                 this.quality = quality
@@ -663,11 +625,7 @@ class DonghuaLifeProvider : MainAPI() {
                 }
             }
 
-<<<<<<< HEAD
-            // ===== Método 3: Buscar URL m3u8 (HLS) =====
-=======
             // ===== Método 5: Cualquier URL m3u8 genérica =====
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
             val m3u8Patterns = listOf(
                 Regex("""["'](https?://[^"']+\.m3u8[^"']*)["']"""),
                 Regex("""(https?://[^\s"'<>]+?\.m3u8(?:\?[^\s"'<>]*)?)"""),
@@ -683,11 +641,7 @@ class DonghuaLifeProvider : MainAPI() {
                 }
             }
 
-<<<<<<< HEAD
-            // ===== Método 4: Buscar URLs mp4 genéricas =====
-=======
             // ===== Método 6: URLs mp4 genéricas =====
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
             val mp4Patterns = listOf(
                 Regex("""["'](https?://[^"']+\.mp4[^"']*)["']"""),
                 Regex("""(https?://[^\s"'<>]+\.mp4[^\s"'<>]*)"""),
@@ -717,11 +671,7 @@ class DonghuaLifeProvider : MainAPI() {
                 }
             }
 
-<<<<<<< HEAD
-            // ===== Método 5: og:video meta tag =====
-=======
             // ===== Método 7: og:video meta tag =====
->>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
             val ogVideoPattern = Regex("""<meta\s+property=["']og:video(?::url)?["']\s+content=["']([^"']+)["']""")
             val ogMatch = ogVideoPattern.find(html)
             if (ogMatch != null) {
