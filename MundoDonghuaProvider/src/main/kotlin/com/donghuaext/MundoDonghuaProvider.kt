@@ -171,7 +171,14 @@ class MundoDonghuaProvider : MainAPI() {
         val doc = app.get(searchUrl, timeout = 120).document
 
         return doc.select("div.md-card").mapNotNull { card ->
+<<<<<<< HEAD
             val title = card.selectFirst("h3.md-card-title")?.text() ?: return@mapNotNull null
+=======
+            val title = card.selectFirst("h5.md-card-title")?.text()
+                ?: card.selectFirst("h3.md-card-title")?.text()
+                ?: card.selectFirst(".md-card-title")?.text()
+                ?: return@mapNotNull null
+>>>>>>> 5aeb304a0b3528b7a809d36ac0a37cf22574476e
             val href = card.selectFirst("a")?.attr("href") ?: return@mapNotNull null
             val image = card.selectFirst("div.md-card-img img")?.let { getBestImgSrc(it) }
             val dubstat = if (title.contains("Latino") || title.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
