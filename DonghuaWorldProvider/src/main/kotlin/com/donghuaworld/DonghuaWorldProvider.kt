@@ -26,17 +26,60 @@ class DonghuaWorldProvider : MainAPI() {
     }
 
     // ==================== MAIN PAGE ====================
+    // FIX 2026-08-11: Refactorizado para usar selectores CSS basados en clases en lugar
+    // de matching por texto de heading. Mas robusto y menos propenso a romperse si el
+    // sitio cambia el texto del heading (ej: "Series Update" → "Hot Series Update").
+    //
+    // Ademas, agrega la nueva seccion "Completed" que viene de la URL
+    // /anime/?status=completed&sub=&order=latest (con paginacion via ?page=N).
+    //
+    // Estructura HTML del homepage (verificada con BS4):
+    //   <div class="releases hothome"><h3>...Series Update...</h3></div>
+    //   <div class="listupd popularslider">...<article>...</article>...</div>   ← Hot Series Update (5 articles)
+    //   <div class="releases latesthome"><h3>Latest Release</h3></div>
+    //   <div class="listupd normal">...<article>...</article>...</div>           ← Latest Release (~30 articles)
+    //   <div class="releases"><h3>Recommendation</h3></div>
+    //   <div class="series-gen">...<article>...</article>...</div>              ← Recommendation (25 articles)
+    //
+    // Para "Completed" (separada): GET /anime/?status=completed&sub=&order=latest
+    //   <div class="listupd">...<article>...</article>...</div>                  ← 20 series articles
+    //   Paginacion: ?page=N&status=completed&sub=&order=latest
 
     override val mainPage = mainPageOf(
         "$mainUrl/" to "Hot Series Update",
         "$mainUrl/##latest" to "Latest Release",
-        "$mainUrl/##recommendation" to "Recommendation"
+        "$mainUrl/##recommendation" to "Recommendation",
+        "$mainUrl/anime/?status=completed&sub=&order=latest" to "Completed"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val sectionName = request.name
         val sectionUrl = request.data
 
+        // === Completed section: separate page with its own pagination ===
+        if (sectionName == "Completed") {
+            // URL: /anime/?status=completed&sub=&order=latest
+            // Page N: ?page=N&status=completed&sub=&order=latest
+            val url = if (page > 1) {
+                "$mainUrl/anime/?page=$page&status=completed&sub=&order=latest"
+            } else {
+                sectionUrl
+            }
+            val document = app.get(url).document
+            val items = document.select(".listupd article").mapNotNull { art ->
+                parseArticleCard(art)
+            }
+            // Paginacion: si la pagina actual tiene 20 articulos, hay mas paginas
+            val hasNext = items.size >= 20
+            return newHomePageResponse(
+                listOf(HomePageList(sectionName, items)),
+                hasNext = hasNext
+            )
+        }
+
+        // === Homepage sections (Hot/Latest/Recommendation) ===
+        // Solo la primera pagina trae el HTML del homepage; a partir de pagina 2
+        // cargamos /page/N/ para la seccion Latest Release.
         val document = if (page == 1) {
             app.get(sectionUrl.substringBefore("##")).document
         } else {
@@ -48,9 +91,9 @@ class DonghuaWorldProvider : MainAPI() {
         }
 
         val items = when {
-            sectionName == "Hot Series Update" -> parseSectionByHeading(document, "Series Update")
-            sectionName == "Latest Release" -> parseSectionByHeading(document, "Latest Release")
-            sectionName == "Recommendation" -> parseSectionByHeading(document, "Recommendation")
+            sectionName == "Hot Series Update" -> document.select(".listupd.popularslider article").mapNotNull { parseArticleCard(it) }
+            sectionName == "Latest Release" -> document.select(".listupd.normal article").mapNotNull { parseArticleCard(it) }
+            sectionName == "Recommendation" -> document.select(".series-gen article").mapNotNull { parseArticleCard(it) }
             else -> emptyList()
         }
 
@@ -58,38 +101,6 @@ class DonghuaWorldProvider : MainAPI() {
             listOf(HomePageList(sectionName, items)),
             hasNext = sectionName == "Latest Release" && items.isNotEmpty()
         )
-    }
-
-    /**
-     * Generic section parser: finds the heading matching [headingText],
-     * then scans sibling elements for article cards.
-     */
-    private fun parseSectionByHeading(
-        document: org.jsoup.nodes.Document,
-        headingText: String
-    ): List<SearchResponse> {
-        val items = mutableListOf<SearchResponse>()
-
-        val heading = document.select("h3, h2").firstOrNull { h ->
-            h.text().trim().equals(headingText, ignoreCase = true)
-        } ?: return emptyList()
-
-        var sibling: org.jsoup.nodes.Element? = heading.parent()
-        var attempts = 0
-
-        while (sibling != null && attempts < 10) {
-            val articles = sibling.select("article")
-            if (articles.isNotEmpty()) {
-                articles.forEach { article ->
-                    parseArticleCard(article)?.let { items.add(it) }
-                }
-                return items
-            }
-            sibling = sibling.nextElementSibling()
-            attempts++
-        }
-
-        return items
     }
 
     /**
@@ -280,9 +291,16 @@ class DonghuaWorldProvider : MainAPI() {
         // Además, hay que evitar la zona .lastend (que contiene "First Episode"/"New Episode"
         // con texto confuso) y leer número/título desde .epl-num y .epl-title en lugar de
         // linkEl.text() que concatenaba todo y daba "New Episode Episode 678 (4K)".
-        document.select(".eplister li a[href*=episode], .eplister li a[href*=episode-]").forEach { linkEl ->
+        // FIX 2026-08-11: Admitir URLs que contengan "-movie-" ademas de "episode".
+        // Series como "Perfect World Movie - Ninefold The Burning Sky" tienen episodios
+        // cuyas URLs son /perfect-world-movie-ninefold-the-burning-sky-part-2-movie-4k-multi-subtitles/
+        // (no contienen "episode"). Con el selector anterior, estos episodios no se
+        // encontraban y la app mostraba "se ve la descripcion pero no hay video para reproducir".
+        document.select(".eplister li a[href*=episode], .eplister li a[href*=-movie-]").forEach { linkEl ->
             val epUrl = linkEl.attr("abs:href")
-            if (epUrl.isEmpty() || !epUrl.contains("episode", ignoreCase = true)) return@forEach
+            // Validar que la URL sea de episodio o de movie (no filtros)
+            val isEpisodeUrl = epUrl.contains("episode", ignoreCase = true) || epUrl.contains("-movie-", ignoreCase = true)
+            if (epUrl.isEmpty() || !isEpisodeUrl) return@forEach
             if (!seenUrls.add(epUrl)) return@forEach
 
             // Priorizar .epl-num y .epl-title (estructura actual del tema)
@@ -290,6 +308,8 @@ class DonghuaWorldProvider : MainAPI() {
             val titleText = linkEl.selectFirst(".epl-title")?.text()?.trim()
             // FIX 2026-07-29: Si .epl-num no tiene numero (ej: "Series Haitus"),
             // caer a titleText que normalmente contiene "Episode X".
+            // FIX 2026-08-11: extractEpisodeNumber ahora tambien soporta "Part X"
+            // para movies (ej: "Perfect World Movie Part 2" → epNum=2).
             val epNum = numText?.let { extractEpisodeNumber(it) }
                 ?: titleText?.let { extractEpisodeNumber(it) }
             val name = titleText ?: numText
@@ -302,9 +322,10 @@ class DonghuaWorldProvider : MainAPI() {
 
         // Method 2: Selectores legacy (.bxcl, .epl) por si el tema cambia de vuelta
         if (episodes.isEmpty()) {
-            document.select(".bxcl a[href*=episode], .epl a[href*=episode], .episodelist a[href*=episode]").forEach { linkEl ->
+            document.select(".bxcl a[href*=episode], .epl a[href*=episode], .episodelist a[href*=episode], .bxcl a[href*=-movie-], .epl a[href*=-movie-], .episodelist a[href*=-movie-]").forEach { linkEl ->
                 val epUrl = linkEl.attr("abs:href")
-                if (epUrl.isEmpty() || !epUrl.contains("episode", ignoreCase = true)) return@forEach
+                val isEpisodeUrl = epUrl.contains("episode", ignoreCase = true) || epUrl.contains("-movie-", ignoreCase = true)
+                if (epUrl.isEmpty() || !isEpisodeUrl) return@forEach
                 if (!seenUrls.add(epUrl)) return@forEach
 
                 val epText = linkEl.text().trim()
@@ -317,10 +338,10 @@ class DonghuaWorldProvider : MainAPI() {
             }
         }
 
-        // Method 3: Fallback - cualquier link de episodio, EXCLUYENDO los de .lastend
+        // Method 3: Fallback - cualquier link de episodio o movie, EXCLUYENDO los de .lastend
         // (que tienen "New Episode"/"First Episode" y rompen la secuencia)
         if (episodes.isEmpty()) {
-            document.select("a[href*=episode]").forEach { linkEl ->
+            document.select("a[href*=episode], a[href*=-movie-]").forEach { linkEl ->
                 // Saltar si está dentro de .lastend (botón "New Episode"/"First Episode")
                 if (linkEl.parents().any { it.hasClass("lastend") }) return@forEach
 
@@ -380,19 +401,33 @@ class DonghuaWorldProvider : MainAPI() {
     }
 
     /**
-     * Extract episode number from text like "Episode 263" or "Episode 254-255"
+     * Extract episode number from text like "Episode 263" or "Episode 254-255".
      * FIX 2026-07-29: Para textos como "678 (4K)" o "2 (4K)" (sin "Episode"),
      * el fallback de digitos ahora toma el PRIMER match (no el ultimo).
      * Antes: "2 (4K)" → lastOrNull = "4" → epNum=4 (todos los episodios quedaban
      * con numero 4, CloudStream los deduplicaba y solo mostraba 1).
      * Ahora: "2 (4K)" → firstOrNull = "2" → epNum=2.
+     *
+     * FIX 2026-08-11: Soporte para "Part X" en movies.
+     * Series como "Perfect World Movie - Ninefold The Burning Sky" tienen episodios
+     * con .epl-num="Movie (4K)" y .epl-title="Perfect World Movie - ... Part 2 Movie (4K)".
+     * El regex de "Episode" no hace match, y el fallback de digitos tomaría "4" (de "4K").
+     * Ahora: priorizamos "Part X" antes del fallback de digitos, y eliminamos "4K"/"8K"
+     * del texto antes de buscar digitos para evitar falsos positivos.
      */
     private fun extractEpisodeNumber(text: String): Int? {
-        return EPISODE_NUM_REGEX.find(text)?.groupValues?.get(1)?.let { numStr ->
-            numStr.substringBefore("-").toIntOrNull()
-        } ?: run {
-            Regex("""(\d+)""").findAll(text).firstOrNull()?.groupValues?.get(1)?.toIntOrNull()
+        // 1. "Episode X" o "Episode X-Y"
+        EPISODE_NUM_REGEX.find(text)?.groupValues?.get(1)?.let { numStr ->
+            return numStr.substringBefore("-").toIntOrNull()
         }
+        // 2. "Part X" (para movies divididos en partes)
+        Regex("""Part\s+(\d+)""", RegexOption.IGNORE_CASE).find(text)?.groupValues?.get(1)?.let { partStr ->
+            return partStr.toIntOrNull()
+        }
+        // 3. Fallback: primer digito, PERO primero eliminamos "4K"/"8K"/"2K" para evitar
+        //    falsos positivos en textos como "Movie (4K)" → sin este paso, devolvería 4.
+        val cleanedText = text.replace(Regex("""\d+[Kk]"""), "")
+        return Regex("""(\d+)""").findAll(cleanedText).firstOrNull()?.groupValues?.get(1)?.toIntOrNull()
     }
 
     /**
