@@ -737,6 +737,18 @@ class DonghuaLifeBetaProvider : MainAPI() {
             .find(rscPayload)
         val activeEpId = activeEpIdMatch?.groupValues?.get(1) ?: ""
 
+        // 1.5 NUEVO: extraer tokens del array "sources":[...] que está junto al activeEpisodeId
+        // El RSC incluye un component $L1e o $L1b con {"sources":[{"id","label","name","token","type","provider"}]}
+        // Esto es lo MISMO que usan las películas, así que reutilizamos loadMovieLinks.
+        if (activeEpId.isNotBlank()) {
+            val epSources = extractSourcesNearEpisode(rscPayload, activeEpId)
+            if (epSources.isNotEmpty()) {
+                // Llamar al API con los tokens (igual que las películas)
+                val anyEmitted = loadSourcesViaApi(epSources, activeEpId, url, subtitleCallback, callback)
+                if (anyEmitted) return true
+            }
+        }
+
         // 2. Si tenemos activeEpisodeId, buscar el episodio específico y extraer sus servers
         if (activeEpId.isNotBlank()) {
             val epServers = extractServersForEpisode(rscPayload, activeEpId)
@@ -892,8 +904,13 @@ class DonghuaLifeBetaProvider : MainAPI() {
         }
         for ((serverName, serverUrl) in servers) {
             val name = serverName.trim().ifBlank { "Server" }
-            // Normalizar URL: para Ok.ru, agregar www. si falta (algunos extractores CS3 lo requieren)
+            // Normalizar URL:
+            // - Para Ok.ru, el sitio usa /videoembed/<id> pero CS3 solo reconoce /video/<id>.
+            //   Convertimos al formato esperado por el extractor nativo.
+            // - Algunos extractores además requieren www.
             val normalizedUrl = when {
+                serverUrl.contains("ok.ru/videoembed/") ->
+                    serverUrl.replace("ok.ru/videoembed/", "www.ok.ru/video/")
                 serverUrl.contains("ok.ru") && !serverUrl.contains("www.ok.ru") ->
                     serverUrl.replace("ok.ru", "www.ok.ru")
                 else -> serverUrl
@@ -1080,6 +1097,145 @@ class DonghuaLifeBetaProvider : MainAPI() {
                             return true
                         } catch (_: Exception) {}
                     }
+                }
+            } catch (_: Exception) {}
+        }
+
+        return false
+    }
+
+    /**
+     * Extrae los sources con tokens que están junto al activeEpisodeId en el RSC.
+     *
+     * Estructura real del RSC:
+     *   ...,["$","$L1e","<activeEpisodeId>",{"sources":[{"id":"...","label":"ok.ru","name":"ok.ru","token":"...","type":"embed","provider":"ok.ru",...}]}],...
+     *
+     * Busca "<activeEpisodeId>",{"sources":[ y extrae el array que sigue.
+     */
+    private fun extractSourcesNearEpisode(payload: String, episodeId: String): List<MovieSource> {
+        val sources = ArrayList<MovieSource>()
+
+        // Buscar el patrón: "<episodeId>",{"sources":[
+        val marker = ""","$episodeId",{"sources":["""
+        val markerPos = payload.find(marker)
+        if (markerPos < 0) return sources
+
+        val arrayStart = markerPos + marker.length
+        var depth = 0
+        var i = arrayStart
+        while (i < payload.length) {
+            when (payload[i]) {
+                '[' -> depth++
+                ']' -> { if (depth == 0) break else depth-- }
+            }
+            i++
+        }
+        val sourcesArrayStr = payload.substring(arrayStart, i)
+
+        // Mismo patrón que extractMovieSources
+        val sourcePattern = Regex(
+            """\{"id":"[^"]+","label":"([^"]+)","name":"([^"]+)","token":"([^"]+)","type":"([^"]+)","provider":"([^"]+)""""
+        )
+        for (m in sourcePattern.findAll(sourcesArrayStr)) {
+            sources.add(
+                MovieSource(
+                    label = m.groupValues[1],
+                    name = m.groupValues[2],
+                    token = m.groupValues[3],
+                    type = m.groupValues[4],
+                    provider = m.groupValues[5],
+                )
+            )
+        }
+        return sources
+    }
+
+    /**
+     * Llama al API /api/sources con los tokens extraídos del RSC (igual que loadMovieLinks
+     * pero para episodios). Reutiliza la misma lógica de múltiples métodos.
+     *
+     * @param contentId ID del episodio (activeEpisodeId)
+     * @param referer URL del episodio (para headers)
+     */
+    private suspend fun loadSourcesViaApi(
+        sources: List<MovieSource>,
+        contentId: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        if (sources.isEmpty()) return false
+
+        val headers = mapOf(
+            "Accept" to "application/json",
+            "Content-Type" to "application/json",
+            "Origin" to mainUrl,
+            "Referer" to referer,
+            "User-Agent" to USER_AGENT,
+        )
+
+        // Método A: POST /api/sources con {token} por cada source
+        for (source in sources) {
+            val token = source.token
+            if (token.isBlank()) continue
+            try {
+                val resp = app.post(
+                    "$mainUrl/api/sources",
+                    json = mapOf<String, Any>("token" to token),
+                    headers = headers,
+                    timeout = 30L
+                ).text
+                if (resp.isNotBlank() && resp != "{}" && !resp.contains("\"error\"")) {
+                    if (emitFromApiResponse(resp, referer, subtitleCallback, callback, defaultLabel = source.label)) return true
+                }
+            } catch (_: Exception) {}
+        }
+
+        // Método B: POST /api/sources con {episodeId, token}
+        for (source in sources) {
+            val token = source.token
+            if (token.isBlank()) continue
+            try {
+                val resp = app.post(
+                    "$mainUrl/api/sources",
+                    json = mapOf<String, Any>(
+                        "episodeId" to contentId,
+                        "token" to token
+                    ),
+                    headers = headers,
+                    timeout = 30L
+                ).text
+                if (resp.isNotBlank() && resp != "{}" && !resp.contains("\"error\"")) {
+                    if (emitFromApiResponse(resp, referer, subtitleCallback, callback, defaultLabel = source.label)) return true
+                }
+            } catch (_: Exception) {}
+        }
+
+        // Método C: POST /api/sources con {episodeId}
+        try {
+            val resp = app.post(
+                "$mainUrl/api/sources",
+                json = mapOf<String, Any>("episodeId" to contentId),
+                headers = headers,
+                timeout = 30L
+            ).text
+            if (resp.isNotBlank() && resp != "{}" && !resp.contains("\"error\"")) {
+                if (emitFromApiResponse(resp, referer, subtitleCallback, callback)) return true
+            }
+        } catch (_: Exception) {}
+
+        // Método D: GET /api/sources?token=<token>
+        for (source in sources) {
+            val token = source.token
+            if (token.isBlank()) continue
+            try {
+                val resp = app.get(
+                    "$mainUrl/api/sources?token=$token",
+                    headers = headers,
+                    timeout = 30L
+                ).text
+                if (resp.isNotBlank() && resp != "{}" && !resp.contains("\"error\"")) {
+                    if (emitFromApiResponse(resp, referer, subtitleCallback, callback, defaultLabel = source.label)) return true
                 }
             } catch (_: Exception) {}
         }
