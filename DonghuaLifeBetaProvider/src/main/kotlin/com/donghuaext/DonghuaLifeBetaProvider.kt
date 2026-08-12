@@ -15,17 +15,27 @@ import kotlin.collections.ArrayList
 /**
  * DonghuaLifeBetaProvider — Provider para https://beta.donghualife.com
  *
- * v3 (2026-08-12): Correcciones tras pruebas reales en app:
- *   - loadEpisodeLinks: usa activeEpisodeId para encontrar el episodio específico
- *     (antes extraía servers de TODOS los episodios de la temporada, ahora solo del activo)
- *   - loadMovieLinks: prueba múltiples formatos de API (movieId, token, sourceId)
- *     y parsea defensivamente cualquier URL en la respuesta
- *   - Multi-temporada: usa 1..episodeCount como rango (antes usaba firstEpNum..firstEpNum+N que era incorrecto)
- *   - Regex de temporadas: ahora matchea cualquier temporada (no requiere initialEpisodes[0])
- *   - search: scrapea /series y /peliculas (páginas 1-5) y filtra por query
- *     (el sitio no filtra server-side, hay que hacerlo client-side)
- *   - Metadata: usa campos nativos de CS3 (showStatus, duration, rating, year, tags)
- *     en lugar de incluirlos en el plot — aparecen junto a PROVEEDOR/TIPO/AÑO
+ * v4 (2026-08-12): Correcciones tras segunda ronda de pruebas reales:
+ *   - Duration: usa durationMinutes directamente (CS3 espera minutos, no segundos)
+ *     Antes: duration = durationMinutes * 60 → 7min se mostraba como 7h0m
+ *     Ahora: duration = durationMinutes → 7min se muestra como 7m
+ *   - Episode URL: usa initialEpisodes[0].number como inicio del rango
+ *     Antes: generaba episodios 1..episodeCount (creando URLs inválidas para eps inexistentes)
+ *     Ahora: genera episodios startNum..(startNum+episodeCount-1) basado en initialEpisodes[0]
+ *   - Special seasons: detecta isSpecial:true y los marca como season 0 (Especiales)
+ *     Antes: trataba los especiales como temporadas numeradas (corriendo el contador)
+ *     Ahora: season 0 = Especiales, season 1..N = temporadas reales
+ *   - anyEmitted tracking: usa un flag real basado en callback invocado
+ *     Antes: asumía true siempre (falseaba el retorno de loadLinks)
+ *     Ahora: traza cada callback invocado
+ *   - Ok.ru URL: convierte a formato con www. antes de loadExtractor
+ *     Algunos extractores nativos de CS3 requieren www.ok.ru
+ *   - Movies: agrega header Origin al POST /api/sources
+ *     Sin Origin, Next.js puede rechazar la conexión (CSRF check)
+ *   - extractRumble: más patrones de fallback (mp4 directo, HLS genérico)
+ *   - extractDailymotion: soporta URL formato geo.dailymotion.com/player.html?video=
+ *   - Metadata display: agrega puntuación/Estado/Fecha/Duración al inicio del plot
+ *     (CS3 no tiene campo nativo para esto; el plot es la única opción confiable)
  */
 class DonghuaLifeBetaProvider : MainAPI() {
 
@@ -435,6 +445,27 @@ class DonghuaLifeBetaProvider : MainAPI() {
             ?: releaseDateStr.substringAfterLast(" ").trim().toIntOrNull()
             ?: jsonLdDate.takeIf { it.isNotBlank() }?.substring(0, 4)?.toIntOrNull()
 
+        // ====== Construir bloque de metadata para el plot ======
+        // CS3 no tiene campos nativos para Estado/Fecha/Puntuación como texto;
+        // los mostramos al inicio del plot (arriba de Sinopsis) para máxima visibilidad.
+        val metaLines = ArrayList<String>()
+        if (showStatus != null) {
+            val statusText = when (showStatus) {
+                ShowStatus.Ongoing -> "En Emisión"
+                ShowStatus.Completed -> "Finalizado"
+            }
+            metaLines.add("Estado: $statusText")
+        }
+        if (releaseDateStr.isNotBlank()) metaLines.add("Fecha: $releaseDateStr")
+        if (durationMinutes > 0) metaLines.add("Duración: ${durationMinutes}m")
+        // Puntuación: intentaremos extraerla si está disponible en el HTML/RSC
+        val ratingScore = extractRatingScore(html, rscPayload)
+        if (ratingScore.isNotBlank()) metaLines.add("Puntuación: $ratingScore")
+        val metaBlock = if (metaLines.isNotEmpty()) {
+            metaLines.joinToString("\n") + "\n\n"
+        } else ""
+        val fullPlot = metaBlock + description
+
         // ====== Si es película, devolver MovieLoadResponse ======
         if (isMovie) {
             val movieId = extractContentIdFromPayload(rscPayload, "movieId") ?: ""
@@ -445,11 +476,12 @@ class DonghuaLifeBetaProvider : MainAPI() {
             }
             return newMovieLoadResponse(title, dataUrl, TvType.AnimeMovie, dataUrl) {
                 posterUrl = poster
-                plot = description
+                plot = fullPlot
                 tags = genres
                 year = yearInt
-                if (durationMinutes > 0) this.duration = durationMinutes * 60
+                if (durationMinutes > 0) this.duration = durationMinutes
                 showStatus = showStatus
+                rating = ratingScore.extractRatingToInt()
             }
         }
 
@@ -457,21 +489,50 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val episodes = ArrayList<Episode>()
         val seasons = extractSeasonsFromPayload(rscPayload)
 
-        for ((idx, season) in seasons.withIndex()) {
+        // Separar temporadas regulares de especiales
+        // Las especiales van como season 0 (Especiales), las regulares como 1..N
+        val regularSeasons = seasons.filter { !it.isSpecial }
+        val specialSeasons = seasons.filter { it.isSpecial }
+
+        for ((idx, season) in regularSeasons.withIndex()) {
             val seasonNum = idx + 1
             val seasonSlug = season.slug
             val episodeCount = season.episodeCount
+            // initialEpisodes está ordenado ASCENDENTE por número
+            // El primer elemento nos dice cuál es el primer episodio disponible
+            val startEpNum = season.firstEpNumber.takeIf { it > 0 } ?: 1
 
             if (episodeCount > 0) {
                 // Construir URLs /watch/{seasonSlug}-{N} para cada episodio
-                // Los episodios SIEMPRE empiezan en 1 dentro de cada temporada
-                for (epNum in 1..episodeCount) {
+                // Los episodios se numeran desde startEpNum hasta startEpNum+episodeCount-1
+                for (i in 0 until episodeCount) {
+                    val epNum = startEpNum + i
                     val epUrl = "$mainUrl/watch/$seasonSlug-$epNum"
                     episodes.add(
                         newEpisode(epUrl) {
                             this.season = seasonNum
                             this.episode = epNum
                             this.name = "Episodio $epNum"
+                        }
+                    )
+                }
+            }
+        }
+
+        // Agregar temporadas especiales como season 0
+        for (season in specialSeasons) {
+            val seasonSlug = season.slug
+            val episodeCount = season.episodeCount
+            val startEpNum = season.firstEpNumber.takeIf { it > 0 } ?: 1
+            if (episodeCount > 0) {
+                for (i in 0 until episodeCount) {
+                    val epNum = startEpNum + i
+                    val epUrl = "$mainUrl/watch/$seasonSlug-$epNum"
+                    episodes.add(
+                        newEpisode(epUrl) {
+                            this.season = 0  // 0 = Especiales en CS3
+                            this.episode = epNum
+                            this.name = "Especial $epNum"
                         }
                     )
                 }
@@ -502,20 +563,61 @@ class DonghuaLifeBetaProvider : MainAPI() {
             posterUrl = poster
             addEpisodes(DubStatus.Subbed, episodes.sortedWith(compareBy({ it.season }, { it.episode })))
             showStatus = showStatus
-            plot = description
+            plot = fullPlot
             tags = genres
             year = yearInt
-            if (durationMinutes > 0) this.duration = durationMinutes * 60
+            if (durationMinutes > 0) this.duration = durationMinutes
+            rating = ratingScore.extractRatingToInt()
         }
     }
 
     /**
+     * Intenta extraer la puntuación numérica (ej: "4.9") del HTML o RSC payload.
+     * El sitio carga la puntuación dinámicamente vía JS, pero a veces está en el RSC
+     * como "rating":4.9 o "score":4.9 o "averageRating":4.9.
+     */
+    private fun extractRatingScore(html: String, rscPayload: String): String {
+        // Buscar patrones de puntuación en el RSC payload
+        val patterns = listOf(
+            Regex(""""rating"\s*:\s*(\d+\.?\d*)"""),
+            Regex(""""score"\s*:\s*(\d+\.?\d*)"""),
+            Regex(""""averageRating"\s*:\s*(\d+\.?\d*)"""),
+            Regex(""""ratingValue"\s*:\s*(\d+\.?\d*)"""),
+            Regex(""""puntuacion"\s*:\s*(\d+\.?\d*)"""),
+        )
+        for (p in patterns) {
+            val m = p.find(rscPayload)
+            if (m != null) {
+                val value = m.groupValues[1]
+                // Filtrar valores fuera de rango válido (0-10)
+                val asDouble = value.toDoubleOrNull() ?: continue
+                if (asDouble in 0.0..10.0) {
+                    return "$value/10 votos"
+                }
+            }
+        }
+        return ""
+    }
+
+    /**
+     * Convierte una puntuación como "4.9/10 votos" a un Int 0-10000 (escala CS3).
+     * 1000 = 1 estrella, 10000 = 10 estrellas.
+     */
+    private fun String.extractRatingToInt(): Int? {
+        if (this.isBlank()) return null
+        val numStr = this.substringBefore("/").trim()
+        val num = numStr.toDoubleOrNull() ?: return null
+        if (num <= 0 || num > 10) return null
+        return (num * 1000).toInt()
+    }
+
+    /**
      * Extrae la lista de temporadas desde el RSC payload.
-     * Cada temporada: {slug, label, episodeCount, initialEpisodes: [{number, ...}]}
+     * Cada temporada: {slug, label, episodeCount, isSpecial, initialEpisodes: [{number, ...}]}
      *
-     * NOTA: initialEpisodes[0].number NO es el primer episodio de la temporada,
-     * es uno de los episodios más recientes mostrados en la UI. Los episodios
-     * siempre empiezan en 1 dentro de cada temporada.
+     * initialEpisodes[] está ordenado ASCENDENTE por número.
+     * El primer elemento (initialEpisodes[0].number) nos dice cuál es el PRIMER episodio
+     * disponible en la temporada (no necesariamente 1 — ej: Martial Master empieza en 152).
      */
     private fun extractSeasonsFromPayload(payload: String): List<SeasonMeta> {
         val seasons = ArrayList<SeasonMeta>()
@@ -535,20 +637,36 @@ class DonghuaLifeBetaProvider : MainAPI() {
         }
         val seasonsArrayStr = payload.substring(start, i)
 
-        // Patrón más flexible: captura slug, label, episodeCount sin requerir initialEpisodes
+        // Patrón: captura slug, label, isSpecial, episodeCount
         // Pattern: {"id":"...","slug":"<slug>","label":"<label>","coverImage":"...","isSpecial":<bool>,"episodeCount":<N>
         val seasonPattern = Regex(
-            """\{"id":"[^"]+","slug":"([^"]+)","label":"([^"]+)","coverImage":"[^"]*","isSpecial":(?:true|false),"episodeCount":(\d+)"""
+            """\{"id":"[^"]+","slug":"([^"]+)","label":"([^"]+)","coverImage":"[^"]*","isSpecial":(true|false),"episodeCount":(\d+)"""
         )
         for (m in seasonPattern.findAll(seasonsArrayStr)) {
             val slug = m.groupValues[1]
             val label = m.groupValues[2]
-            val countStr = m.groupValues[3]
+            val isSpecial = m.groupValues[3] == "true"
+            val countStr = m.groupValues[4]
+            val episodeCount = countStr.toIntOrNull() ?: 0
+
+            // Buscar el primer número de episodio en initialEpisodes[]
+            // Estructura: ..."initialEpisodes":[{"id":"...","title":"...","number":N,...}]
+            // Buscamos el primer "number":N después de "initialEpisodes":[ dentro de esta temporada
+            val initialEpStart = seasonsArrayStr.find("\"initialEpisodes\":[", m.range.first)
+            val firstEpNumber = if (initialEpStart >= 0 && initialEpStart > m.range.first) {
+                // Tomar el primer "number":N después de "initialEpisodes":[
+                val searchStart = initialEpStart + "\"initialEpisodes\":[".length
+                val numMatch = Regex(""""number":(\d+)""").find(seasonsArrayStr.substring(searchStart))
+                numMatch?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            } else 0
+
             seasons.add(
                 SeasonMeta(
                     slug = slug,
                     label = label,
-                    episodeCount = countStr.toIntOrNull() ?: 0,
+                    episodeCount = episodeCount,
+                    isSpecial = isSpecial,
+                    firstEpNumber = firstEpNumber,
                 )
             )
         }
@@ -751,6 +869,10 @@ class DonghuaLifeBetaProvider : MainAPI() {
     /**
      * Emite ExtractorLinks para una lista de (name, url) de servers de episodio.
      * Retorna true si al menos un callback fue invocado.
+     *
+     * IMPORTANTE: usamos un wrapper del callback para detectar si fue invocado.
+     * loadExtractor no retorna éxito/fracaso ni lanza excepción si no encuentra links;
+     * solo invoca el callback cuando tiene un link. Por eso envolvemos el callback.
      */
     private suspend fun emitEpisodeServers(
         servers: List<Pair<String, String>>,
@@ -759,43 +881,56 @@ class DonghuaLifeBetaProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         var anyEmitted = false
+        // Wrapper del callback que registra invocaciones
+        val trackingCallback: (ExtractorLink) -> Unit = { link ->
+            anyEmitted = true
+            callback(link)
+        }
         for ((serverName, serverUrl) in servers) {
             val name = serverName.trim().ifBlank { "Server" }
+            // Normalizar URL: para Ok.ru, agregar www. si falta (algunos extractores CS3 lo requieren)
+            val normalizedUrl = when {
+                serverUrl.contains("ok.ru") && !serverUrl.contains("www.ok.ru") ->
+                    serverUrl.replace("ok.ru", "www.ok.ru")
+                else -> serverUrl
+            }
             try {
                 when {
                     // Rumble
                     serverUrl.contains("rumble.com") -> {
-                        extractRumble(serverUrl, referer, name, callback)
+                        extractRumble(serverUrl, referer, name, trackingCallback)
                     }
-                    // Dailymotion
-                    serverUrl.contains("dailymotion.com") -> {
-                        extractDailymotion(serverUrl, referer, name, callback)
+                    // Dailymotion (incluye geo.dailymotion.com)
+                    serverUrl.contains("dailymotion.com") || serverUrl.contains("geo.dailymotion.com") -> {
+                        extractDailymotion(serverUrl, referer, name, trackingCallback)
                     }
                     // Stremeable = streamable.com
                     serverUrl.contains("streamable.com") -> {
-                        extractStreamable(serverUrl, referer, name, subtitleCallback, callback)
+                        extractStreamable(serverUrl, referer, name, subtitleCallback, trackingCallback)
                     }
-                    // Ok.ru (CS3 tiene extractor nativo)
+                    // Ok.ru (CS3 tiene extractor nativo; usar URL normalizada con www.)
                     serverUrl.contains("ok.ru") -> {
-                        loadExtractor(serverUrl, referer, subtitleCallback, callback)
+                        loadExtractor(normalizedUrl, referer, subtitleCallback, trackingCallback)
+                        // Si loadExtractor no emitió nada, intentar con la URL original también
+                        if (!anyEmitted) {
+                            try { loadExtractor(serverUrl, referer, subtitleCallback, trackingCallback) } catch (_: Exception) {}
+                        }
                     }
                     // Voe.sx
                     serverUrl.contains("voe.sx") -> {
-                        loadExtractor(serverUrl, referer, subtitleCallback, callback)
+                        loadExtractor(serverUrl, referer, subtitleCallback, trackingCallback)
                     }
                     // Filemoon
                     serverUrl.contains("filemoon") || serverUrl.contains("moonplayer") -> {
-                        loadExtractor(serverUrl, referer, subtitleCallback, callback)
+                        loadExtractor(serverUrl, referer, subtitleCallback, trackingCallback)
                     }
                     // Otros: loadExtractor genérico
                     else -> {
-                        loadExtractor(serverUrl, referer, subtitleCallback, callback)
+                        loadExtractor(serverUrl, referer, subtitleCallback, trackingCallback)
                     }
                 }
             } catch (_: Exception) {}
-            // Nota: no podemos saber con certeza si el callback fue invocado,
-            // pero asumimos que si loadExtractor/extractX no lanza excepción, intentó emitir.
-            anyEmitted = true
+            // No seteamos anyEmitted aquí: el trackingCallback lo hace al ser invocado
         }
         return anyEmitted
     }
@@ -829,8 +964,10 @@ class DonghuaLifeBetaProvider : MainAPI() {
 
         val headers = mapOf(
             "Accept" to "application/json",
-            "Referer" to url,
             "Content-Type" to "application/json",
+            "Origin" to mainUrl,  // Next.js requiere Origin para POSTs a /api/*
+            "Referer" to url,
+            "User-Agent" to USER_AGENT,
         )
 
         // ====== Método 1: POST /api/sources con {movieId: "<uuid>"} ======
@@ -1315,6 +1452,8 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val slug: String,
         val label: String,
         val episodeCount: Int,
+        val isSpecial: Boolean = false,
+        val firstEpNumber: Int = 0,  // Primer número de episodio (de initialEpisodes[0])
     )
 
     private data class MovieSource(
