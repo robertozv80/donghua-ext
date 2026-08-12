@@ -1,5 +1,6 @@
 package com.donghuaext
 
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
@@ -11,6 +12,8 @@ import com.lagradost.cloudstream3.utils.Qualities
 import java.net.URLDecoder
 import java.net.URLEncoder
 import kotlin.collections.ArrayList
+
+private const val TAG = "DonghuaLifeBeta"
 
 /**
  * DonghuaLifeBetaProvider — Provider para https://beta.donghualife.com
@@ -736,15 +739,19 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val activeEpIdMatch = Regex(""""activeEpisodeId":"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"""")
             .find(rscPayload)
         val activeEpId = activeEpIdMatch?.groupValues?.get(1) ?: ""
+        Log.i(TAG, "loadEpisodeLinks url=$url activeEpId=$activeEpId rscSize=${rscPayload.length}")
 
         // 1.5 NUEVO: extraer tokens del array "sources":[...] que está junto al activeEpisodeId
         // El RSC incluye un component $L1e o $L1b con {"sources":[{"id","label","name","token","type","provider"}]}
         // Esto es lo MISMO que usan las películas, así que reutilizamos loadMovieLinks.
         if (activeEpId.isNotBlank()) {
             val epSources = extractSourcesNearEpisode(rscPayload, activeEpId)
+            Log.i(TAG, "Episode sources with tokens: ${epSources.size}")
+            for (s in epSources) Log.i(TAG, "  source: label=${s.label} provider=${s.provider} token=${s.token.take(30)}...")
             if (epSources.isNotEmpty()) {
                 // Llamar al API con los tokens (igual que las películas)
                 val anyEmitted = loadSourcesViaApi(epSources, activeEpId, url, subtitleCallback, callback)
+                Log.i(TAG, "loadSourcesViaApi returned anyEmitted=$anyEmitted")
                 if (anyEmitted) return true
             }
         }
@@ -752,8 +759,11 @@ class DonghuaLifeBetaProvider : MainAPI() {
         // 2. Si tenemos activeEpisodeId, buscar el episodio específico y extraer sus servers
         if (activeEpId.isNotBlank()) {
             val epServers = extractServersForEpisode(rscPayload, activeEpId)
+            Log.i(TAG, "Direct episode servers (name,url): ${epServers.size}")
+            for ((n, u) in epServers) Log.i(TAG, "  server: $n -> $u")
             if (epServers.isNotEmpty()) {
                 val anyEmitted = emitEpisodeServers(epServers, url, subtitleCallback, callback)
+                Log.i(TAG, "emitEpisodeServers returned anyEmitted=$anyEmitted")
                 if (anyEmitted) return true
             }
         }
@@ -978,9 +988,12 @@ class DonghuaLifeBetaProvider : MainAPI() {
     ): Boolean {
         val movieId = if (preloadedContentId.isNotBlank()) preloadedContentId
             else extractContentIdFromPayload(rscPayload, "movieId") ?: ""
+        Log.i(TAG, "loadMovieLinks url=$url movieId=$movieId rscSize=${rscPayload.length}")
 
         // Extraer la lista de sources con tokens desde el payload
         val sources = extractMovieSources(rscPayload)
+        Log.i(TAG, "Movie sources with tokens: ${sources.size}")
+        for (s in sources) Log.i(TAG, "  source: label=${s.label} provider=${s.provider} type=${s.type} token=${s.token.take(30)}...")
         if (movieId.isBlank() && sources.isEmpty()) return false
 
         val headers = mapOf(
@@ -1000,10 +1013,11 @@ class DonghuaLifeBetaProvider : MainAPI() {
                     headers = headers,
                     timeout = 30L
                 ).text
+                Log.i(TAG, "M1 POST /api/sources {movieId} respLen=${resp.length} respHead=${resp.take(200)}")
                 if (resp.isNotBlank() && resp != "{}") {
                     if (emitFromApiResponse(resp, url, subtitleCallback, callback)) return true
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) { Log.w(TAG, "M1 failed: ${e.message}") }
         }
 
         // ====== Método 2: POST /api/sources con {token: "<token>"} por cada source ======
@@ -1017,10 +1031,11 @@ class DonghuaLifeBetaProvider : MainAPI() {
                     headers = headers,
                     timeout = 30L
                 ).text
+                Log.i(TAG, "M2 POST {token} label=${source.label} respLen=${resp.length} respHead=${resp.take(200)}")
                 if (resp.isNotBlank() && resp != "{}") {
                     if (emitFromApiResponse(resp, url, subtitleCallback, callback, defaultLabel = source.label)) return true
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) { Log.w(TAG, "M2 failed (${source.label}): ${e.message}") }
         }
 
         // ====== Método 3: POST /api/sources con {movieId, token} por cada source ======
@@ -1185,10 +1200,11 @@ class DonghuaLifeBetaProvider : MainAPI() {
                     headers = headers,
                     timeout = 30L
                 ).text
+                Log.i(TAG, "EA POST {token} label=${source.label} respLen=${resp.length} respHead=${resp.take(200)}")
                 if (resp.isNotBlank() && resp != "{}" && !resp.contains("\"error\"")) {
                     if (emitFromApiResponse(resp, referer, subtitleCallback, callback, defaultLabel = source.label)) return true
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) { Log.w(TAG, "EA failed (${source.label}): ${e.message}") }
         }
 
         // Método B: POST /api/sources con {episodeId, token}
@@ -1205,10 +1221,11 @@ class DonghuaLifeBetaProvider : MainAPI() {
                     headers = headers,
                     timeout = 30L
                 ).text
+                Log.i(TAG, "EB POST {episodeId, token} label=${source.label} respLen=${resp.length} respHead=${resp.take(200)}")
                 if (resp.isNotBlank() && resp != "{}" && !resp.contains("\"error\"")) {
                     if (emitFromApiResponse(resp, referer, subtitleCallback, callback, defaultLabel = source.label)) return true
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) { Log.w(TAG, "EB failed (${source.label}): ${e.message}") }
         }
 
         // Método C: POST /api/sources con {episodeId}
@@ -1219,10 +1236,11 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 headers = headers,
                 timeout = 30L
             ).text
+            Log.i(TAG, "EC POST {episodeId} respLen=${resp.length} respHead=${resp.take(200)}")
             if (resp.isNotBlank() && resp != "{}" && !resp.contains("\"error\"")) {
                 if (emitFromApiResponse(resp, referer, subtitleCallback, callback)) return true
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) { Log.w(TAG, "EC failed: ${e.message}") }
 
         // Método D: GET /api/sources?token=<token>
         for (source in sources) {
@@ -1234,10 +1252,11 @@ class DonghuaLifeBetaProvider : MainAPI() {
                     headers = headers,
                     timeout = 30L
                 ).text
+                Log.i(TAG, "ED GET ?token label=${source.label} respLen=${resp.length} respHead=${resp.take(200)}")
                 if (resp.isNotBlank() && resp != "{}" && !resp.contains("\"error\"")) {
                     if (emitFromApiResponse(resp, referer, subtitleCallback, callback, defaultLabel = source.label)) return true
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) { Log.w(TAG, "ED failed (${source.label}): ${e.message}") }
         }
 
         return false
@@ -1299,13 +1318,16 @@ class DonghuaLifeBetaProvider : MainAPI() {
         defaultLabel: String = "Server"
     ): Boolean {
         var anyEmitted = false
+        Log.i(TAG, "emitFromApiResponse defaultLabel=$defaultLabel responseLen=${response.length}")
 
         // Intentar parsear como JSON estructurado
         val parsed: SourcesResponse? = try { parseJson<SourcesResponse>(response) } catch (_: Exception) { null }
 
         if (parsed != null && parsed.sources.isNotEmpty()) {
+            Log.i(TAG, "  Parsed sources: ${parsed.sources.size}")
             for ((idx, source) in parsed.sources.withIndex()) {
                 val srcUrl = source.url ?: source.src ?: source.embedUrl ?: source.iframeUrl ?: ""
+                Log.i(TAG, "  src[$idx]: url=${source.url} src=${source.src} embedUrl=${source.embedUrl} iframeUrl=${source.iframeUrl} label=${source.label} name=${source.name} type=${source.type} quality=${source.quality}")
                 if (srcUrl.isBlank()) continue
 
                 val serverLabel = source.label ?: source.name ?: defaultLabel
@@ -1322,11 +1344,13 @@ class DonghuaLifeBetaProvider : MainAPI() {
                     when {
                         // m3u8 directo
                         type.contains("m3u8") || srcUrl.endsWith(".m3u8") -> {
+                            Log.i(TAG, "  -> m3u8 path: $srcUrl")
                             generateM3u8(serverLabel, srcUrl, referer).forEach(callback)
                             anyEmitted = true
                         }
                         // mp4 directo
                         type.contains("mp4") || srcUrl.endsWith(".mp4") -> {
+                            Log.i(TAG, "  -> mp4 path: $srcUrl")
                             callback(
                                 newExtractorLink(
                                     source = serverLabel,
@@ -1345,11 +1369,19 @@ class DonghuaLifeBetaProvider : MainAPI() {
                         srcUrl.contains("dailymotion.com") || srcUrl.contains("ok.ru") ||
                         srcUrl.contains("vk.com") || srcUrl.contains("vk.ru") ||
                         srcUrl.contains("voe.sx") || srcUrl.contains("filemoon") -> {
-                            loadExtractor(srcUrl, referer, subtitleCallback, callback)
+                            Log.i(TAG, "  -> loadExtractor path (embed): $srcUrl")
+                            // Normalizar Ok.ru videoembed -> video (CS3 OkruExtractor solo reconoce /video/)
+                            val normalizedEmbed = if (srcUrl.contains("ok.ru/videoembed/")) {
+                                srcUrl.replace("ok.ru/videoembed/", "www.ok.ru/video/")
+                            } else if (srcUrl.contains("ok.ru") && !srcUrl.contains("www.ok.ru")) {
+                                srcUrl.replace("ok.ru", "www.ok.ru")
+                            } else srcUrl
+                            loadExtractor(normalizedEmbed, referer, subtitleCallback, callback)
                             anyEmitted = true
                         }
                         // Otros (intentar loadExtractor genérico)
                         else -> {
+                            Log.i(TAG, "  -> loadExtractor path (generic): $srcUrl")
                             try {
                                 loadExtractor(srcUrl, referer, subtitleCallback, callback)
                                 anyEmitted = true
