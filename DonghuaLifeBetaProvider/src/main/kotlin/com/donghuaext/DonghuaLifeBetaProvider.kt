@@ -481,7 +481,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 year = yearInt
                 if (durationMinutes > 0) this.duration = durationMinutes
                 showStatus = showStatus
-                score = ratingScore.extractRatingToInt()
+                score = ratingScore.extractRatingToInt()?.let { Score(it) }
             }
         }
 
@@ -567,7 +567,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
             tags = genres
             year = yearInt
             if (durationMinutes > 0) this.duration = durationMinutes
-            score = ratingScore.extractRatingToInt()
+            score = ratingScore.extractRatingToInt()?.let { Score(it) }
         }
     }
 
