@@ -29,7 +29,7 @@
       "robertozv80"
     ],
     "description": "DonghuaLifeBETA - Donghuas en espa\u00f1ol con subt\u00edtulos",
-    "fileSize": 71938,
+    "fileSize": 75765,
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
     "language": "es",
     "tvTypes": [
@@ -37,7 +37,7 @@
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=donghualife.com&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-da21d3a621c34d5fb5021ace5fa5d0ddabe41e085bd6d0d4cb2d353b17ff8650"
+    "fileHash": "sha256-6de0db3bab8db342c7db26d4ebd92d8502ee772a4ac8f91d08b8c3e6a186a770"
   },
   {
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/DonghuaLifeProvider.cs3",
