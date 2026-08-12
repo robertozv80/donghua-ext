@@ -448,7 +448,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 plot = description
                 tags = genres
                 year = yearInt
-                if (durationMinutes > 0) this.duration = durationMinutes * 60L
+                if (durationMinutes > 0) this.duration = durationMinutes * 60
                 showStatus = showStatus
             }
         }
@@ -505,7 +505,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
             plot = description
             tags = genres
             year = yearInt
-            if (durationMinutes > 0) this.duration = durationMinutes * 60L
+            if (durationMinutes > 0) this.duration = durationMinutes * 60
         }
     }
 
