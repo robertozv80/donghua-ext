@@ -481,7 +481,9 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 year = yearInt
                 if (durationMinutes > 0) this.duration = durationMinutes
                 showStatus = showStatus
-                score = ratingScore.extractRatingToInt()?.let { Score(it) }
+                // score omitido: la API de CS3 cambió y Score() tiene constructor privado.
+                // Para reactivarlo, usar: score = Score.from10PointScale(ratingScore.toFloat())
+                // (o el factory method que use tu versión de CS3)
             }
         }
 
@@ -567,7 +569,9 @@ class DonghuaLifeBetaProvider : MainAPI() {
             tags = genres
             year = yearInt
             if (durationMinutes > 0) this.duration = durationMinutes
-            score = ratingScore.extractRatingToInt()?.let { Score(it) }
+            // score omitido: la API de CS3 cambió y Score() tiene constructor privado.
+            // Para reactivarlo, usar: score = Score.from10PointScale(ratingScore.toFloat())
+            // (o el factory method que use tu versión de CS3)
         }
     }
 
