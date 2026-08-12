@@ -13,54 +13,17 @@ import java.net.URLEncoder
 import kotlin.collections.ArrayList
 
 /**
- * DonghuaLifeBetaProvider — Provider temporal para https://beta.donghualife.com
+ * DonghuaLifeBetaProvider — Provider para https://beta.donghualife.com
  *
- * ANTECEDENTES:
- *   donghualife.com está migrando a una nueva arquitectura (Next.js 14 + React Server
- *   Components). La beta (https://beta.donghualife.com) ya tiene contenido que el sitio
- *   principal aún no muestra (ej: "Nine Tribulations Burnings Heaven"). Este provider
- *   da acceso a ese contenido nuevo mientras se completa la migración.
- *
- * DIFERENCIAS CLAVE CON EL SITIO PRINCIPAL:
- *   - URLs:     /series/<slug>     (en lugar de /series/<slug>)
- *               /peliculas/<slug>  (en lugar de /movie/<slug>)
- *               /watch/<slug>-<temp>-<ep>  (en lugar de /episode/<slug>-<temp>-episodio-x<ep>)
- *   - HTML:     Next.js 14 con Tailwind CSS. Clases utilitarias, no semánticas.
- *   - Imágenes: Servidas via /_next/image?url=<path>&w=<w>&q=75 (optimización on-the-fly).
- *   - Servidores: Lista embebida en RSC payload (#5 típicamente) con tokens encriptados
- *                 (AES-256-CBC + HMAC-SHA256). El backend expone /api/sources que acepta
- *                 POST con {"movieId":"<uuid>"} o {"episodeId":"<uuid>"} y devuelve las
- *                 URLs desencriptadas.
- *   - Rating:    Visible solo en la página de Rankings (ej: 4.6, 30 votos). No aparece
- *                 en listados de series/películas. Se incorpora al título cuando está
- *                 disponible (formato: "Title • ★4.6 (30 votos)").
- *
- * SECCIONES DEL GRID PRINCIPAL (según solicitud del usuario):
- *   1. Últimos Episodios (home, episodios recientes con link /watch/...)
- *   2. Recomendaciones  (home, "TE RECOMENDAMOS PARA VOS")
- *   3. Tendencias       (home, "TENDENCIAS" — ranking #1-#10)
- *   4. Ranking          (/rankings — ranking completo con puntuación)
- *   5. Series           (/series?sort=latest — listado paginado)
- *   6. Películas        (/peliculas?sort=newest — listado paginado)
- *
- * EXTRACCIÓN DE VIDEO (loadLinks):
- *   1. La página de detalle (pelicula/episodio) incluye un RSC payload con la lista
- *      de servidores: [{id, label, name, token, type, provider, ...}, ...]
- *      - token = base64(JSON{iv, data, sig})  — payload encriptado AES-256-CBC
- *   2. La misma página incluye el UUID del contenido: "movieId":"<uuid>" o
- *      "episodeId":"<uuid>" embebido en el RSC payload.
- *   3. Se hace POST a /api/sources con JSON body {"movieId":"<uuid>"} o
- *      {"episodeId":"<uuid>"}. El backend desencripta los tokens y devuelve:
- *        {"success":true, "sources":[{"url":"https://...","quality":"720p","type":"mp4"}, ...]}
- *   4. Cada source se convierte en ExtractorLink. Si el source es un embed
- *      (rumble, streamable, dailymotion, ok.ru), se invoca loadExtractor nativo
- *      de CS3 con la URL ya desencriptada.
- *
- * NOTA: Como no se pudo verificar el formato exacto del response de /api/sources
- * (la página solo hace POST y no se puede probar GET), el código es defensivo:
- * intenta varios formatos de respuesta (sources[], data.sources[], url directa)
- * y múltiples claves (url, src, embedUrl, iframeUrl). Si falla, registra un error
- * y continúa con el siguiente servidor.
+ * v2 (2026-08-12): Correcciones tras pruebas en app real:
+ *   - Homepage: selectores por #id (más confiables que h2.section-title)
+ *   - Series load(): usa JSON seasons[] del RSC payload (no scrapea /watch/ links,
+ *     evitando picks erróneos de botones "Capítulo 1" y "Ver Último")
+ *   - Episode loadLinks(): parsea JSON del episodio page y obtiene servers[] directos
+ *     (NO usa /api/sources para episodios — las URLs están en plano en el JSON)
+ *   - Movie loadLinks(): prueba GET /api/sources?movieId=<uuid> primero, POST como fallback
+ *   - Detalle: agrega status (En Emisión/Finalizado) y fecha desde HTML visible
+ *   - Search: prueba múltiples URL patterns (/search?q=, /?q=, /api/search?q=)
  */
 class DonghuaLifeBetaProvider : MainAPI() {
 
@@ -97,17 +60,31 @@ class DonghuaLifeBetaProvider : MainAPI() {
         }
     }
 
-    /**
-     * Extrae la ruta real de la imagen desde una URL de Next.js Image Optimization:
-     *   /_next/image?url=%2Fimages%2Fwebp%2Ffoo.webp&w=3840&q=75
-     * devuelve:
-     *   /images/webp/foo.webp
-     * Si la URL no tiene el formato /_next/image?url=..., se devuelve tal cual.
-     */
     private fun extractNextImagePath(imgSrc: String): String {
         val decoded = URLDecoder.decode(imgSrc, "UTF-8")
         val paramMatch = Regex("""url=([^&]+)""").find(decoded)
         return paramMatch?.groupValues?.get(1) ?: decoded
+    }
+
+    /**
+     * Extrae y decodifica todos los payloads self.__next_f.push([1,"..."]) del HTML.
+     * Retorna el texto combinado con escapes JS resueltos (\" -> ", \\ -> \, etc.).
+     */
+    private fun extractRscPayload(html: String): String {
+        val payloadPattern = Regex("""self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)""")
+        val payloads = payloadPattern.findAll(html).map { it.groupValues[1] }.toList()
+        val sb = StringBuilder()
+        for (p in payloads) {
+            val decoded = try {
+                p.replace("\\\"", "\"")
+                    .replace("\\\\", "\\")
+                    .replace("\\n", "\n")
+                    .replace("\\/", "/")
+                    .replace("\\u0026", "&")
+            } catch (_: Exception) { p }
+            sb.append(decoded)
+        }
+        return sb.toString()
     }
 
     // =========================== PÁGINA PRINCIPAL ===========================
@@ -118,125 +95,88 @@ class DonghuaLifeBetaProvider : MainAPI() {
         var hasNext = false
 
         when {
-            // ====== Sección 1: ÚLTIMOS EPISODIOS (home, episodios recientes) ======
-            // Anclaje: section-title = "ÚLTIMOS EPISODIOS"
-            // Cards: <a class="group..." href="/watch/<slug>-<temp>-<ep>">
+            // ====== Sección 1: ÚLTIMOS EPISODIOS (home) ======
+            // Selectores por #id (más confiable que h2.section-title que no existe)
+            // Estructura: <div id="latest-episodes-scroll"><a class="group block..." href="/watch/...">
             url.endsWith("/") && !url.contains("#") -> {
                 val doc = app.get(url, timeout = 60).document
-                // Buscar la sección ÚLTIMOS EPISODIOS por el h2.section-title
-                val targetH2 = doc.select("h2.section-title").find { it.text().contains("ÚLTIMOS EPISODIOS", ignoreCase = true) }
-                if (targetH2 != null) {
-                    // Las cards están en un wrapper hermano de section-header
-                    val sectionHeader = targetH2.parent() // div.section-header
-                    val wrapper = sectionHeader?.parent() // div py-8
-                    if (wrapper != null) {
-                        // Solo capturar los <a class="group"> con href /watch/
-                        wrapper.select("a.group[href*='/watch/']").forEach { a ->
-                            val href = a.attr("href")
-                            // Texto visible: "EP 40 Peerless Divine Emperor hace 2 min · Capítulo 40"
-                            val fullText = a.text().trim()
-                            // Extraer número de episodio del texto
-                            val epNum = Regex("""EP\s*(\d+)""", RegexOption.IGNORE_CASE).find(fullText)
-                                ?.groupValues?.get(1)?.toIntOrNull()
-                            // Extraer título (entre "EP N " y " hace X ")
-                            val title = Regex("""EP\s*\d+\s*(.+?)\s+hace\s""", RegexOption.IGNORE_CASE)
-                                .find(fullText)?.groupValues?.get(1)?.trim() ?: fullText
-                            // Poster (de la <img> interna)
-                            val poster = a.selectFirst("img")?.attr("src")?.let { resolveUrl(extractNextImagePath(it)) }
-                            // Para episodios, la URL se pasa directamente (load() detecta /watch/ y procesa como episodio)
-                            home.add(
-                                newAnimeSearchResponse(title, resolveUrl(href), TvType.Anime) {
-                                    this.posterUrl = poster
-                                    if (epNum != null) addDubStatus(DubStatus.Subbed, epNum)
-                                }
-                            )
+                doc.select("#latest-episodes-scroll a[href*='/watch/']").forEach { a ->
+                    val href = a.attr("href")
+                    // El título está en <p class="line-clamp-2..."> dentro del <a>
+                    val title = a.selectFirst("p.line-clamp-2")?.text()?.trim()
+                        ?: a.selectFirst("img")?.attr("alt")?.trim()
+                        ?: href.substringAfterLast("/").replace("-", " ")
+                    // Número de episodio: badge <span>EP 152</span> o del href
+                    val epBadge = a.selectFirst("span")?.text()?.trim() ?: ""
+                    val epNum = Regex("""EP\s*(\d+)""", RegexOption.IGNORE_CASE).find(epBadge)
+                        ?.groupValues?.get(1)?.toIntOrNull()
+                        ?: Regex("""/(?:watch/)?(?:[^/]+-)*(\d+)$""").find(href)?.groupValues?.get(1)?.toIntOrNull()
+                    val poster = a.selectFirst("img")?.attr("src")?.let { resolveUrl(extractNextImagePath(it)) }
+                    home.add(
+                        newAnimeSearchResponse(title, resolveUrl(href), TvType.Anime) {
+                            this.posterUrl = poster
+                            if (epNum != null) addDubStatus(DubStatus.Subbed, epNum)
                         }
-                    }
+                    )
                 }
-                hasNext = false  // Home no tiene paginación
+                hasNext = false
             }
 
-            // ====== Sección 2: RECOMENDACIONES (home, "TE RECOMENDAMOS PARA VOS") ======
+            // ====== Sección 2: RECOMENDACIONES (home) ======
             url.endsWith("#recomendaciones") -> {
                 val doc = app.get("$mainUrl/", timeout = 60).document
-                val targetH2 = doc.select("h2.section-title").find { it.text().contains("RECOMENDAMOS", ignoreCase = true) }
-                if (targetH2 != null) {
-                    val wrapper = targetH2.parent()?.parent()
-                    wrapper?.select("a[href^='/series/']")?.forEach { a ->
-                        val href = a.attr("href")
-                        val title = a.selectFirst("img")?.attr("alt")?.trim()
-                            ?: a.selectFirst("p")?.text()?.trim()
-                            ?: href.substringAfterLast("/")
-                        val poster = a.selectFirst("img")?.attr("src")?.let { resolveUrl(extractNextImagePath(it)) }
-                        if (title.isNotBlank()) {
-                            home.add(
-                                newAnimeSearchResponse(title, resolveUrl(href), TvType.Anime) {
-                                    this.posterUrl = poster
-                                    addDubStatus(DubStatus.Subbed)
-                                }
-                            )
-                        }
+                doc.select("#recommended-scroll a[href^='/series/']").forEach { a ->
+                    val href = a.attr("href")
+                    val title = a.selectFirst("img")?.attr("alt")?.trim()
+                        ?: a.selectFirst("p")?.text()?.trim()
+                        ?: href.substringAfterLast("/")
+                    val poster = a.selectFirst("img")?.attr("src")?.let { resolveUrl(extractNextImagePath(it)) }
+                    if (title.isNotBlank()) {
+                        home.add(
+                            newAnimeSearchResponse(title, resolveUrl(href), TvType.Anime) {
+                                this.posterUrl = poster
+                                addDubStatus(DubStatus.Subbed)
+                            }
+                        )
                     }
                 }
                 hasNext = false
             }
 
-            // ====== Sección 3: TENDENCIAS (home, "TENDENCIAS" — ranking #1-#10) ======
+            // ====== Sección 3: TENDENCIAS (home, ranking #1-#10) ======
             url.endsWith("#tendencias") -> {
                 val doc = app.get("$mainUrl/", timeout = 60).document
-                val targetH2 = doc.select("h2.section-title").find { it.text().contains("TENDENCIAS", ignoreCase = true) }
-                if (targetH2 != null) {
-                    val wrapper = targetH2.parent()?.parent()
-                    wrapper?.select("a[href^='/series/']")?.forEach { a ->
-                        val href = a.attr("href")
-                        // El texto incluye "# 1 Alquimia Suprema" — extraer el ranking
-                        val fullText = a.text().replace(Regex("\\s+"), " ").trim()
-                        val rankMatch = Regex("""#\s*(\d+)\s*(.+)""").find(fullText)
-                        val (rank, title) = if (rankMatch != null) {
-                            rankMatch.groupValues[1].toIntOrNull() to rankMatch.groupValues[2].trim()
-                        } else null to fullText
-                        val poster = a.selectFirst("img")?.attr("src")?.let { resolveUrl(extractNextImagePath(it)) }
-                        // Mostrar ranking en el título si está disponible
-                        val displayTitle = if (rank != null) "#$rank $title" else title
-                        if (title.isNotBlank()) {
-                            home.add(
-                                newAnimeSearchResponse(displayTitle, resolveUrl(href), TvType.Anime) {
-                                    this.posterUrl = poster
-                                    addDubStatus(DubStatus.Subbed)
-                                }
-                            )
+                doc.select("#trending-scroll a[href^='/series/']").forEach { a ->
+                    val href = a.attr("href")
+                    val title = a.selectFirst("img")?.attr("alt")?.trim()
+                        ?: a.selectFirst("p")?.text()?.trim()
+                        ?: href.substringAfterLast("/")
+                    val poster = a.selectFirst("img")?.attr("src")?.let { resolveUrl(extractNextImagePath(it)) }
+                    home.add(
+                        newAnimeSearchResponse(title, resolveUrl(href), TvType.Anime) {
+                            this.posterUrl = poster
+                            addDubStatus(DubStatus.Subbed)
                         }
-                    }
+                    )
                 }
                 hasNext = false
             }
 
             // ====== Sección 4: RANKING (/rankings) ======
-            // Cards: <a class="flex items-center gap-4..." href="/series/<slug>">
-            // Rating: <span class="font-black">4.6</span>  +  <span class="text-muted">30 votos</span>
             url.contains("/rankings") -> {
                 val doc = app.get(url, timeout = 60).document
-                // Las cards del ranking son <a> con clase "flex items-center gap-4"
-                doc.select("a.flex.items-center").forEach { a ->
+                doc.select("a[href^='/series/']").forEach { a ->
                     val href = a.attr("href")
-                    // Filtrar enlaces no válidos (ej: botón "back to home" con href="/")
                     if (!href.startsWith("/series/")) return@forEach
                     val title = a.selectFirst("h2")?.text()?.trim() ?: return@forEach
                     val poster = a.selectFirst("img")?.attr("src")?.let { resolveUrl(extractNextImagePath(it)) }
-                    // Buscar score y votos
-                    val scoreSpans = a.select("span.font-black, span.text-base")
+                    // Rating: <span class="font-black">4.6</span> + <span class="text-muted">30 votos</span>
                     var score: String? = null
-                    var votes: String? = null
-                    for (s in scoreSpans) {
+                    a.select("span").forEach { s ->
                         val txt = s.text().trim()
                         if (txt.matches(Regex("""\d+\.\d+"""))) score = txt
                     }
-                    val votesSpan = a.selectFirst("span.text-muted")
-                    if (votesSpan != null) {
-                        val v = votesSpan.text().trim()
-                        if (v.matches(Regex("""\d+\s*votos"""))) votes = v
-                    }
-                    // Mostrar puntuación en el título
+                    val votes = a.selectFirst("span.text-muted")?.text()?.trim()
                     val displayTitle = when {
                         score != null && votes != null -> "$title • ★$score ($votes)"
                         score != null -> "$title • ★$score"
@@ -249,7 +189,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
                         }
                     )
                 }
-                hasNext = false  // Ranking no tiene paginación (top 10)
+                hasNext = false
             }
 
             // ====== Sección 5: SERIES (/series?sort=latest) ======
@@ -262,22 +202,17 @@ class DonghuaLifeBetaProvider : MainAPI() {
                         ?: a.selectFirst("p.font-black")?.text()?.trim()
                         ?: href.substringAfterLast("/")
                     val poster = a.selectFirst("img")?.attr("src")?.let { resolveUrl(extractNextImagePath(it)) }
-                    // Estado (En Emisión, Finalizado)
-                    val statusText = a.selectFirst("span[class*=backdrop-blur]")?.text()?.trim()
-                    val dubstat = if (statusText?.contains("Finalizado", ignoreCase = true) == true) DubStatus.Subbed else DubStatus.Subbed
-                    // Conteo de episodios y último episodio (opcional)
                     val epsText = a.select("p.tracking-widest").lastOrNull()?.text()?.trim() ?: ""
                     val lastEpMatch = Regex("""Ep\s*(\d+)""", RegexOption.IGNORE_CASE).find(epsText)
                     val lastEp = lastEpMatch?.groupValues?.get(1)?.toIntOrNull()
                     home.add(
                         newAnimeSearchResponse(title, resolveUrl(href), TvType.Anime) {
                             this.posterUrl = poster
-                            if (lastEp != null) addDubStatus(dubstat, lastEp)
-                            else addDubStatus(dubstat)
+                            if (lastEp != null) addDubStatus(DubStatus.Subbed, lastEp)
+                            else addDubStatus(DubStatus.Subbed)
                         }
                     )
                 }
-                // Paginación: hay <a href="/series?page=N+1">Sig</a>
                 hasNext = doc.select("a[href*='/series?page=']:last-child").isNotEmpty() ||
                            doc.select("a:contains(Sig)").isNotEmpty()
             }
@@ -313,23 +248,61 @@ class DonghuaLifeBetaProvider : MainAPI() {
     // =========================== BÚSQUEDA ===========================
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val doc = app.get("$mainUrl/?q=${URLEncoder.encode(query, "UTF-8")}", timeout = 60).document
         val results = ArrayList<SearchResponse>()
-        // Las series y películas aparecen como <a class="poster-card" href="/series/..." o "/peliculas/..."
-        doc.select("a.poster-card").forEach { a ->
-            val href = a.attr("href")
-            if (!href.startsWith("/series/") && !href.startsWith("/peliculas/")) return@forEach
-            val title = a.selectFirst("img")?.attr("alt")?.trim()
-                ?: a.selectFirst("p.font-black")?.text()?.trim()
-                ?: return@forEach
-            val poster = a.selectFirst("img")?.attr("src")?.let { resolveUrl(extractNextImagePath(it)) }
-            val tvType = if (href.startsWith("/peliculas/")) TvType.AnimeMovie else TvType.Anime
-            results.add(
-                newAnimeSearchResponse(title, resolveUrl(href), tvType) {
-                    this.posterUrl = poster
-                    addDubStatus(DubStatus.Subbed)
+        val encodedQuery = URLEncoder.encode(query, "UTF-8")
+
+        // Probar múltiples URL patterns (no sabemos cuál usa el sitio)
+        val searchUrls = listOf(
+            "$mainUrl/search?q=$encodedQuery",
+            "$mainUrl/?q=$encodedQuery",
+            "$mainUrl/api/search?q=$encodedQuery",
+        )
+
+        for (searchUrl in searchUrls) {
+            try {
+                val response = app.get(searchUrl, timeout = 30)
+                val doc = response.document
+                val html = doc.html()
+
+                // Si es JSON (API), parsearlo
+                if (searchUrl.contains("/api/") || response.text.trimStart().startsWith("[")) {
+                    val text = response.text
+                    val jsonResults = Regex(""""url":"(/(?:series|peliculas)/[^"]+)"""").findAll(text).toList()
+                    if (jsonResults.isNotEmpty()) {
+                        for (m in jsonResults) {
+                            val href = m.groupValues[1]
+                            val title = Regex(""""title":"([^"]+)"""").find(text)?.groupValues?.get(1)
+                                ?: href.substringAfterLast("/").replace("-", " ")
+                            val tvType = if (href.startsWith("/peliculas/")) TvType.AnimeMovie else TvType.Anime
+                            results.add(
+                                newAnimeSearchResponse(title, resolveUrl(href), tvType) {
+                                    addDubStatus(DubStatus.Subbed)
+                                }
+                            )
+                        }
+                        if (results.isNotEmpty()) return results
+                    }
                 }
-            )
+
+                // HTML: buscar cards de series/películas
+                doc.select("a.poster-card[href^='/series/'], a.poster-card[href^='/peliculas/']").forEach { a ->
+                    val href = a.attr("href")
+                    val title = a.selectFirst("img")?.attr("alt")?.trim()
+                        ?: a.selectFirst("p.font-black")?.text()?.trim()
+                        ?: return@forEach
+                    val poster = a.selectFirst("img")?.attr("src")?.let { resolveUrl(extractNextImagePath(it)) }
+                    val tvType = if (href.startsWith("/peliculas/")) TvType.AnimeMovie else TvType.Anime
+                    results.add(
+                        newAnimeSearchResponse(title, resolveUrl(href), tvType) {
+                            this.posterUrl = poster
+                            addDubStatus(DubStatus.Subbed)
+                        }
+                    )
+                }
+                if (results.isNotEmpty()) return results
+            } catch (_: Exception) {
+                continue
+            }
         }
         return results
     }
@@ -341,19 +314,15 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val isWatch = url.contains("/watch/")
         val isSeries = url.contains("/series/")
 
-        // Si la URL es /watch/<slug>-<temp>-<ep>, necesitamos resolver la serie a la que pertenece.
-        // El formato es: /watch/<series-slug>-<temp>-<ep>
-        // Para series con slug que termina en número (ej: "swallowed-star-3"), necesitamos
-        // separar correctamente. La serie es todo hasta "-<digito>-<digito>$".
+        // Si la URL es /watch/<slug>-<temp>-<ep>, resolver a la serie
         val seriesUrl = if (isWatch) {
             val path = url.substringAfter("/watch/")
-            // Quitar los dos últimos segmentos "-<temp>-<ep>"
             val match = Regex("""^(.+)-(\d+)-(\d+)$""").find(path)
             if (match != null) {
                 val slug = match.groupValues[1]
                 "$mainUrl/series/$slug"
             } else {
-                url  // fallback
+                url
             }
         } else {
             url
@@ -361,12 +330,9 @@ class DonghuaLifeBetaProvider : MainAPI() {
 
         val doc = app.get(seriesUrl, timeout = 60).document
         val html = doc.html()
+        val rscPayload = extractRscPayload(html)
 
         // ====== Metadata desde JSON-LD schema.org ======
-        // Ejemplo:
-        //   {"@context":"https://schema.org","@type":"Movie","name":"...",
-        //    "description":"...","image":"/uploads/images/...jpg","url":"...",
-        //    "datePublished":"2026-08-09T00:00:00.000Z","productionCompany":{"name":"Tencent"}}
         val jsonLdPattern = Regex(
             """<script[^>]*type=["']application/ld\+json["'][^>]*>(.*?)</script>""",
             RegexOption.DOT_MATCHES_ALL
@@ -377,6 +343,9 @@ class DonghuaLifeBetaProvider : MainAPI() {
         var jsonLdImage = ""
         var jsonLdDate = ""
         var jsonLdStudio = ""
+        var jsonLdGenres = listOf<String>()
+        var jsonLdNumEps = 0
+        var jsonLdNumSeasons = 0
         if (jsonLdMatch != null) {
             try {
                 val json = parseJson<JsonLdMeta>(jsonLdMatch.groupValues[1].trim())
@@ -385,37 +354,54 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 jsonLdImage = json.image ?: ""
                 jsonLdDate = json.datePublished?.substringBefore("T") ?: ""
                 jsonLdStudio = json.productionCompany?.name?.trim() ?: ""
+                jsonLdGenres = json.genre ?: emptyList()
+                jsonLdNumEps = json.numberOfEpisodes ?: 0
+                jsonLdNumSeasons = json.numberOfSeasons ?: 0
             } catch (_: Exception) {}
         }
 
-        // ====== Metadata desde HTML (fallback) ======
+        // ====== Metadata desde HTML ======
         val title = jsonLdName.ifBlank {
             doc.selectFirst("h1")?.text()?.trim() ?: ""
         }
         val description = jsonLdDescription.ifBlank {
-            doc.selectFirst("[class*=description i], [class*=synopsis i], [class*=plot i]")?.text()?.trim() ?: ""
+            doc.selectFirst("[class*=description i], [class*=synopsis i]")?.text()?.trim() ?: ""
         }
         val poster = if (jsonLdImage.isNotBlank()) {
             resolveUrl(jsonLdImage)
         } else {
             doc.selectFirst("img[alt]")?.attr("src")?.let { resolveUrl(extractNextImagePath(it)) } ?: ""
         }
+        val genres = ArrayList<String>(jsonLdGenres)
+        if (jsonLdStudio.isNotBlank() && jsonLdStudio !in genres) genres.add(jsonLdStudio)
 
-        // ====== Géneros (si existen en el HTML) ======
-        val genres = ArrayList<String>()
-        // Buscar bloques de "Géneros" o "Generos" en el HTML
-        doc.select("a[href^='/genres/']").forEach { a ->
-            val g = a.text().trim()
-            if (g.isNotBlank()) genres.add(g)
+        // ====== Status (En Emisión/Finalizado) desde HTML visible ======
+        // Estructura: <span class="text-xs font-black uppercase tracking-widest">En Emisión</span>
+        var showStatus: ShowStatus? = null
+        val statusSpans = doc.select("span.text-xs.font-black.uppercase.tracking-widest")
+        for (s in statusSpans) {
+            val txt = s.text().trim()
+            when {
+                txt.contains("Emisión", ignoreCase = true) -> { showStatus = ShowStatus.Ongoing; break }
+                txt.contains("Pausa", ignoreCase = true) -> { showStatus = ShowStatus.Ongoing; break }
+                txt.contains("Finalizado", ignoreCase = true) -> { showStatus = ShowStatus.Completed; break }
+            }
         }
-        if (jsonLdStudio.isNotBlank()) genres.add(jsonLdStudio)
+
+        // ====== Fecha de estreno desde HTML (formato "7 Marzo, 2020") ======
+        var releaseDate = ""
+        for (s in statusSpans) {
+            val txt = s.text().trim()
+            // Patrón: día + mes + año (acepta "7 Marzo, 2020", "15 Enero 2025", etc.)
+            if (Regex("""\d+\s+[A-Za-záéíóú]+,?\s+\d{4}""").matches(txt)) {
+                releaseDate = txt
+                break
+            }
+        }
 
         // ====== Si es película, devolver MovieLoadResponse ======
         if (isMovie) {
-            // Buscar el movieId en el RSC payload (para usarlo en loadLinks)
-            val movieId = extractMovieOrEpisodeId(html, "movieId") ?: ""
-            // Construir URL "compuesta" para loadLinks: pasamos movieId como queryparam
-            // Caso especial: si la URL original es /peliculas/<slug>, pasamos URL+?movieId=<uuid>
+            val movieId = extractContentIdFromPayload(rscPayload, "movieId") ?: ""
             val dataUrl = if (movieId.isNotBlank()) {
                 "$seriesUrl##movieId=$movieId"
             } else {
@@ -423,35 +409,50 @@ class DonghuaLifeBetaProvider : MainAPI() {
             }
             return newMovieLoadResponse(title, dataUrl, TvType.AnimeMovie, dataUrl) {
                 posterUrl = poster
-                plot = description
+                plot = buildPlot(description, releaseDate, jsonLdNumEps, jsonLdNumSeasons, showStatus)
                 tags = genres
-                year = jsonLdDate.takeIf { it.isNotBlank() }?.toIntOrNull()
+                year = releaseDate.substringAfterLast(",").trim().toIntOrNull()
+                    ?: jsonLdDate.takeIf { it.isNotBlank() }?.substring(0, 4)?.toIntOrNull()
             }
         }
 
-        // ====== Si es serie, extraer temporadas y episodios ======
-        // Para series, los episodios están listados en la página de detalle o en
-        // sub-páginas por temporada. Beta usa /watch/<slug>-<temp>-<ep>.
-        // Sin tener un dump de una página de serie de la beta, asumimos estructura
-        // similar a películas: cada "episodio" es un <a href="/watch/...">
+        // ====== Si es serie, extraer temporadas y episodios desde JSON seasons[] ======
         val episodes = ArrayList<Episode>()
+        val seasons = extractSeasonsFromPayload(rscPayload)
 
-        // Método 1: episodios listados directamente en la página de serie
-        // (cards <a href="/watch/<slug>-<temp>-<ep>">)
-        val watchLinks = doc.select("a[href*='/watch/']")
-        if (watchLinks.isNotEmpty()) {
-            val seen = mutableSetOf<String>()
-            for (a in watchLinks) {
+        for ((idx, season) in seasons.withIndex()) {
+            val seasonNum = idx + 1
+            val seasonSlug = season.slug
+            val episodeCount = season.episodeCount
+            val firstEpNum = season.firstEpisodeNumber
+
+            if (firstEpNum > 0 && episodeCount > 0) {
+                // Construir URLs /watch/{seasonSlug}-{N} para cada episodio
+                for (epOffset in 0 until episodeCount) {
+                    val epNum = firstEpNum + epOffset
+                    val epUrl = "$mainUrl/watch/$seasonSlug-$epNum"
+                    episodes.add(
+                        newEpisode(epUrl) {
+                            this.season = seasonNum
+                            this.episode = epNum
+                            this.name = "Episodio $epNum"
+                        }
+                    )
+                }
+            }
+        }
+
+        // Fallback: si no encontramos seasons en JSON, scrapear /watch/ links del HTML
+        // (excluyendo botones de navegación "Capítulo 1" y "Ver Último")
+        if (episodes.isEmpty()) {
+            // Seleccionar SOLO cards de episodios (clase aspect-video), no botones
+            doc.select("a.aspect-video[href*='/watch/']").forEach { a ->
                 val href = a.attr("href")
-                if (href in seen) continue
-                seen.add(href)
-                // Parse: /watch/<slug>-<temp>-<ep>
                 val match = Regex("""/watch/(.+)-(\d+)-(\d+)$""").find(href)
                 if (match != null) {
                     val seasonNum = match.groupValues[2].toIntOrNull() ?: 1
-                    val epNum = match.groupValues[3].toIntOrNull() ?: continue
-                    // Texto del episodio (título opcional)
-                    val epTitle = a.text().trim().takeIf { it.isNotBlank() }
+                    val epNum = match.groupValues[3].toIntOrNull() ?: return@forEach
+                    val epTitle = a.selectFirst("img")?.attr("alt")?.trim()
                     episodes.add(
                         newEpisode(resolveUrl(href)) {
                             this.season = seasonNum
@@ -463,94 +464,97 @@ class DonghuaLifeBetaProvider : MainAPI() {
             }
         }
 
-        // Método 2 (fallback): Si no encontramos episodios en la página de serie,
-        // puede ser que la serie tenga múltiples temporadas listadas como enlaces.
-        // Buscar patrones adicionales: <a href="/series/<slug>-<temp>"> para temporadas.
-        // (Esto se probará con dumps reales de series en la siguiente iteración.)
-
-        // Extraer episodeId del RSC payload si está presente
-        val episodeId = extractMovieOrEpisodeId(html, "episodeId") ?: ""
-
         return newAnimeLoadResponse(title, seriesUrl, TvType.Anime) {
             posterUrl = poster
             addEpisodes(DubStatus.Subbed, episodes.sortedWith(compareBy({ it.season }, { it.episode })))
-            plot = description
+            showStatus = showStatus
+            plot = buildPlot(description, releaseDate, jsonLdNumEps, jsonLdNumSeasons, showStatus)
             tags = genres
-            year = jsonLdDate.takeIf { it.isNotBlank() }?.toIntOrNull()
+            year = releaseDate.substringAfterLast(",").trim().toIntOrNull()
+                ?: jsonLdDate.takeIf { it.isNotBlank() }?.substring(0, 4)?.toIntOrNull()
         }
     }
 
-    /**
-     * Extrae el UUID del contenido desde el RSC payload de Next.js.
-     * Busca patrones como: "movieId":"<uuid>" o "episodeId":"<uuid>"
-     */
-    private fun extractMovieOrEpisodeId(html: String, key: String): String? {
-        val pattern = Regex(""""$key"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"""", RegexOption.IGNORE_CASE)
-        return pattern.find(html)?.groupValues?.get(1)
+    private fun buildPlot(
+        description: String,
+        releaseDate: String,
+        numEps: Int,
+        numSeasons: Int,
+        status: ShowStatus?
+    ): String {
+        val sb = StringBuilder()
+        if (description.isNotBlank()) {
+            sb.append(description)
+            sb.append("\n\n")
+        }
+        val meta = mutableListOf<String>()
+        if (releaseDate.isNotBlank()) meta.add("Estreno: $releaseDate")
+        if (status != null) {
+            val statusStr = when (status) {
+                ShowStatus.Ongoing -> "En Emisión"
+                ShowStatus.Completed -> "Finalizado"
+            }
+            meta.add("Estado: $statusStr")
+        }
+        if (numSeasons > 0) meta.add("Temporadas: $numSeasons")
+        if (numEps > 0) meta.add("Episodios: $numEps")
+        if (meta.isNotEmpty()) {
+            sb.append(meta.joinToString(" • "))
+        }
+        return sb.toString().trim()
     }
 
     /**
-     * Extrae la lista de servidores desde el RSC payload de Next.js.
-     * Cada servidor tiene: id, label, name, token, type, provider, subtitleSupport, isWorking, priority.
-     * Retorna una lista de mapas con los campos relevantes.
+     * Extrae la lista de temporadas desde el RSC payload.
+     * Cada temporada: {slug, label, episodeCount, initialEpisodes: [{number, ...}]}
      */
-    private fun extractServerList(html: String): List<ServerInfo> {
-        // El RSC payload está dentro de self.__next_f.push([1,"..."]) y usa escapes \"
-        val payloadPattern = Regex("""self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)""")
-        val payloads = payloadPattern.findAll(html).map { it.groupValues[1] }.toList()
+    private fun extractSeasonsFromPayload(payload: String): List<SeasonMeta> {
+        val seasons = ArrayList<SeasonMeta>()
+        // Buscar "seasons":[ ... ]
+        val seasonsStart = payload.find("\"seasons\":[")
+        if (seasonsStart < 0) return seasons
 
-        val servers = ArrayList<ServerInfo>()
-        // Patrón para cada servidor dentro del payload (después de unescape de \")
-        // Estructura: {"id":"...","label":"...","name":"...","token":"...","type":"...","provider":"...","subtitleSupport":"...","isWorking":true/false,"priority":N}
-        val serverPattern = Regex(
-            """\{[^{}]*?"id":"([^"]+)"[^{}]*?"label":"([^"]+)"[^{}]*?"name":"([^"]+)"[^{}]*?"token":"([^"]+)"[^{}]*?"type":"([^"]+)"[^{}]*?"provider":"([^"]+)"[^{}]*?"subtitleSupport":"([^"]+)"[^{}]*?"isWorking":(true|false)[^{}]*?"priority":(\d+)[^{}]*?\}""",
-            RegexOption.DOT_MATCHES_ALL
+        // Encontrar el cierre del array
+        var depth = 0
+        var i = seasonsStart + "\"seasons\":[".length
+        val start = i
+        while (i < payload.length) {
+            when (payload[i]) {
+                '[' -> depth++
+                ']' -> { if (depth == 0) break else depth-- }
+            }
+            i++
+        }
+        val seasonsArrayStr = payload.substring(start, i)
+
+        // Extraer metadata de cada temporada: {slug, label, episodeCount, firstEpNumber}
+        // Patrón: {"id":"...","slug":"<slug>","label":"<label>","coverImage":"...","isSpecial":false,"episodeCount":<N>,"initialEpisodes":[{"id":"...","title":"...","number":<N>,...
+        val seasonPattern = Regex(
+            """\{"id":"[^"]+","slug":"([^"]+)","label":"([^"]+)","coverImage":"[^"]+","isSpecial":(?:true|false),"episodeCount":(\d+),"initialEpisodes":\[\{"id":"[^"]+","title":"[^"]+","number":(\d+)"""
         )
-
-        for (p in payloads) {
-            // Unescape JS string escapes: \" -> ", \\ -> \, \n -> newline, etc.
-            val decoded = try {
-                p.replace("\\\"", "\"").replace("\\\\", "\\").replace("\\n", "\n").replace("\\/", "/")
-            } catch (_: Exception) { p }
-            for (m in serverPattern.findAll(decoded)) {
-                val (id, label, name, token, type_, provider, sub, working, prio) = m.destructured
-                if (working != "true") continue  // Solo servidores funcionales
-                servers.add(
-                    ServerInfo(
-                        id = id,
-                        label = label,
-                        name = name,
-                        token = token,
-                        type = type_,
-                        provider = provider,
-                        subtitleSupport = sub,
-                        priority = prio.toIntOrNull() ?: 99,
-                    )
+        for (m in seasonPattern.findAll(seasonsArrayStr)) {
+            val (slug, label, countStr, firstEpStr) = m.destructured
+            seasons.add(
+                SeasonMeta(
+                    slug = slug,
+                    label = label,
+                    episodeCount = countStr.toIntOrNull() ?: 0,
+                    firstEpisodeNumber = firstEpStr.toIntOrNull() ?: 1,
                 )
-            }
-            if (servers.isNotEmpty()) break  // Solo necesitamos el primer payload que tenga servers
+            )
         }
-        return servers.sortedBy { it.priority }
+        return seasons
     }
 
+    private fun String.find(needle: String): Int = this.indexOf(needle)
+
     /**
-     * Extrae el movieId o episodeId (UUID) desde el RSC payload.
-     * El payload contiene: "movieId":"<uuid>" o "episodeId":"<uuid>"
+     * Extrae movieId o episodeId (UUID) desde el RSC payload decodificado.
      */
-    private fun extractContentId(html: String): Pair<String, String>? {
-        // Devuelve (tipo, uuid) donde tipo es "movieId" o "episodeId"
-        val payloadPattern = Regex("""self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)""")
-        val payloads = payloadPattern.findAll(html).map { it.groupValues[1] }.toList()
-        for (p in payloads) {
-            val decoded = try {
-                p.replace("\\\"", "\"").replace("\\\\", "\\").replace("\\/", "/")
-            } catch (_: Exception) { p }
-            for (key in listOf("movieId", "episodeId")) {
-                val m = Regex(""""$key"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"""", RegexOption.IGNORE_CASE).find(decoded)
-                if (m != null) return key to m.groupValues[1]
-            }
-        }
-        return null
+    private fun extractContentIdFromPayload(payload: String, key: String): String? {
+        // Construir regex: "$key":"<uuid>" — usar escapeRegex para el key (que es literal)
+        val pattern = Regex(""""$key"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"""", RegexOption.IGNORE_CASE)
+        return pattern.find(payload)?.groupValues?.get(1)
     }
 
     // =========================== LOAD LINKS ===========================
@@ -561,16 +565,6 @@ class DonghuaLifeBetaProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // data puede ser:
-        //   1. URL de película con anchor: https://beta.donghualife.com/peliculas/<slug>##movieId=<uuid>
-        //   2. URL de episodio: https://beta.donghualife.com/watch/<slug>-<temp>-<ep>
-        // En ambos casos, necesitamos:
-        //   - Fetch del HTML
-        //   - Extraer movieId o episodeId del RSC payload
-        //   - Extraer lista de servidores del RSC payload
-        //   - POST a /api/sources con {"movieId":"<uuid>"} o {"episodeId":"<uuid>"}
-        //   - Parsear response y emitir ExtractorLink por cada fuente
-
         // Limpiar la URL: quitar el anchor ##movieId= si lo trae
         val (cleanUrl, preloadedContentId) = if (data.contains("##")) {
             val parts = data.split("##")
@@ -580,49 +574,139 @@ class DonghuaLifeBetaProvider : MainAPI() {
             data to ""
         }
 
-        val doc = app.get(cleanUrl, timeout = 60).document
-        val html = doc.html()
+        val response = app.get(cleanUrl, timeout = 60)
+        val html = response.text
+        val rscPayload = extractRscPayload(html)
 
-        // Identificar el contentId (movieId o episodeId)
-        val contentPair = if (preloadedContentId.isNotBlank()) {
-            // Para películas, el anchor ya trae el movieId
-            "movieId" to preloadedContentId
+        val isMovie = cleanUrl.contains("/peliculas/")
+
+        if (isMovie) {
+            return loadMovieLinks(cleanUrl, preloadedContentId, rscPayload, subtitleCallback, callback)
         } else {
-            extractContentId(html) ?: ("" to "")
+            return loadEpisodeLinks(cleanUrl, rscPayload, subtitleCallback, callback)
         }
-        val idKey = contentPair.first
-        val contentUuid = contentPair.second
+    }
 
-        if (contentUuid.isBlank()) {
-            // Sin contentId no podemos llamar a /api/sources
-            return false
+    /**
+     * Para episodios: parsear JSON del /watch/ page y obtener servers[] directos.
+     * Estructura: cada episode object tiene servers: [{name, url}, ...]
+     * Las URLs son directas (rumble.com/embed/..., geo.dailymotion.com/..., etc.)
+     */
+    private suspend fun loadEpisodeLinks(
+        url: String,
+        rscPayload: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        // Buscar todos los servidores de episodios en el payload
+        // Patrón: {"name":"<name>","url":"<url>"}
+        // dentro del contexto de un episodio (servers:[...])
+        val serversPattern = Regex(
+            """"servers":\[([^\]]+)\]"""
+        )
+        val serverEntryPattern = Regex(
+            """\{"name":"([^"]+)","url":"([^"]+)"\}"""
+        )
+
+        val seenUrls = mutableSetOf<String>()
+        var anyEmitted = false
+
+        for (m in serversPattern.findAll(rscPayload)) {
+            val serversArrayStr = m.groupValues[1]
+            for (sm in serverEntryPattern.findAll(serversArrayStr)) {
+                val (rawName, rawUrl) = sm.destructured
+                val serverName = rawName.trim()
+                // Unescape URL
+                val serverUrl = rawUrl
+                    .replace("\\/", "/")
+                    .replace("\\u0026", "&")
+                    .replace("\\\"", "\"")
+
+                if (serverUrl in seenUrls) continue
+                seenUrls.add(serverUrl)
+
+                try {
+                    when {
+                        // Rumble: extractor nativo de CS3 funciona con embed URLs
+                        serverUrl.contains("rumble.com") -> {
+                            extractRumble(serverUrl, url, serverName.ifBlank { "Rumble" }, callback)
+                            anyEmitted = true
+                        }
+                        // Dailymotion: usar API metadata
+                        serverUrl.contains("dailymotion.com") -> {
+                            extractDailymotion(serverUrl, url, serverName.ifBlank { "Dailymotion" }, callback)
+                            anyEmitted = true
+                        }
+                        // Stremeable = streamable.com
+                        serverUrl.contains("streamable.com") -> {
+                            extractStreamable(serverUrl, url, serverName.ifBlank { "Stremeable" }, subtitleCallback, callback)
+                            anyEmitted = true
+                        }
+                        // Ok.ru
+                        serverUrl.contains("ok.ru") -> {
+                            val okUrl = serverUrl.replace("https://ok.ru", "http://ok.ru")
+                            try { loadExtractor(okUrl, url, subtitleCallback, callback); anyEmitted = true } catch (_: Exception) {}
+                        }
+                        // Otros: loadExtractor genérico
+                        else -> {
+                            try { loadExtractor(serverUrl, url, subtitleCallback, callback); anyEmitted = true } catch (_: Exception) {}
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+            if (anyEmitted) return true
         }
+        return anyEmitted
+    }
 
-        // Extraer la lista de servidores del RSC payload (para conocer labels y providers)
-        val servers = extractServerList(html)
+    /**
+     * Para películas: los servidores usan tokens encriptados.
+     * Probar GET /api/sources?movieId=<uuid> (más probable según el mensaje de error 400)
+     * Si falla, probar POST /api/sources con JSON body como fallback.
+     */
+    private suspend fun loadMovieLinks(
+        url: String,
+        preloadedContentId: String,
+        rscPayload: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val movieId = if (preloadedContentId.isNotBlank()) preloadedContentId
+            else extractContentIdFromPayload(rscPayload, "movieId") ?: ""
 
-        // POST a /api/sources con JSON body
-        // CloudStream 3 app.post signature: post(url, json: Map<String,Any>? = null, referer: String?, headers: Map<String,String>, ...)
-        // Pasamos el body como mapa (forma soportada y type-safe)
-        val apiUrl = "$mainUrl/api/sources"
-        val bodyMap = mapOf<String, Any>(idKey to contentUuid)
-        val apiResponse = try {
-            app.post(
-                apiUrl,
-                json = bodyMap,
+        if (movieId.isBlank()) return false
+
+        // Método 1: GET /api/sources?movieId=<uuid>
+        var apiResponse: String? = null
+        try {
+            apiResponse = app.get(
+                "$mainUrl/api/sources?movieId=$movieId",
                 headers = mapOf(
                     "Accept" to "application/json",
-                    "Referer" to cleanUrl,
+                    "Referer" to url,
                 ),
                 timeout = 30L
             ).text
-        } catch (_: Exception) {
-            ""
+        } catch (_: Exception) {}
+
+        // Método 2: POST /api/sources con JSON body (fallback)
+        if (apiResponse.isNullOrBlank()) {
+            try {
+                apiResponse = app.post(
+                    "$mainUrl/api/sources",
+                    json = mapOf<String, Any>("movieId" to movieId),
+                    headers = mapOf(
+                        "Accept" to "application/json",
+                        "Referer" to url,
+                    ),
+                    timeout = 30L
+                ).text
+            } catch (_: Exception) {}
         }
 
-        if (apiResponse.isBlank()) return false
+        if (apiResponse.isNullOrBlank()) return false
 
-        // Parsear la respuesta: {"success":true,"sources":[{"url":"...","quality":"720p","type":"mp4"}, ...]}
+        // Parsear respuesta: {"success":true,"sources":[{"url":"...","quality":"720p","type":"mp4"}, ...]}
         val parsed = try { parseJson<SourcesResponse>(apiResponse) } catch (_: Exception) { null }
         if (parsed?.success != true) return false
 
@@ -630,8 +714,8 @@ class DonghuaLifeBetaProvider : MainAPI() {
         for ((idx, source) in parsed.sources.withIndex()) {
             val srcUrl = source.url ?: source.src ?: source.embedUrl ?: source.iframeUrl ?: ""
             if (srcUrl.isBlank()) continue
-            // Nombre del servidor (mapear por índice al label del RSC si está disponible)
-            val serverLabel = servers.getOrNull(idx)?.label ?: source.label ?: source.name ?: "Server ${idx + 1}"
+
+            val serverLabel = source.label ?: source.name ?: "Server ${idx + 1}"
             val quality = when {
                 source.quality?.contains("1080", ignoreCase = true) == true -> Qualities.P1080.value
                 source.quality?.contains("720", ignoreCase = true) == true -> Qualities.P720.value
@@ -643,14 +727,14 @@ class DonghuaLifeBetaProvider : MainAPI() {
 
             when {
                 // m3u8 directo
-                type.contains("m3u8") || srcUrl.endsWith(".m3u8") || srcUrl.contains(".m3u8") -> {
+                type.contains("m3u8") || srcUrl.endsWith(".m3u8") -> {
                     try {
-                        generateM3u8(serverLabel, srcUrl, cleanUrl).forEach(callback)
+                        generateM3u8(serverLabel, srcUrl, url).forEach(callback)
                         anyEmitted = true
                     } catch (_: Exception) {}
                 }
                 // mp4 directo
-                type.contains("mp4") || srcUrl.endsWith(".mp4") || srcUrl.contains(".mp4") -> {
+                type.contains("mp4") || srcUrl.endsWith(".mp4") -> {
                     callback(
                         newExtractorLink(
                             source = serverLabel,
@@ -658,32 +742,210 @@ class DonghuaLifeBetaProvider : MainAPI() {
                             url = srcUrl,
                             type = ExtractorLinkType.VIDEO
                         ) {
-                            this.referer = cleanUrl
+                            this.referer = url
                             this.quality = quality
                         }
                     )
                     anyEmitted = true
                 }
-                // Embeds conocidos: pasar a loadExtractor nativo de CS3
+                // Embeds conocidos
                 srcUrl.contains("rumble.com") || srcUrl.contains("streamable.com") ||
                 srcUrl.contains("dailymotion.com") || srcUrl.contains("ok.ru") ||
-                srcUrl.contains("fembed.com") || srcUrl.contains("voe.sx") ||
-                srcUrl.contains("asura") || srcUrl.contains("vk.com") || srcUrl.contains("vk.ru") -> {
+                srcUrl.contains("vk.com") || srcUrl.contains("vk.ru") -> {
                     try {
-                        loadExtractor(srcUrl, cleanUrl, subtitleCallback, callback)
+                        loadExtractor(srcUrl, url, subtitleCallback, callback)
                         anyEmitted = true
                     } catch (_: Exception) {}
                 }
-                // Otros embeds: probar loadExtractor genérico
+                // Otros
                 else -> {
                     try {
-                        loadExtractor(srcUrl, cleanUrl, subtitleCallback, callback)
+                        loadExtractor(srcUrl, url, subtitleCallback, callback)
                         anyEmitted = true
                     } catch (_: Exception) {}
                 }
             }
         }
         return anyEmitted
+    }
+
+    // =========================== EXTRACTORES DE VIDEO ===========================
+    // (Reutilizados del DonghuaLifeProvider confirmado funcional)
+
+    private suspend fun extractRumble(
+        embedUrl: String,
+        referer: String,
+        serverName: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        try {
+            val html = app.get(embedUrl, referer = referer, timeout = 30L).text
+
+            // Método 1: HLS master playlist "hls":{"auto":{"url":"..."}}
+            val hlsAutoPatterns = listOf(
+                Regex(""""hls"\s*:\s*\{[^{}]*"auto"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+)""""),
+                Regex(""""hls"\s*:\s*\{\s*"url"\s*:\s*"([^"]+\.m3u8[^"]*)""""),
+                Regex(""""url"\s*:\s*"(https?://rumble\.com/hls-vod/[^"]+\.m3u8[^"]*)""""),
+            )
+            for (pattern in hlsAutoPatterns) {
+                val m = pattern.find(html)
+                if (m != null) {
+                    val u = m.destructured.component1().replace("\\/", "/").replace("\\u0026", "&")
+                    try {
+                        generateM3u8(serverName, u, referer).forEach(callback)
+                        return
+                    } catch (_: Exception) {}
+                }
+            }
+
+            // Método 2: "ua":{"tar":{"<quality>":{"url":"..."}}}
+            val tarBlockMatch = Regex(""""ua"\s*:\s*\{[^{}]*"tar"\s*:\s*(\{[^}]+\})""").find(html)
+            if (tarBlockMatch != null) {
+                val tarBlock = tarBlockMatch.groupValues[1]
+                var foundAny = false
+                val tarQualityPattern = Regex(""""(\d{3,4})"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+)"""")
+                tarQualityPattern.findAll(tarBlock).forEach { match ->
+                    val qLabel = match.groupValues[1]
+                    val u = match.groupValues[2].replace("\\/", "/").replace("\\u0026", "&")
+                    val quality = when (qLabel) {
+                        "2160", "1440" -> Qualities.P2160.value
+                        "1080" -> Qualities.P1080.value
+                        "720" -> Qualities.P720.value
+                        "480" -> Qualities.P480.value
+                        "360" -> Qualities.P360.value
+                        else -> Qualities.Unknown.value
+                    }
+                    callback(
+                        newExtractorLink(source = serverName, name = "$serverName ${qLabel}p", url = u, type = ExtractorLinkType.M3U8) {
+                            this.referer = referer
+                            this.quality = quality
+                        }
+                    )
+                    foundAny = true
+                }
+                if (foundAny) return
+            }
+
+            // Método 3: URLs CDN rmbl.ws
+            val rmblPatterns = listOf(
+                Regex("""["'](https?://[^"']*rmbl\.ws[^"']*\.mp4[^"']*)["']"""),
+                Regex("""["'](https?://[^"']*rmbl\.ws[^"']*)["']"""),
+            )
+            for (pattern in rmblPatterns) {
+                val matches = pattern.findAll(html).toList()
+                if (matches.isNotEmpty()) {
+                    for (match in matches) {
+                        val u = match.destructured.component1()
+                        val quality = when {
+                            u.contains("1080") -> Qualities.P1080.value
+                            u.contains("720") -> Qualities.P720.value
+                            u.contains("480") -> Qualities.P480.value
+                            u.contains("360") -> Qualities.P360.value
+                            else -> Qualities.Unknown.value
+                        }
+                        callback(
+                            newExtractorLink(source = serverName, name = "$serverName ${quality / 1000}p", url = u, type = ExtractorLinkType.VIDEO) {
+                                this.referer = referer
+                                this.quality = quality
+                            }
+                        )
+                    }
+                    return
+                }
+            }
+
+            // Método 4: m3u8 genérico
+            val m3u8Patterns = listOf(
+                Regex("""["'](https?://[^"']+\.m3u8[^"']*)["']"""),
+            )
+            for (pattern in m3u8Patterns) {
+                val match = pattern.find(html)
+                if (match != null) {
+                    val u = match.destructured.component1()
+                    try {
+                        generateM3u8(serverName, u, referer).forEach(callback)
+                        return
+                    } catch (_: Exception) {}
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
+    private suspend fun extractDailymotion(
+        embedUrl: String,
+        referer: String,
+        serverName: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val videoId = Regex("video=([A-Za-z0-9]+)").find(embedUrl)?.destructured?.component1()
+            ?: Regex("/video/([A-Za-z0-9]+)").find(embedUrl)?.destructured?.component1()
+            ?: return
+
+        try {
+            val apiUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
+            val jsonText = app.get(apiUrl,
+                referer = "https://www.dailymotion.com/embed/video/$videoId",
+                headers = mapOf("User-Agent" to USER_AGENT, "Accept" to "application/json"),
+                timeout = 15L).text
+
+            for (match in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(jsonText)) {
+                try {
+                    generateM3u8(serverName, match.value, "https://www.dailymotion.com").forEach(callback)
+                    return
+                } catch (_: Exception) {}
+            }
+            val mp4Urls = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(jsonText).map { it.value }.distinct().toList()
+            for (u in mp4Urls) {
+                val q = when {
+                    u.contains("1080") -> Qualities.P1080.value
+                    u.contains("720") -> Qualities.P720.value
+                    u.contains("480") -> Qualities.P480.value
+                    else -> Qualities.Unknown.value
+                }
+                callback(newExtractorLink(source = serverName, name = "$serverName ${q/1000}p", url = u) {
+                    this.referer = "https://www.dailymotion.com"
+                    this.quality = q
+                })
+            }
+        } catch (_: Exception) {}
+
+        try {
+            loadExtractor("https://www.dailymotion.com/embed/video/$videoId", referer, subtitleCallback = {}, callback)
+        } catch (_: Exception) {}
+    }
+
+    private suspend fun extractStreamable(
+        embedUrl: String,
+        referer: String,
+        serverName: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        try {
+            val html = app.get(embedUrl, referer = referer, timeout = 15L).text
+            val seen = mutableSetOf<String>()
+            val mp4Pattern = Regex("""["'](//cdn-cf-[^"']*streamable\.com/video/[^"']+\.mp4[^"']*)["']""")
+            for (match in mp4Pattern.findAll(html)) {
+                var u = match.groupValues[1]
+                if (u.startsWith("//")) u = "https:$u"
+                u = u.replace("&amp;", "&").replace("\\u0026", "&").replace("\\/", "/")
+                if (u in seen) continue
+                seen.add(u)
+                val quality = when {
+                    u.contains("/video/mp4-mobile/") -> Qualities.P360.value
+                    u.contains("/video/mp4/") -> Qualities.P720.value
+                    else -> Qualities.Unknown.value
+                }
+                callback(
+                    newExtractorLink(source = serverName, name = "$serverName ${quality / 1000}p", url = u, type = ExtractorLinkType.VIDEO) {
+                        this.referer = "https://streamable.com/"
+                        this.quality = quality
+                    }
+                )
+            }
+            if (seen.isNotEmpty()) return
+        } catch (_: Exception) {}
+        try { loadExtractor(embedUrl, referer, subtitleCallback, callback) } catch (_: Exception) {}
     }
 
     // =========================== CLASES DE DATOS ===========================
@@ -693,22 +955,21 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val description: String? = null,
         val image: String? = null,
         val datePublished: String? = null,
-        val productionCompany: ProductionCompany? = null
+        val productionCompany: ProductionCompany? = null,
+        val genre: List<String>? = null,
+        val numberOfEpisodes: Int? = null,
+        val numberOfSeasons: Int? = null,
     )
 
     private data class ProductionCompany(
         val name: String? = null
     )
 
-    private data class ServerInfo(
-        val id: String,
+    private data class SeasonMeta(
+        val slug: String,
         val label: String,
-        val name: String,
-        val token: String,
-        val type: String,
-        val provider: String,
-        val subtitleSupport: String,
-        val priority: Int,
+        val episodeCount: Int,
+        val firstEpisodeNumber: Int,
     )
 
     private data class SourcesResponse(
