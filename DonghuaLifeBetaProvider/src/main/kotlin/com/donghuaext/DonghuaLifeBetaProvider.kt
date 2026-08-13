@@ -17,6 +17,7 @@ import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.Qualities
+import com.google.gson.JsonObject
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.util.Base64
@@ -3080,12 +3081,12 @@ class DonghuaLifeBetaProvider : MainAPI() {
 
                 // La API devuelve: {"data":{"<vkey>":{"hls":{"auto":{"url":"...m3u8"}},"ua":{"tar":{"1080":{"url":"...mp4"}}}}}}
                 // o variante con "video" key directa
-                val json = try { AppUtils.parseJson(jsonText) } catch (_: Throwable) { null }
+                val json: JsonObject? = try { parseJson<JsonObject>(jsonText) } catch (_: Throwable) { null }
                 if (json != null) {
-                    val dataObj = json.asJsonObject?.getAsJsonObject("data")
+                    val dataObj = json.getAsJsonObject("data")
                     val vidObj = dataObj?.getAsJsonObject(vkey)
                         ?: dataObj?.entrySet()?.firstOrNull()?.value?.asJsonObject
-                        ?: json.asJsonObject
+                        ?: json
 
                     // hls.auto.url
                     val hlsAutoUrl = vidObj
