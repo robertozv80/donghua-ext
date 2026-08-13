@@ -9,6 +9,7 @@ import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.network.WebViewResolver
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.util.Base64
@@ -834,12 +835,58 @@ class DonghuaLifeBetaProvider : MainAPI() {
             downloadAndAnalyzeJs(html, "loadLinks")
         }
 
+        // v14: Última estrategia — usar WebViewResolver para renderizar la página en
+        // un motor Chrome real que ejecuta JS como un navegador verdadero.
+        // Esto bypassa la bot detection que reduce el RSC y devuelve MOCK URLs.
+        // El WebView ejecuta el JS de Next.js, que hace fetch() autenticado al
+        // backend y recibe URLs reales (Dailymotion, Rumble, etc.).
+        var webViewCaptured: String = ""
+        if (rscPayload.isNotEmpty() && rscPayload.length < 50000) {
+            val webViewResult = tryWebViewResolver(cleanUrl, "loadLinks")
+            if (webViewResult != null) {
+                val (renderedHtml, capturedJson) = webViewResult
+                webViewCaptured = capturedJson
+                // Intentar extraer RSC del HTML renderizado por WebView
+                val webViewRsc = extractRscPayload(renderedHtml)
+                Log.i(TAG, "loadLinks v14 WEBVIEW RSC: rscLen=${webViewRsc.length} " +
+                    "hasActiveEpId=${webViewRsc.contains("\"activeEpisodeId\":")} " +
+                    "hasSources=${webViewRsc.contains("\"sources\":[")}")
+                // Si el RSC del WebView es más completo, usarlo
+                if (webViewRsc.length > rscPayload.length) {
+                    val oldRscLen = rscPayload.length
+                    html = renderedHtml
+                    rscPayload = webViewRsc
+                    Log.i(TAG, "loadLinks v14 WEBVIEW: using WebView RSC " +
+                        "(was $oldRscLen, now ${webViewRsc.length})")
+                }
+                // Si capturedJson tiene next_f, concatenarlo al RSC (puede tener servers[] reales)
+                if (capturedJson.isNotEmpty()) {
+                    try {
+                        val captured = parseJson<CapturedWebViewData>(capturedJson)
+                        val nextF = captured.next_f ?: ""
+                        if (nextF.length > 1000) {
+                            Log.i(TAG, "loadLinks v14 WEBVIEW: appending captured next_f " +
+                                "(len=${nextF.length}) to rscPayload")
+                            // El next_f del WebView puede contener servers[] reales que
+                            // no estaban en el RSC original. Lo concatenamos.
+                            rscPayload = rscPayload + "\n" + nextF
+                            Log.i(TAG, "loadLinks v14 WEBVIEW: rscPayload now len=${rscPayload.length} " +
+                                "hasSources=${rscPayload.contains("\"sources\":[")} " +
+                                "hasActiveEpId=${rscPayload.contains("\"activeEpisodeId\":")}")
+                        }
+                    } catch (e: Exception) {
+                        Log.i(TAG, "loadLinks v14 WEBVIEW: parse captured for next_f error: ${e.message}")
+                    }
+                }
+            }
+        }
+
         val isMovie = cleanUrl.contains("/peliculas/")
 
         if (isMovie) {
-            return loadMovieLinks(cleanUrl, preloadedContentId, rscPayload, html, subtitleCallback, callback)
+            return loadMovieLinks(cleanUrl, preloadedContentId, rscPayload, html, webViewCaptured, subtitleCallback, callback)
         } else {
-            return loadEpisodeLinks(cleanUrl, rscPayload, html, subtitleCallback, callback)
+            return loadEpisodeLinks(cleanUrl, rscPayload, html, webViewCaptured, subtitleCallback, callback)
         }
     }
 
@@ -855,6 +902,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
         url: String,
         rscPayload: String,
         html: String,
+        webViewCaptured: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
@@ -863,7 +911,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val activeEpIdMatch = Regex(""""activeEpisodeId":"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"""")
             .find(rscPayload)
         val activeEpId = activeEpIdMatch?.groupValues?.get(1) ?: ""
-        Log.i(TAG, "$logKey loadEpisodeLinks url=$url activeEpId=$activeEpId rscSize=${rscPayload.length} htmlLen=${html.length}")
+        Log.i(TAG, "$logKey loadEpisodeLinks url=$url activeEpId=$activeEpId rscSize=${rscPayload.length} htmlLen=${html.length} webViewCapturedLen=${webViewCaptured.length}")
 
         // v12: Si el RSC está reducido (bot detection) y no tiene activeEpId,
         // buscar servers[] directamente en el HTML crudo. El HTML tiene mucha más
@@ -1001,6 +1049,17 @@ class DonghuaLifeBetaProvider : MainAPI() {
                         anyEmitted = true
                     }
                 }
+            }
+        }
+
+        // v14: Si después de todas las estrategias no se emitió nada, intentar
+        // emitir desde los datos capturados por WebViewResolver (videos, fetchResponses)
+        if (!anyEmitted && webViewCaptured.isNotEmpty()) {
+            Log.i(TAG, "$logKey v14 WEBVIEW FALLBACK: trying to emit from captured WebView data")
+            val emitted = emitFromWebViewCaptured(webViewCaptured, url, logKey, subtitleCallback, callback)
+            if (emitted) {
+                anyEmitted = true
+                Log.i(TAG, "$logKey FINAL anyEmitted=true (via WebView captured)")
             }
         }
 
@@ -1259,6 +1318,177 @@ class DonghuaLifeBetaProvider : MainAPI() {
     }
 
     /**
+     * v14: Emite ExtractorLinks desde los datos capturados por WebViewResolver.
+     *
+     * Busca URLs de video reales en:
+     * 1. captured.next_f — RSC data fetched client-side por el WebView
+     * 2. captured.nextData — __NEXT_DATA__ legacy hydration
+     * 3. captured.fetchResponses — respuestas interceptadas de /api/sources
+     * 4. captured.videos — <video>, <iframe>, <source> del DOM renderizado
+     * 5. captured.dataUrls — atributos data-src, data-url, data-video
+     *
+     * Filtra URLs mock ("/video/example", "cdn.example.com") y URLs que no
+     * parecen ser de video (CSS, JS, imágenes, fonts).
+     *
+     * Retorna true si al menos un ExtractorLink fue emitido.
+     */
+    private suspend fun emitFromWebViewCaptured(
+        capturedJson: String,
+        referer: String,
+        logKey: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val servers = ArrayList<Pair<String, String>>()
+
+        // Helper: verifica si una URL parece ser de video real
+        fun isVideoUrl(url: String): Boolean {
+            return url.contains("dailymotion.com") ||
+                url.contains("rumble.com") ||
+                url.contains("ok.ru") ||
+                url.contains("vk.com") || url.contains("vk.ru") ||
+                url.contains("streamable.com") ||
+                url.contains("voe.sx") ||
+                url.contains("filemoon") || url.contains("moonplayer") ||
+                url.contains("r2.cloudflarestorage") ||
+                url.contains("hcdn.dev") ||
+                url.contains("cloudflarestorage") ||
+                url.contains(".mp4") || url.contains(".m3u8")
+        }
+
+        // Helper: verifica si una URL es mock/placeholder del sitio
+        fun isMockUrl(url: String): Boolean {
+            return url.contains("/video/example") ||
+                url.contains("cdn.example.com") ||
+                url.contains("rumble.com/embed/example") ||
+                url.contains("dailymotion.com/embed/video/example")
+        }
+
+        // Helper: extrae URLs de video de un texto (RSC o API response)
+        fun extractVideoUrls(text: String, sourceLabel: String) {
+            if (text.isEmpty()) return
+            // Pattern 1: {"name":"X","url":"Y"} (formato RSC, name y url adyacentes)
+            val serverPattern = Regex("""\{\\?"name\\?":"([^"\\]+)\\?",\\?"url\\?":"([^"\\]+)\\?"\}""")
+            for (m in serverPattern.findAll(text)) {
+                val name = m.groupValues[1]
+                val url = m.groupValues[2]
+                    .replace("\\/", "/")
+                    .replace("\\u0026", "&")
+                    .replace("\\\"", "\"")
+                if (isVideoUrl(url) && !isMockUrl(url) && url.length >= 20) {
+                    servers.add(name to url)
+                    Log.i(TAG, "$logKey v14 EMIT found (RSC format): name=$name url=${url.take(80)}")
+                }
+            }
+            // Pattern 2: "url":"<video_url>" en cualquier posición (formato API response)
+            // Busca nombres cercanos para asociarlos
+            val urlPattern = Regex(""""url"\s*:\s*"([^"]+)"""")
+            for (m in urlPattern.findAll(text)) {
+                val url = m.groupValues[1]
+                    .replace("\\/", "/")
+                    .replace("\\u0026", "&")
+                if (!isVideoUrl(url) || isMockUrl(url) || url.length < 20) continue
+                // Buscar "name":"X" cercano (hasta 200 chars antes)
+                val urlPos = m.range.first
+                val searchStart = maxOf(0, urlPos - 200)
+                val searchEnd = minOf(text.length, urlPos)
+                val nearbyText = text.substring(searchStart, searchEnd)
+                val nameMatch = Regex(""""name"\s*:\s*"([^"]+)"""").find(nearbyText)
+                val name = nameMatch?.groupValues?.get(1) ?: sourceLabel
+                // Verificar que no esté ya en servers (dedupe básico)
+                if (servers.none { it.second == url }) {
+                    servers.add(name to url)
+                    Log.i(TAG, "$logKey v14 EMIT found (API format): name=$name url=${url.take(80)}")
+                }
+            }
+            // Pattern 3: "label":"X",...,"url":"Y" (otra variante del API)
+            val labelUrlPattern = Regex(""""label"\s*:\s*"([^"]+)"[^}]*?"url"\s*:\s*"([^"]+)"""")
+            for (m in labelUrlPattern.findAll(text)) {
+                val name = m.groupValues[1]
+                val url = m.groupValues[2]
+                    .replace("\\/", "/")
+                    .replace("\\u0026", "&")
+                if (!isVideoUrl(url) || isMockUrl(url) || url.length < 20) continue
+                if (servers.none { it.second == url }) {
+                    servers.add(name to url)
+                    Log.i(TAG, "$logKey v14 EMIT found (label format): name=$name url=${url.take(80)}")
+                }
+            }
+        }
+
+        try {
+            val captured = parseJson<CapturedWebViewData>(capturedJson)
+
+            // 1. Escanear next_f (RSC data del WebView, puede tener servers[] reales)
+            val nextF = captured.next_f ?: ""
+            if (nextF.isNotEmpty()) {
+                Log.i(TAG, "$logKey v14 EMIT: scanning next_f (${nextF.length} chars)")
+                extractVideoUrls(nextF, "WebView RSC")
+            }
+
+            // 2. Escanear nextData (legacy __NEXT_DATA__)
+            val nextData = captured.nextData ?: ""
+            if (nextData.isNotEmpty()) {
+                Log.i(TAG, "$logKey v14 EMIT: scanning nextData (${nextData.length} chars)")
+                extractVideoUrls(nextData, "WebView NextData")
+            }
+
+            // 3. Escanear fetchResponses (respuestas interceptadas de /api/sources)
+            val fetchResponses = captured.fetchResponses ?: emptyList()
+            for ((idx, fr) in fetchResponses.withIndex()) {
+                val frUrl = fr.url ?: ""
+                val frBody = fr.body ?: ""
+                if (frBody.isEmpty()) continue
+                Log.i(TAG, "$logKey v14 EMIT: scanning fetchResponse[$idx] url=$frUrl bodyLen=${frBody.length}")
+                // Log si la respuesta es mock
+                if (frBody.contains("/video/example") || frBody.contains("cdn.example.com")) {
+                    Log.i(TAG, "$logKey v14 EMIT: fetchResponse[$idx] is MOCK, but still scanning for real URLs")
+                }
+                extractVideoUrls(frBody, "WebView API $idx")
+            }
+
+            // 4. Agregar videos directos del DOM (ya son URLs completas)
+            val videos = captured.videos ?: emptyList()
+            for ((vIdx, v) in videos.withIndex()) {
+                if (v.length < 20 || !isVideoUrl(v) || isMockUrl(v)) continue
+                if (servers.none { it.second == v }) {
+                    Log.i(TAG, "$logKey v14 EMIT: DOM video[$vIdx]=$v")
+                    servers.add("WebView Video $vIdx" to v)
+                }
+            }
+
+            // 5. Agregar dataUrls del DOM
+            val dataUrls = captured.dataUrls ?: emptyList()
+            for ((dIdx, d) in dataUrls.withIndex()) {
+                if (d.length < 20 || !isVideoUrl(d) || isMockUrl(d)) continue
+                if (servers.none { it.second == d }) {
+                    Log.i(TAG, "$logKey v14 EMIT: DOM dataUrl[$dIdx]=$d")
+                    servers.add("WebView Data $dIdx" to d)
+                }
+            }
+
+            // Dedupe final por URL
+            val seen = mutableSetOf<String>()
+            val uniqueServers = servers.filter { (_, u) ->
+                if (seen.contains(u)) false else { seen.add(u); true }
+            }
+
+            Log.i(TAG, "$logKey v14 EMIT: total ${servers.size} servers found, ${uniqueServers.size} unique")
+            if (uniqueServers.isEmpty()) {
+                Log.i(TAG, "$logKey v14 EMIT: no servers found in captured WebView data")
+                return false
+            }
+
+            // Emitir usando emitEpisodeServers (que maneja cada tipo de URL)
+            Log.i(TAG, "$logKey v14 EMIT: emitting ${uniqueServers.size} servers via emitEpisodeServers")
+            return emitEpisodeServers(uniqueServers, referer, subtitleCallback, callback)
+        } catch (e: Exception) {
+            Log.i(TAG, "$logKey v14 EMIT error: ${e.message}")
+            return false
+        }
+    }
+
+    /**
      * Fallback para ok.ru: scrapea el HTML del embed y busca URLs directas de video.
      *
      * Ok.ru embeds incluyen data-options="{...}" con URLs HLS y MP4.
@@ -1364,13 +1594,14 @@ class DonghuaLifeBetaProvider : MainAPI() {
         preloadedContentId: String,
         rscPayload: String,
         html: String,
+        webViewCaptured: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val logKey = "[mv#${rscPayload.hashCode().and(0xFFFF)}]"  // marker anti-chatty
         val movieId = if (preloadedContentId.isNotBlank()) preloadedContentId
             else extractContentIdFromPayload(rscPayload, "movieId") ?: ""
-        Log.i(TAG, "$logKey loadMovieLinks url=$url movieId=$movieId rscSize=${rscPayload.length} htmlLen=${html.length}")
+        Log.i(TAG, "$logKey loadMovieLinks url=$url movieId=$movieId rscSize=${rscPayload.length} htmlLen=${html.length} webViewCapturedLen=${webViewCaptured.length}")
 
         // v12: Si el RSC está reducido (bot detection), buscar servers[] en el HTML crudo.
         // Para películas, el HTML puede contener los servers del movieId.
@@ -1605,6 +1836,17 @@ class DonghuaLifeBetaProvider : MainAPI() {
                         anyEmitted = true
                     }
                 }
+            }
+        }
+
+        // v14: Si después de todas las estrategias no se emitió nada, intentar
+        // emitir desde los datos capturados por WebViewResolver (videos, fetchResponses)
+        if (!anyEmitted && webViewCaptured.isNotEmpty()) {
+            Log.i(TAG, "$logKey v14 WEBVIEW FALLBACK: trying to emit from captured WebView data")
+            val emitted = emitFromWebViewCaptured(webViewCaptured, url, logKey, subtitleCallback, callback)
+            if (emitted) {
+                anyEmitted = true
+                Log.i(TAG, "$logKey FINAL anyEmitted=true (via WebView captured)")
             }
         }
 
@@ -1955,6 +2197,251 @@ class DonghuaLifeBetaProvider : MainAPI() {
         }
         return ""
     }
+
+    /**
+     * v14: Usa WebViewResolver para renderizar la página en un motor Chrome real
+     * (WebView de Android) que ejecuta JavaScript como un navegador verdadero.
+     *
+     * Esto bypassa la bot detection de beta.donghualife.com que:
+     * - Reduce el RSC payload a ~30KB (skeleton de loading) para clientes no-navegador
+     * - Devuelve MOCK URLs ("example") en /api/sources cuando se llama directo
+     * - Bloquea POST endpoints (respLen=0)
+     *
+     * El WebView ejecuta el JS de Next.js, que hace fetch() autenticado al backend
+     * y recibe URLs reales (Dailymotion, Rumble, etc.) en lugar de mocks.
+     *
+     * Estrategia del script JS:
+     * 1. Interceptar window.fetch para capturar respuestas de /api/sources
+     * 2. Esperar 10s a que React hidrate y haga fetch client-side
+     * 3. Capturar window.__next_f (RSC data fetched client-side)
+     * 4. Capturar <video>, <iframe>, <source> del DOM renderizado
+     * 5. Inyectar todo en un <div id="cs3-captured"> oculto
+     *
+     * @param url URL completa del episodio/película
+     * @param logKey Prefijo para logs
+     * @return Pair(renderedHtml, capturedJson) o null si falla
+     */
+    private suspend fun tryWebViewResolver(
+        url: String,
+        logKey: String
+    ): Pair<String, String>? {
+        return try {
+            Log.i(TAG, "$logKey v14 WEBVIEW: launching WebViewResolver for $url")
+
+            // Script JS que se ejecuta después de que la página carga.
+            // Captura datos del estado de Next.js y los inyecta en el DOM.
+            val script = """
+                (function() {
+                    return new Promise(function(resolve) {
+                        try {
+                            // 1. Interceptar fetch para capturar respuestas de API
+                            if (!window.__cs3FetchIntercepted) {
+                                window.__cs3FetchIntercepted = true;
+                                window.__cs3FetchResponses = [];
+                                var origFetch = window.fetch;
+                                window.fetch = function() {
+                                    var args = arguments;
+                                    var fetchUrl = (typeof args[0] === 'string') ? args[0] :
+                                                   (args[0] && args[0].url) ? args[0].url : '';
+                                    return origFetch.apply(this, args).then(function(resp) {
+                                        try {
+                                            if (fetchUrl && (fetchUrl.indexOf('/api/') >= 0 ||
+                                                fetchUrl.indexOf('sources') >= 0 ||
+                                                fetchUrl.indexOf('embed') >= 0 ||
+                                                fetchUrl.indexOf('stream') >= 0)) {
+                                                var clone = resp.clone();
+                                                clone.text().then(function(txt) {
+                                                    if (txt && txt.length < 50000) {
+                                                        window.__cs3FetchResponses.push({
+                                                            url: fetchUrl,
+                                                            status: resp.status,
+                                                            body: txt
+                                                        });
+                                                    }
+                                                }).catch(function(){});
+                                            }
+                                        } catch(e) {}
+                                        return resp;
+                                    });
+                                };
+                            }
+                        } catch(e) {}
+
+                        // 2. Esperar a que la página renderice y haga fetches client-side
+                        setTimeout(function() {
+                            try {
+                                var captured = {};
+
+                                // 3. Capturar window.__next_f (RSC data, incluye client-side fetches)
+                                var nextF = '';
+                                try {
+                                    if (window.__next_f && window.__next_f.length) {
+                                        for (var i = 0; i < window.__next_f.length; i++) {
+                                            try {
+                                                var part = window.__next_f[i];
+                                                if (part && part.length >= 2) {
+                                                    nextF += part[1] + '\n';
+                                                }
+                                            } catch(e) {}
+                                        }
+                                    }
+                                } catch(e) {}
+                                captured.next_f = nextF.substring(0, 300000);
+
+                                // 4. Capturar __NEXT_DATA__ (legacy data hydration)
+                                try {
+                                    if (window.__NEXT_DATA__) {
+                                        captured.nextData = JSON.stringify(window.__NEXT_DATA__).substring(0, 100000);
+                                    }
+                                } catch(e) {}
+
+                                // 5. Capturar video/iframe/source URLs del DOM renderizado
+                                var videos = [];
+                                try {
+                                    document.querySelectorAll('video').forEach(function(v) {
+                                        if (v.src) videos.push(v.src);
+                                        if (v.currentSrc) videos.push(v.currentSrc);
+                                    });
+                                    document.querySelectorAll('iframe').forEach(function(i) {
+                                        if (i.src) videos.push(i.src);
+                                    });
+                                    document.querySelectorAll('source').forEach(function(s) {
+                                        if (s.src) videos.push(s.src);
+                                    });
+                                } catch(e) {}
+                                captured.videos = videos;
+
+                                // 6. Capturar data-src, data-url, data-video attributes
+                                var dataUrls = [];
+                                try {
+                                    document.querySelectorAll('[data-src],[data-url],[data-video],[data-source]').forEach(function(el) {
+                                        ['data-src','data-url','data-video','data-source'].forEach(function(attr) {
+                                            var val = el.getAttribute(attr);
+                                            if (val && val.indexOf('http') === 0) dataUrls.push(val);
+                                        });
+                                    });
+                                } catch(e) {}
+                                captured.dataUrls = dataUrls;
+
+                                // 7. Capturar fetch responses interceptadas
+                                try {
+                                    captured.fetchResponses = window.__cs3FetchResponses || [];
+                                } catch(e) {
+                                    captured.fetchResponses = [];
+                                }
+
+                                // 8. Capturar HTML length para diagnóstico
+                                try {
+                                    captured.htmlLength = document.documentElement.outerHTML.length;
+                                } catch(e) {}
+
+                                // Inyectar en DOM como div oculto
+                                var div = document.createElement('div');
+                                div.id = 'cs3-captured';
+                                div.style.display = 'none';
+                                div.textContent = JSON.stringify(captured);
+                                document.body.appendChild(div);
+                            } catch(e) {
+                                try {
+                                    var errDiv = document.createElement('div');
+                                    errDiv.id = 'cs3-captured-error';
+                                    errDiv.style.display = 'none';
+                                    errDiv.textContent = 'ERROR: ' + e.toString() + ' STACK: ' + (e.stack || '');
+                                    document.body.appendChild(errDiv);
+                                } catch(ee) {}
+                            }
+                            resolve();
+                        }, 12000);  // 12s: dar tiempo a React hidrate + fetches client-side
+                    });
+                })();
+            """.trimIndent()
+
+            val renderedHtml = WebViewResolver(
+                url = url,
+                referer = mainUrl,
+                timeout = 30L,
+                script = script
+            ).resolve()
+
+            if (renderedHtml.isNullOrEmpty()) {
+                Log.i(TAG, "$logKey v14 WEBVIEW: resolve() returned null/empty")
+                return null
+            }
+            Log.i(TAG, "$logKey v14 WEBVIEW: resolved htmlLen=${renderedHtml.length}")
+
+            // Extraer el div #cs3-captured del HTML renderizado
+            val capturedJson = Regex(
+                """<div[^>]*id="cs3-captured"[^>]*>(.*?)</div>""",
+                RegexOption.DOT_MATCHES_ALL
+            ).find(renderedHtml)?.groupValues?.get(1)
+                ?.replace("&quot;", "\"")
+                ?.replace("&amp;", "&")
+                ?.replace("&lt;", "<")
+                ?.replace("&gt;", ">")
+                ?.replace("&#39;", "'")
+
+            if (capturedJson.isNullOrEmpty()) {
+                Log.i(TAG, "$logKey v14 WEBVIEW: no #cs3-captured div found in rendered HTML")
+                // Verificar si hay error
+                val errMsg = Regex(
+                    """<div[^>]*id="cs3-captured-error"[^>]*>(.*?)</div>""",
+                    RegexOption.DOT_MATCHES_ALL
+                ).find(renderedHtml)?.groupValues?.get(1)
+                if (!errMsg.isNullOrEmpty()) {
+                    Log.i(TAG, "$logKey v14 WEBVIEW SCRIPT ERROR: $errMsg")
+                }
+            } else {
+                Log.i(TAG, "$logKey v14 WEBVIEW CAPTURED len=${capturedJson.length}")
+                // Log resumido (no volcar todo el JSON al logcat)
+                try {
+                    val captured = parseJson<CapturedWebViewData>(capturedJson)
+                    Log.i(TAG, "$logKey v14 WEBVIEW: next_f len=${captured.next_f?.length ?: 0} " +
+                        "nextData len=${captured.nextData?.length ?: 0} " +
+                        "videos=${captured.videos?.size ?: 0} " +
+                        "dataUrls=${captured.dataUrls?.size ?: 0} " +
+                        "fetchResponses=${captured.fetchResponses?.size ?: 0} " +
+                        "htmlLength=${captured.htmlLength ?: 0}")
+                    // Log videos encontrados (lo más relevante)
+                    captured.videos?.take(5)?.forEachIndexed { idx, v ->
+                        Log.i(TAG, "$logKey v14 WEBVIEW video[$idx]=$v")
+                    }
+                    captured.dataUrls?.take(5)?.forEachIndexed { idx, u ->
+                        Log.i(TAG, "$logKey v14 WEBVIEW dataUrl[$idx]=$u")
+                    }
+                    captured.fetchResponses?.take(3)?.forEachIndexed { idx, fr ->
+                        Log.i(TAG, "$logKey v14 WEBVIEW fetchResp[$idx] url=${fr.url} status=${fr.status} bodyLen=${fr.body?.length ?: 0} bodyHead=${fr.body?.take(150)}")
+                    }
+                } catch (e: Exception) {
+                    Log.i(TAG, "$logKey v14 WEBVIEW: parse captured error: ${e.message}")
+                    Log.i(TAG, "$logKey v14 WEBVIEW raw head: ${capturedJson.take(500)}")
+                }
+            }
+            Pair(renderedHtml, capturedJson ?: "")
+        } catch (e: Exception) {
+            Log.i(TAG, "$logKey v14 WEBVIEW exception: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * v14: Data class para parsear el JSON capturado por WebViewResolver.
+     * Usa Gson (vía AppUtils.parseJson) — los nombres de campo Kotlin coinciden
+     * con las keys del JSON, no se necesitan anotaciones @SerializedName.
+     */
+    private data class CapturedWebViewData(
+        val next_f: String? = null,
+        val nextData: String? = null,
+        val videos: List<String>? = null,
+        val dataUrls: List<String>? = null,
+        val fetchResponses: List<FetchResponseData>? = null,
+        val htmlLength: Int? = null
+    )
+
+    private data class FetchResponseData(
+        val url: String? = null,
+        val status: Int? = null,
+        val body: String? = null
+    )
 
     /**
      * v11: Descarga el JS chunk principal del watch/peliculas page y busca strings
