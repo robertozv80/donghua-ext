@@ -1292,9 +1292,9 @@ class DonghuaLifeBetaProvider : MainAPI() {
                         // v15 FIX: si extractRumble no emitió nada, probar loadExtractor
                         // (CS3 tiene un RumbleExtractor built-in que maneja /embed/<id> URLs)
                         if (!emittedHere && !anyEmitted) {
-                            Log.i(TAG, "$logKey v15 Rumble: custom extractRumble failed, trying loadExtractor fallback")
+                            Log.i(TAG, "v15 Rumble: custom extractRumble failed, trying loadExtractor fallback for $serverUrlFixed")
                             try { loadExtractor(serverUrlFixed, referer, subtitleCallback, trackingCallback) } catch (e: Exception) {
-                                Log.w(TAG, "$logKey v15 Rumble: loadExtractor also failed: ${e.message}")
+                                Log.w(TAG, "v15 Rumble: loadExtractor also failed: ${e.message}")
                             }
                         }
                     }
@@ -1302,9 +1302,9 @@ class DonghuaLifeBetaProvider : MainAPI() {
                     serverUrlFixed.contains("dailymotion.com") || serverUrlFixed.contains("geo.dailymotion.com") -> {
                         val emittedHere = extractDailymotion(serverUrlFixed, referer, name, trackingCallback)
                         if (!emittedHere && !anyEmitted) {
-                            Log.i(TAG, "$logKey v15 Dailymotion: custom extractDailymotion failed, trying loadExtractor fallback")
+                            Log.i(TAG, "v15 Dailymotion: custom extractDailymotion failed, trying loadExtractor fallback for $serverUrlFixed")
                             try { loadExtractor(serverUrlFixed, referer, subtitleCallback, trackingCallback) } catch (e: Exception) {
-                                Log.w(TAG, "$logKey v15 Dailymotion: loadExtractor also failed: ${e.message}")
+                                Log.w(TAG, "v15 Dailymotion: loadExtractor also failed: ${e.message}")
                             }
                         }
                     }
