@@ -18,23 +18,29 @@ private const val TAG = "DonghuaLifeBeta"
 /**
  * DonghuaLifeBetaProvider — Provider para https://beta.donghualife.com
  *
- * v7 (2026-08-13): FIX CRÍTICO basado en logcat v6 del emulador.
- *   Hallazgo v6: aunque M0 (GET ?mv&token) funciona, el server devuelve
- *   URLs MOCK (cdn.example.com, /video/example) → ExoPlayer error.
- *   Y para Martial Master, el RSC llega SIN activeEpisodeId (27KB vs 200KB).
- *   Causa: bot detection del server. NiceHttp manda UA "CloudStream" y el
- *   server devuelve RSC reducido + respuestas mock a clientes no-navegador.
+ * v9 (2026-08-13): FIX CRÍTICO basado en logcat v8 del emulador.
+ *   Hallazgo v8: con el fix de Accept-Encoding, el RSC vuelve a extraerse
+ *   (rscLen=26896 para Martial Master), pero sigue siendo el RSC REDUCIDO
+ *   por bot detection (367KB real vs 27KB reducido). El server sigue:
+ *     - Omitiendo activeEpisodeId del RSC reducido
+ *     - Devolviendo URLs mock (cdn.example.com/video.mp4) en /api/sources
+ *   Conclusión: la bot detection del server NO se bypassa solo con headers.
+ *   El server probablemente usa fingerprinting TLS/HTTP/2 o cookies de sesión
+ *   que OkHttp no puede reproducir.
  *
- *   - browserUA: UA Chrome 149 desktop real (no USER_AGENT de CS3).
- *   - browserHeaders: Accept, Accept-Language, Sec-Fetch-*, Upgrade-Insecure-Requests
- *     (todos los headers que manda un browser real en petición de documento).
- *   - API headers: Accept application/json, Sec-Fetch-Dest=empty, Sec-Fetch-Mode=cors,
- *     Sec-Fetch-Site=same-origin (headers típicos de un fetch AJAX desde el navegador).
- *   - Reemplazados TODOS los USER_AGENT por browserUA.
- *   - Agregado log diagnóstico: loadLinks ahora imprime htmlLen, rscLen,
- *     hasActiveEpId, hasSources, hasTokens → para ver si los headers funcionan.
+ *   Estrategia v9: WORKAROUND en lugar de bypass.
+ *   1. DUMPEAR RSC reducido (primeros 5000 chars) para ver qué data llega.
+ *   2. EXTRAER TODOS los sources con token del RSC, sin depender de
+ *      activeEpisodeId. Cada source.id tiene formato "<contentId>-<index>",
+ *      de donde derivamos el episodeId/movieId vía MovieSource.deriveContentId().
+ *   3. Para cada source + contentId derivado, llamar /api/sources?episodeId=X&token=Y.
+ *   4. DETECTAR URLs mock en respuestas del API (cdn.example.com, /video/example)
+ *      y NO emitirlas como ExtractorLink (evita errores en ExoPlayer).
+ *      Se loguea como MOCK_URL_DETECTED para diagnóstico.
  *
- * v6: M0/EE/EF/M0b métodos GET con episodeId/movieId + token (siguen vigentes).
+ * v8: Quitado Accept-Encoding de browserHeaders (NiceHttp lo maneja solo).
+ * v7: browserUA + browserHeaders para intentar bypass (no funcionó solo).
+ * v6: M0/EE/EF/M0b métodos GET con episodeId/movieId + token.
  * v5: No retornar temprano, headers en ExtractorLinks, URL resolution, anti-chatty.
  */
 class DonghuaLifeBetaProvider : MainAPI() {
@@ -750,6 +756,12 @@ class DonghuaLifeBetaProvider : MainAPI() {
             Log.i(TAG, "loadLinks HTML head=${html.take(300).replace("\n", " ")}")
             Log.i(TAG, "loadLinks HTML tail=${html.takeLast(300).replace("\n", " ")}")
         }
+        // v9: Si el RSC es sospechosamente pequeño (bot detection), dumpear primeros 5000 chars
+        // para ver qué data logró llegar. Esto nos permite ver la estructura real del RSC reducido.
+        if (rscPayload.isNotEmpty() && rscPayload.length < 50000) {
+            Log.i(TAG, "loadLinks RSC_DUMP (reduced, ${rscPayload.length} chars): " +
+                rscPayload.take(5000).replace("\n", " "))
+        }
 
         val isMovie = cleanUrl.contains("/peliculas/")
 
@@ -793,6 +805,25 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 // Llamar al API con los tokens (igual que las películas) — NO retornar temprano
                 val emitted = loadSourcesViaApi(epSources, activeEpId, url, subtitleCallback, callback, logKey)
                 Log.i(TAG, "$logKey loadSourcesViaApi emitted=$emitted")
+                if (emitted) anyEmitted = true
+            }
+        }
+
+        // 1.6 NUEVO v9: Si NO tenemos activeEpId (RSC reducido por bot detection),
+        // escanear TODO el RSC en busca de sources con token. Cada source.id tiene
+        // formato "<episodeId>-<index>", de donde derivamos el episodeId.
+        // Esto permite recuperar los links incluso cuando el server omitió activeEpisodeId.
+        if (activeEpId.isBlank()) {
+            val allSources = extractAllSourcesFromRsc(rscPayload)
+            Log.i(TAG, "$logKey v9 fallback: no activeEpId, found ${allSources.size} sources with tokens " +
+                "labels=[${allSources.joinToString(",") { it.first.label }}] " +
+                "contentIds=[${allSources.joinToString(",") { it.second.take(8) }}]")
+            // Agrupar por contentId derivado (puede haber múltiples sources por episodio)
+            val byContentId = allSources.groupBy({ it.second }, { it.first })
+            for ((contentId, srcs) in byContentId) {
+                Log.i(TAG, "$logKey v9 trying contentId=$contentId sources=${srcs.size}")
+                val emitted = loadSourcesViaApi(srcs, contentId, url, subtitleCallback, callback, logKey)
+                Log.i(TAG, "$logKey v9 contentId=$contentId emitted=$emitted")
                 if (emitted) anyEmitted = true
             }
         }
@@ -1358,17 +1389,19 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val sourcesArrayStr = payload.substring(arrayStart, i)
 
         // Mismo patrón que extractMovieSources
+        // v9: capturamos también el "id" del source
         val sourcePattern = Regex(
-            """\{"id":"[^"]+","label":"([^"]+)","name":"([^"]+)","token":"([^"]+)","type":"([^"]+)","provider":"([^"]+)""""
+            """\{"id":"([^"]+)","label":"([^"]+)","name":"([^"]+)","token":"([^"]+)","type":"([^"]+)","provider":"([^"]+)""""
         )
         for (m in sourcePattern.findAll(sourcesArrayStr)) {
             sources.add(
                 MovieSource(
-                    label = m.groupValues[1],
-                    name = m.groupValues[2],
-                    token = m.groupValues[3],
-                    type = m.groupValues[4],
-                    provider = m.groupValues[5],
+                    id = m.groupValues[1],
+                    label = m.groupValues[2],
+                    name = m.groupValues[3],
+                    token = m.groupValues[4],
+                    type = m.groupValues[5],
+                    provider = m.groupValues[6],
                 )
             )
         }
@@ -1551,21 +1584,55 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val sourcesArrayStr = payload.substring(arrayStart, i)
 
         // Patrón: {"id":"...","label":"X","name":"Y","token":"Z","type":"video","provider":"P",...}
+        // v9: capturamos también el "id" para derivar el contentId cuando no hay activeEpisodeId.
         val sourcePattern = Regex(
-            """\{"id":"[^"]+","label":"([^"]+)","name":"([^"]+)","token":"([^"]+)","type":"([^"]+)","provider":"([^"]+)""""
+            """\{"id":"([^"]+)","label":"([^"]+)","name":"([^"]+)","token":"([^"]+)","type":"([^"]+)","provider":"([^"]+)""""
         )
         for (m in sourcePattern.findAll(sourcesArrayStr)) {
             sources.add(
                 MovieSource(
-                    label = m.groupValues[1],
-                    name = m.groupValues[2],
-                    token = m.groupValues[3],
-                    type = m.groupValues[4],
-                    provider = m.groupValues[5],
+                    id = m.groupValues[1],
+                    label = m.groupValues[2],
+                    name = m.groupValues[3],
+                    token = m.groupValues[4],
+                    type = m.groupValues[5],
+                    provider = m.groupValues[6],
                 )
             )
         }
         return sources
+    }
+
+    /**
+     * v9: Extrae TODOS los sources con token de TODOS los arrays "sources":[...] del RSC.
+     * No depende de activeEpisodeId ni de movieId.
+     *
+     * Uso principal: cuando el server devuelve un RSC reducido (bot detection) sin
+     * activeEpisodeId, todavía puede contener sources[] con tokens. Cada source.id
+     * tiene formato "<contentId>-<index>", de donde derivamos el episodeId/movieId.
+     *
+     * @return Lista de (MovieSource, derivedContentId) para todos los sources encontrados.
+     */
+    private fun extractAllSourcesFromRsc(payload: String): List<Pair<MovieSource, String>> {
+        val result = ArrayList<Pair<MovieSource, String>>()
+        val sourcePattern = Regex(
+            """\{"id":"([^"]+)","label":"([^"]+)","name":"([^"]+)","token":"([^"]+)","type":"([^"]+)","provider":"([^"]+)""""
+        )
+        for (m in sourcePattern.findAll(payload)) {
+            val src = MovieSource(
+                id = m.groupValues[1],
+                label = m.groupValues[2],
+                name = m.groupValues[3],
+                token = m.groupValues[4],
+                type = m.groupValues[5],
+                provider = m.groupValues[6],
+            )
+            val contentId = src.deriveContentId()
+            if (contentId.isNotBlank() && src.token.isNotBlank()) {
+                result.add(src to contentId)
+            }
+        }
+        return result
     }
 
     /**
@@ -1589,6 +1656,19 @@ class DonghuaLifeBetaProvider : MainAPI() {
     ): Boolean {
         var anyEmitted = false
         Log.i(TAG, "emitFromApiResponse label=$defaultLabel len=${response.length}")
+
+        // v9: Detectar URLs mock (bot detection). El server devuelve respuestas con
+        // success:true pero URLs falsas como cdn.example.com/video.mp4 o /video/example
+        // cuando detecta que el cliente no es un navegador real.
+        val isMockResponse = response.contains("cdn.example.com") ||
+                             response.contains("\"/video/example\"") ||
+                             response.contains("/video/example\"")
+        if (isMockResponse) {
+            Log.w(TAG, "emitFromApiResponse MOCK_URL_DETECTED label=$defaultLabel " +
+                "resp=${response.take(500)}")
+            // No emitir nada — las URLs mock solo causan errores en ExoPlayer.
+            return false
+        }
 
         // Helper: resolver URL relativa contra mainUrl
         fun resolveUrl(url: String): String = when {
@@ -1959,7 +2039,20 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val token: String,
         val type: String,
         val provider: String,
-    )
+        /** ID completo del source, formato: "<episodeId>-<index>" o "<movieId>-<index>". */
+        val id: String = "",
+    ) {
+        /**
+         * Deriva el episodeId/movieId (UUID) a partir del id del source.
+         * Si id="cad7248e-08f6-4258-9f99-83e178a3e943-0", retorna "cad7248e-08f6-4258-9f99-83e178a3e943".
+         * Si id no tiene el formato esperado, retorna "".
+         */
+        fun deriveContentId(): String {
+            // UUID = 8-4-4-4-12 hex chars. Remover el sufijo "-<index>" final.
+            val uuidPattern = Regex("""([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})""")
+            return uuidPattern.find(id)?.groupValues?.get(1) ?: ""
+        }
+    }
 
     private data class SourcesResponse(
         val success: Boolean? = false,
