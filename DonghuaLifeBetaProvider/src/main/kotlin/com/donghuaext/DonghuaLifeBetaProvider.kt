@@ -17,7 +17,6 @@ import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.Qualities
-import com.google.gson.JsonObject
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.util.Base64
@@ -3080,60 +3079,73 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 Log.i(TAG, "extractRumble: API vkey=$vkey httpCode=${resp.code} jsonLen=${jsonText.length} head=${jsonText.take(200)}")
 
                 // La API devuelve: {"data":{"<vkey>":{"hls":{"auto":{"url":"...m3u8"}},"ua":{"tar":{"1080":{"url":"...mp4"}}}}}}
-                // o variante con "video" key directa
-                val json: JsonObject? = try { parseJson<JsonObject>(jsonText) } catch (_: Throwable) { null }
-                if (json != null) {
-                    val dataObj = json.getAsJsonObject("data")
-                    val vidObj = dataObj?.getAsJsonObject(vkey)
-                        ?: dataObj?.entrySet()?.firstOrNull()?.value?.asJsonObject
-                        ?: json
+                // v22 FIX: com.google.gson NO está en el classpath de CS3 (usan Jackson vía AppUtils.parseJson<T>).
+                // Por simplicidad y consistencia con MÉTODO 2, parseamos el JSON con regex (igual que extractDailymotion).
 
-                    // hls.auto.url
-                    val hlsAutoUrl = vidObj
-                        ?.getAsJsonObject("hls")
-                        ?.getAsJsonObject("auto")
-                        ?.get("url")?.asString
-                    if (!hlsAutoUrl.isNullOrEmpty()) {
-                        try {
-                            generateM3u8(serverName, hlsAutoUrl, "https://rumble.com").forEach(trackingCb)
-                            Log.i(TAG, "extractRumble: API hls.auto emitted: ${hlsAutoUrl.take(80)}")
-                            if (emitted) return true
-                        } catch (e: Exception) {
-                            Log.w(TAG, "extractRumble: API hls.auto generateM3u8 failed: ${e.message}")
-                        }
-                    }
-
-                    // hls.url (fallback si no hay hls.auto)
-                    if (!emitted) {
-                        val hlsUrl = vidObj?.getAsJsonObject("hls")?.get("url")?.asString
-                        if (!hlsUrl.isNullOrEmpty() && hlsUrl.contains(".m3u8")) {
+                // 1) hls.auto.url (m3u8 principal)
+                if (!emitted) {
+                    val hlsAutoMatch = Regex(
+                        """"hls"\s*:\s*\{[^{}]*"auto"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+)""""
+                    ).find(jsonText)
+                    if (hlsAutoMatch != null) {
+                        val u = hlsAutoMatch.groupValues[1]
+                            .replace("\\/", "/")
+                            .replace("\\u0026", "&")
+                        if (u.contains(".m3u8")) {
                             try {
-                                generateM3u8(serverName, hlsUrl, "https://rumble.com").forEach(trackingCb)
-                                Log.i(TAG, "extractRumble: API hls.url emitted: ${hlsUrl.take(80)}")
+                                generateM3u8(serverName, u, "https://rumble.com").forEach(trackingCb)
+                                Log.i(TAG, "extractRumble: API hls.auto emitted: ${u.take(80)}")
                                 if (emitted) return true
                             } catch (e: Exception) {
-                                Log.w(TAG, "extractRumble: API hls.url generateM3u8 failed: ${e.message}")
+                                Log.w(TAG, "extractRumble: API hls.auto generateM3u8 failed: ${e.message}")
                             }
                         }
                     }
+                }
 
-                    // ua.tar.<quality>.url (multiple qualities)
-                    val tarObj = vidObj?.getAsJsonObject("ua")?.getAsJsonObject("tar")
-                    if (tarObj != null) {
-                        var tarEmitted = false
-                        for ((qLabel, qEntry) in tarObj.entrySet()) {
+                // 2) hls.url (fallback si no hay hls.auto)
+                if (!emitted) {
+                    val hlsUrlMatch = Regex(
+                        """"hls"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+\.m3u8[^"]*)""""
+                    ).find(jsonText)
+                    if (hlsUrlMatch != null) {
+                        val u = hlsUrlMatch.groupValues[1]
+                            .replace("\\/", "/")
+                            .replace("\\u0026", "&")
+                        try {
+                            generateM3u8(serverName, u, "https://rumble.com").forEach(trackingCb)
+                            Log.i(TAG, "extractRumble: API hls.url emitted: ${u.take(80)}")
+                            if (emitted) return true
+                        } catch (e: Exception) {
+                            Log.w(TAG, "extractRumble: API hls.url generateM3u8 failed: ${e.message}")
+                        }
+                    }
+                }
+
+                // 3) ua.tar.<quality>.url (multiple qualities mp4)
+                if (!emitted) {
+                    val tarBlockMatch = Regex(
+                        """"ua"\s*:\s*\{[^{}]*"tar"\s*:\s*(\{[^}]+\})"""
+                    ).find(jsonText)
+                    if (tarBlockMatch != null) {
+                        val tarBlock = tarBlockMatch.groupValues[1]
+                        var tarCount = 0
+                        Regex(""""(\d{3,4})"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+)"""").findAll(tarBlock).forEach { match ->
+                            val qLabel = match.groupValues[1]
+                            val u = match.groupValues[2]
+                                .replace("\\/", "/")
+                                .replace("\\u0026", "&")
+                            if (u.isBlank()) return@forEach
+                            val quality = when (qLabel) {
+                                "2160", "1440" -> Qualities.P2160.value
+                                "1080" -> Qualities.P1080.value
+                                "720" -> Qualities.P720.value
+                                "480" -> Qualities.P480.value
+                                "360" -> Qualities.P360.value
+                                else -> Qualities.Unknown.value
+                            }
+                            val isM3u8 = u.contains(".m3u8")
                             try {
-                                val u = qEntry.asJsonObject?.get("url")?.asString ?: continue
-                                if (u.isBlank()) continue
-                                val quality = when (qLabel) {
-                                    "2160", "1440" -> Qualities.P2160.value
-                                    "1080" -> Qualities.P1080.value
-                                    "720" -> Qualities.P720.value
-                                    "480" -> Qualities.P480.value
-                                    "360" -> Qualities.P360.value
-                                    else -> Qualities.Unknown.value
-                                }
-                                val isM3u8 = u.contains(".m3u8")
                                 trackingCb(
                                     newExtractorLink(
                                         source = serverName,
@@ -3145,20 +3157,23 @@ class DonghuaLifeBetaProvider : MainAPI() {
                                         this.quality = quality
                                     }
                                 )
-                                tarEmitted = true
+                                tarCount++
                             } catch (_: Throwable) {}
                         }
-                        if (tarEmitted) {
-                            Log.i(TAG, "extractRumble: API ua.tar emitted ${tarObj.size()} qualities")
+                        if (tarCount > 0) {
+                            Log.i(TAG, "extractRumble: API ua.tar emitted $tarCount qualities")
                             if (emitted) return true
                         }
                     }
+                }
 
-                    // Fallback: scan any .m3u8 or .mp4 URL en el JSON completo
-                    if (!emitted) {
-                        for (m in Regex("""(https?://[^"]+\.(?:m3u8|mp4)[^"]*)""").findAll(jsonText)) {
-                            val u = m.groupValues[1].replace("\\/", "/")
-                            val isM3u8 = u.contains(".m3u8")
+                // 4) Fallback: scan any .m3u8 or .mp4 URL en el JSON completo
+                if (!emitted) {
+                    var fallbackCount = 0
+                    for (m in Regex("""(https?://[^"]+\.(?:m3u8|mp4)[^"]*)""").findAll(jsonText)) {
+                        val u = m.groupValues[1].replace("\\/", "/").replace("\\u0026", "&")
+                        val isM3u8 = u.contains(".m3u8")
+                        try {
                             trackingCb(
                                 newExtractorLink(
                                     source = serverName,
@@ -3170,14 +3185,13 @@ class DonghuaLifeBetaProvider : MainAPI() {
                                     this.quality = Qualities.Unknown.value
                                 }
                             )
-                        }
-                        if (emitted) {
-                            Log.i(TAG, "extractRumble: API regex fallback emitted")
-                            return true
-                        }
+                            fallbackCount++
+                        } catch (_: Throwable) {}
                     }
-                } else {
-                    Log.w(TAG, "extractRumble: API response not JSON parseable")
+                    if (fallbackCount > 0) {
+                        Log.i(TAG, "extractRumble: API regex fallback emitted $fallbackCount URLs")
+                        if (emitted) return true
+                    }
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "extractRumble: API call failed for vkey=$vkey: ${e.message}")
