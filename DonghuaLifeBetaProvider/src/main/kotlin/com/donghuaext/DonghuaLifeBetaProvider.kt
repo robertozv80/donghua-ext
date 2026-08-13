@@ -813,9 +813,9 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val isMovie = cleanUrl.contains("/peliculas/")
 
         if (isMovie) {
-            return loadMovieLinks(cleanUrl, preloadedContentId, rscPayload, subtitleCallback, callback)
+            return loadMovieLinks(cleanUrl, preloadedContentId, rscPayload, html, subtitleCallback, callback)
         } else {
-            return loadEpisodeLinks(cleanUrl, rscPayload, subtitleCallback, callback)
+            return loadEpisodeLinks(cleanUrl, rscPayload, html, subtitleCallback, callback)
         }
     }
 
@@ -830,6 +830,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
     private suspend fun loadEpisodeLinks(
         url: String,
         rscPayload: String,
+        html: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
@@ -838,7 +839,26 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val activeEpIdMatch = Regex(""""activeEpisodeId":"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"""")
             .find(rscPayload)
         val activeEpId = activeEpIdMatch?.groupValues?.get(1) ?: ""
-        Log.i(TAG, "$logKey loadEpisodeLinks url=$url activeEpId=$activeEpId rscSize=${rscPayload.length}")
+        Log.i(TAG, "$logKey loadEpisodeLinks url=$url activeEpId=$activeEpId rscSize=${rscPayload.length} htmlLen=${html.length}")
+
+        // v12: Si el RSC está reducido (bot detection) y no tiene activeEpId,
+        // buscar servers[] directamente en el HTML crudo. El HTML tiene mucha más
+        // data que el RSC decodificado y puede contener los servers del episodio.
+        if (activeEpId.isBlank() && rscPayload.length < 50000) {
+            Log.i(TAG, "$logKey v12 HTML_SCAN: searching servers[] in raw HTML (${html.length} chars)")
+            val htmlServers = extractServersFromHtml(html, logKey)
+            if (htmlServers.isNotEmpty()) {
+                Log.i(TAG, "$logKey v12 HTML_SCAN found ${htmlServers.size} servers in HTML, emitting")
+                val emitted = emitEpisodeServers(htmlServers, url, subtitleCallback, callback)
+                if (emitted) {
+                    Log.i(TAG, "$logKey v12 HTML_SCAN emitted=true, skipping API calls")
+                    Log.i(TAG, "$logKey FINAL anyEmitted=true")
+                    return true
+                }
+            } else {
+                Log.i(TAG, "$logKey v12 HTML_SCAN: no servers found in HTML")
+            }
+        }
 
         var anyEmitted = false
 
@@ -1062,6 +1082,57 @@ class DonghuaLifeBetaProvider : MainAPI() {
     }
 
     /**
+     * v12: Extrae servers [{"name":"X","url":"Y"}] directamente del HTML crudo.
+     *
+     * Cuando el RSC está reducido por bot detection, el HTML completo (724653 bytes
+     * para Martial Master 1-154) puede contener los servers del episodio en:
+     * 1. Otros fragments de self.__next_f.push([1,"..."]) que extractRscPayload no decodificó
+     * 2. JSON embebido en <script> tags
+     * 3. Atributos data-* en el HTML
+     *
+     * Busca TODAS las ocurrencias de "servers":[{"name":"X","url":"Y"}] en el HTML crudo
+     * y filtra solo las URLs que parecen ser de video (dailymotion, rumble, ok.ru, etc.).
+     */
+    private fun extractServersFromHtml(html: String, logKey: String): List<Pair<String, String>> {
+        val servers = ArrayList<Pair<String, String>>()
+        // Buscar TODAS las ocurrencias de {"name":"X","url":"Y"} en el HTML crudo.
+        // El HTML puede tener escapes \\\" \\/ \\u0026, así que buscamos con un patrón
+        // que tolere ambos formatos (escaped y unescaped).
+        val serverEntryPattern = Regex("""\{\\?"name\\?":"([^"\\]+)\\?",\\?"url\\?":"([^"\\]+)\\?"\}""")
+        val seen = mutableSetOf<String>()  // dedupe por URL
+        for (m in serverEntryPattern.findAll(html)) {
+            val rawName = m.groupValues[1]
+            val rawUrl = m.groupValues[2]
+                .replace("\\/", "/")
+                .replace("\\u0026", "&")
+                .replace("\\\"", "\"")
+                .replace("\\\\", "\\")
+            // Filtrar solo URLs que parecen ser de video real.
+            // Esto excluye CSS, JS chunks, imágenes, fonts, etc.
+            val isVideoUrl = rawUrl.contains("dailymotion.com") ||
+                    rawUrl.contains("rumble.com") ||
+                    rawUrl.contains("ok.ru") ||
+                    rawUrl.contains("vk.com") || rawUrl.contains("vk.ru") ||
+                    rawUrl.contains("streamable.com") ||
+                    rawUrl.contains("voe.sx") ||
+                    rawUrl.contains("filemoon") || rawUrl.contains("moonplayer") ||
+                    rawUrl.contains("r2.cloudflarestorage") ||
+                    rawUrl.contains("hcdn.dev") ||
+                    rawUrl.contains("cloudflarestorage") ||
+                    rawUrl.endsWith(".mp4") || rawUrl.contains(".mp4") ||
+                    rawUrl.endsWith(".m3u8") || rawUrl.contains(".m3u8")
+            if (!isVideoUrl) continue
+            if (rawUrl.contains("/video/example") || rawUrl.contains("cdn.example.com")) continue
+            if (rawUrl.length < 20) continue
+            if (seen.contains(rawUrl)) continue
+            seen.add(rawUrl)
+            servers.add(rawName to rawUrl)
+            Log.i(TAG, "$logKey v12 HTML_SCAN found: name=$rawName url=${rawUrl.take(80)}")
+        }
+        return servers
+    }
+
+    /**
      * Emite ExtractorLinks para una lista de (name, url) de servers de episodio.
      * Retorna true si al menos un callback fue invocado.
      *
@@ -1268,13 +1339,32 @@ class DonghuaLifeBetaProvider : MainAPI() {
         url: String,
         preloadedContentId: String,
         rscPayload: String,
+        html: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val logKey = "[mv#${rscPayload.hashCode().and(0xFFFF)}]"  // marker anti-chatty
         val movieId = if (preloadedContentId.isNotBlank()) preloadedContentId
             else extractContentIdFromPayload(rscPayload, "movieId") ?: ""
-        Log.i(TAG, "$logKey loadMovieLinks url=$url movieId=$movieId rscSize=${rscPayload.length}")
+        Log.i(TAG, "$logKey loadMovieLinks url=$url movieId=$movieId rscSize=${rscPayload.length} htmlLen=${html.length}")
+
+        // v12: Si el RSC está reducido (bot detection), buscar servers[] en el HTML crudo.
+        // Para películas, el HTML puede contener los servers del movieId.
+        if (rscPayload.length < 50000) {
+            Log.i(TAG, "$logKey v12 HTML_SCAN: searching servers[] in raw HTML (${html.length} chars)")
+            val htmlServers = extractServersFromHtml(html, logKey)
+            if (htmlServers.isNotEmpty()) {
+                Log.i(TAG, "$logKey v12 HTML_SCAN found ${htmlServers.size} servers in HTML, emitting")
+                val emitted = emitEpisodeServers(htmlServers, url, subtitleCallback, callback)
+                if (emitted) {
+                    Log.i(TAG, "$logKey v12 HTML_SCAN emitted=true, skipping API calls")
+                    Log.i(TAG, "$logKey FINAL anyEmitted=true")
+                    return true
+                }
+            } else {
+                Log.i(TAG, "$logKey v12 HTML_SCAN: no servers found in HTML")
+            }
+        }
 
         // Extraer la lista de sources con tokens desde el payload
         val sources = extractMovieSources(rscPayload)
@@ -1823,11 +1913,16 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 val isMock = resp.contains("cdn.example.com") ||
                              resp.contains("/video/example") ||
                              resp.contains("/embed/video/example")
-                Log.i(TAG, "$logKey ALT $endpoint respLen=${resp.length} isMock=$isMock " +
+                // v12: Rechazar respuestas HTML (Next.js devuelve el HTML 404 cuando
+                // el endpoint no existe). Solo aceptar JSON válido.
+                val isHtml = resp.trimStart().startsWith("<!DOCTYPE") ||
+                             resp.trimStart().startsWith("<html")
+                val isJson = resp.trimStart().startsWith("{") || resp.trimStart().startsWith("[")
+                Log.i(TAG, "$logKey ALT $endpoint respLen=${resp.length} isMock=$isMock isHtml=$isHtml isJson=$isJson " +
                     "head=${resp.take(150).replace("\n", " ")}")
-                if (resp.isNotBlank() && resp.length > 5 && !isMock &&
+                if (resp.isNotBlank() && resp.length > 5 && !isMock && !isHtml && isJson &&
                     !resp.contains("\"error\"") && resp != "{}") {
-                    Log.i(TAG, "$logKey ALT $endpoint NON-MOCK RESPONSE FOUND!")
+                    Log.i(TAG, "$logKey ALT $endpoint NON-MOCK JSON RESPONSE FOUND!")
                     return resp
                 }
             } catch (e: Exception) {
@@ -2134,8 +2229,19 @@ class DonghuaLifeBetaProvider : MainAPI() {
             Log.i(TAG, "  Structured parse failed/skipped, trying raw URL extraction...")
             val urlPattern = Regex("""(https?://[^\s"\\\]]+)""")
             val urls = urlPattern.findAll(response).map { it.groupValues[1] }.distinct().toList()
-            Log.i(TAG, "  Raw URLs found: ${urls.size}")
-            for ((idx, u) in urls.withIndex()) {
+            // v12: Filtrar solo URLs que parecen ser de video (no CSS, JS, imágenes, fonts).
+            val videoUrls = urls.filter { u ->
+                u.contains("dailymotion.com") || u.contains("rumble.com") ||
+                u.contains("ok.ru") || u.contains("vk.com") || u.contains("vk.ru") ||
+                u.contains("streamable.com") || u.contains("voe.sx") ||
+                u.contains("filemoon") || u.contains("moonplayer") ||
+                u.contains("r2.cloudflarestorage") || u.contains("hcdn.dev") ||
+                u.contains("cloudflarestorage") ||
+                u.endsWith(".mp4") || u.contains(".mp4") ||
+                u.endsWith(".m3u8") || u.contains(".m3u8")
+            }.filterNot { it.contains("/video/example") || it.contains("cdn.example.com") }
+            Log.i(TAG, "  Raw URLs found: ${urls.size}, video URLs: ${videoUrls.size}")
+            for ((idx, u) in videoUrls.withIndex()) {
                 val cleanUrl = u.removeSuffix(",").removeSuffix("}")
                 if (cleanUrl.contains("/api/sources")) continue  // No usar la URL del API
                 if (cleanUrl.length < 20) continue  // URLs muy cortas son ruido
