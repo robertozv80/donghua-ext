@@ -776,16 +776,17 @@ class DonghuaLifeBetaProvider : MainAPI() {
             "httpCode=${response.code}")
         // v10: Log de cookies Set-Cookie de la respuesta inicial.
         // Si Cloudflare setea cf_clearance u otra cookie de sesión, la veremos aquí.
-        // NiceHttp expone las cookies del response en response.cookies o response.headers.
+        // OkHttp Headers: names() retorna Set<String>, values(name) retorna List<String>.
         try {
-            val setCookieHeaders = response.headers.keys
+            val setCookieHeaders = response.headers.names()
                 .filter { it.equals("set-cookie", ignoreCase = true) }
-                .flatMap { response.headers.values(it) }
+                .flatMap { name -> response.headers.values(name) }
             if (setCookieHeaders.isNotEmpty()) {
                 Log.i(TAG, "loadLinks SET_COOKIE count=${setCookieHeaders.size} " +
-                    "cookies=${setCookieHeaders.joinToString(" | ") { it.take(120) }}")
+                    "cookies=${setCookieHeaders.joinToString(" | ") { c -> c.take(120) }}")
             } else {
-                Log.i(TAG, "loadLinks SET_COOKIE count=0 (no cookies returned)")
+                Log.i(TAG, "loadLinks SET_COOKIE count=0 (no cookies returned) " +
+                    "headerNames=${response.headers.names().joinToString(",")}")
             }
         } catch (e: Exception) {
             Log.i(TAG, "loadLinks SET_COOKIE error reading: ${e.message}")
