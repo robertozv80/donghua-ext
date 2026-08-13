@@ -1,6 +1,14 @@
 package com.donghuaext
 
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.webkit.JavascriptInterface
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
@@ -9,7 +17,6 @@ import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.network.WebViewResolver
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.util.Base64
@@ -17,7 +24,10 @@ import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.collections.ArrayList
+import kotlin.coroutines.resume
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.suspendCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 
 private const val TAG = "DonghuaLifeBeta"
 
@@ -2226,197 +2236,262 @@ class DonghuaLifeBetaProvider : MainAPI() {
         logKey: String
     ): Pair<String, String>? {
         return try {
-            Log.i(TAG, "$logKey v14 WEBVIEW: launching WebViewResolver for $url")
+            Log.i(TAG, "$logKey v14 WEBVIEW: launching manual WebView for $url")
 
-            // Script JS que se ejecuta después de que la página carga.
-            // Captura datos del estado de Next.js y los inyecta en el DOM.
+            // Obtener Context vía com.lagradost.api.getContext() (API oficial del library module).
+            // MainAPI no tiene context propio; CloudStreamApp lo setea en el library vía setContext().
+            // getContext() retorna Any? (cross-platform), hay que castear a android.content.Context.
+            val ctx: Context? = try {
+                com.lagradost.api.getContext() as? Context
+            } catch (_: Exception) { null }
+            if (ctx == null) {
+                Log.i(TAG, "$logKey v14 WEBVIEW: no Context available via getContext(), cannot use WebView")
+                return null
+            }
+
+            // Script JS que se inyecta DESPUÉS de que la página carga.
+            // Usa setTimeout para esperar a que React hidrate y haga fetches client-side.
+            // Al terminar, llama a Android.onCaptured(json) para enviar los datos al Kotlin.
             val script = """
                 (function() {
-                    return new Promise(function(resolve) {
+                    try {
+                        // 1. Interceptar fetch para capturar respuestas de API
+                        if (!window.__cs3FetchIntercepted) {
+                            window.__cs3FetchIntercepted = true;
+                            window.__cs3FetchResponses = [];
+                            var origFetch = window.fetch;
+                            window.fetch = function() {
+                                var args = arguments;
+                                var fetchUrl = (typeof args[0] === 'string') ? args[0] :
+                                               (args[0] && args[0].url) ? args[0].url : '';
+                                return origFetch.apply(this, args).then(function(resp) {
+                                    try {
+                                        if (fetchUrl && (fetchUrl.indexOf('/api/') >= 0 ||
+                                            fetchUrl.indexOf('sources') >= 0 ||
+                                            fetchUrl.indexOf('embed') >= 0 ||
+                                            fetchUrl.indexOf('stream') >= 0)) {
+                                            var clone = resp.clone();
+                                            clone.text().then(function(txt) {
+                                                if (txt && txt.length < 50000) {
+                                                    window.__cs3FetchResponses.push({
+                                                        url: fetchUrl,
+                                                        status: resp.status,
+                                                        body: txt
+                                                    });
+                                                }
+                                            }).catch(function(){});
+                                        }
+                                    } catch(e) {}
+                                    return resp;
+                                });
+                            };
+                        }
+                    } catch(e) {}
+
+                    // 2. Esperar 12s a que React hidrate y haga fetches client-side
+                    setTimeout(function() {
                         try {
-                            // 1. Interceptar fetch para capturar respuestas de API
-                            if (!window.__cs3FetchIntercepted) {
-                                window.__cs3FetchIntercepted = true;
-                                window.__cs3FetchResponses = [];
-                                var origFetch = window.fetch;
-                                window.fetch = function() {
-                                    var args = arguments;
-                                    var fetchUrl = (typeof args[0] === 'string') ? args[0] :
-                                                   (args[0] && args[0].url) ? args[0].url : '';
-                                    return origFetch.apply(this, args).then(function(resp) {
+                            var captured = {};
+
+                            // 3. Capturar window.__next_f (RSC data client-side)
+                            var nextF = '';
+                            try {
+                                if (window.__next_f && window.__next_f.length) {
+                                    for (var i = 0; i < window.__next_f.length; i++) {
                                         try {
-                                            if (fetchUrl && (fetchUrl.indexOf('/api/') >= 0 ||
-                                                fetchUrl.indexOf('sources') >= 0 ||
-                                                fetchUrl.indexOf('embed') >= 0 ||
-                                                fetchUrl.indexOf('stream') >= 0)) {
-                                                var clone = resp.clone();
-                                                clone.text().then(function(txt) {
-                                                    if (txt && txt.length < 50000) {
-                                                        window.__cs3FetchResponses.push({
-                                                            url: fetchUrl,
-                                                            status: resp.status,
-                                                            body: txt
-                                                        });
-                                                    }
-                                                }).catch(function(){});
+                                            var part = window.__next_f[i];
+                                            if (part && part.length >= 2) {
+                                                nextF += part[1] + '\n';
                                             }
                                         } catch(e) {}
-                                        return resp;
-                                    });
-                                };
-                            }
-                        } catch(e) {}
-
-                        // 2. Esperar a que la página renderice y haga fetches client-side
-                        setTimeout(function() {
-                            try {
-                                var captured = {};
-
-                                // 3. Capturar window.__next_f (RSC data, incluye client-side fetches)
-                                var nextF = '';
-                                try {
-                                    if (window.__next_f && window.__next_f.length) {
-                                        for (var i = 0; i < window.__next_f.length; i++) {
-                                            try {
-                                                var part = window.__next_f[i];
-                                                if (part && part.length >= 2) {
-                                                    nextF += part[1] + '\n';
-                                                }
-                                            } catch(e) {}
-                                        }
                                     }
-                                } catch(e) {}
-                                captured.next_f = nextF.substring(0, 300000);
-
-                                // 4. Capturar __NEXT_DATA__ (legacy data hydration)
-                                try {
-                                    if (window.__NEXT_DATA__) {
-                                        captured.nextData = JSON.stringify(window.__NEXT_DATA__).substring(0, 100000);
-                                    }
-                                } catch(e) {}
-
-                                // 5. Capturar video/iframe/source URLs del DOM renderizado
-                                var videos = [];
-                                try {
-                                    document.querySelectorAll('video').forEach(function(v) {
-                                        if (v.src) videos.push(v.src);
-                                        if (v.currentSrc) videos.push(v.currentSrc);
-                                    });
-                                    document.querySelectorAll('iframe').forEach(function(i) {
-                                        if (i.src) videos.push(i.src);
-                                    });
-                                    document.querySelectorAll('source').forEach(function(s) {
-                                        if (s.src) videos.push(s.src);
-                                    });
-                                } catch(e) {}
-                                captured.videos = videos;
-
-                                // 6. Capturar data-src, data-url, data-video attributes
-                                var dataUrls = [];
-                                try {
-                                    document.querySelectorAll('[data-src],[data-url],[data-video],[data-source]').forEach(function(el) {
-                                        ['data-src','data-url','data-video','data-source'].forEach(function(attr) {
-                                            var val = el.getAttribute(attr);
-                                            if (val && val.indexOf('http') === 0) dataUrls.push(val);
-                                        });
-                                    });
-                                } catch(e) {}
-                                captured.dataUrls = dataUrls;
-
-                                // 7. Capturar fetch responses interceptadas
-                                try {
-                                    captured.fetchResponses = window.__cs3FetchResponses || [];
-                                } catch(e) {
-                                    captured.fetchResponses = [];
                                 }
+                            } catch(e) {}
+                            captured.next_f = nextF.substring(0, 300000);
 
-                                // 8. Capturar HTML length para diagnóstico
-                                try {
-                                    captured.htmlLength = document.documentElement.outerHTML.length;
-                                } catch(e) {}
+                            // 4. Capturar __NEXT_DATA__ (legacy hydration)
+                            try {
+                                if (window.__NEXT_DATA__) {
+                                    captured.nextData = JSON.stringify(window.__NEXT_DATA__).substring(0, 100000);
+                                }
+                            } catch(e) {}
 
-                                // Inyectar en DOM como div oculto
-                                var div = document.createElement('div');
-                                div.id = 'cs3-captured';
-                                div.style.display = 'none';
-                                div.textContent = JSON.stringify(captured);
-                                document.body.appendChild(div);
+                            // 5. Capturar video/iframe/source URLs del DOM
+                            var videos = [];
+                            try {
+                                document.querySelectorAll('video').forEach(function(v) {
+                                    if (v.src) videos.push(v.src);
+                                    if (v.currentSrc) videos.push(v.currentSrc);
+                                });
+                                document.querySelectorAll('iframe').forEach(function(i) {
+                                    if (i.src) videos.push(i.src);
+                                });
+                                document.querySelectorAll('source').forEach(function(s) {
+                                    if (s.src) videos.push(s.src);
+                                });
+                            } catch(e) {}
+                            captured.videos = videos;
+
+                            // 6. Capturar data-src, data-url, data-video attributes
+                            var dataUrls = [];
+                            try {
+                                document.querySelectorAll('[data-src],[data-url],[data-video],[data-source]').forEach(function(el) {
+                                    ['data-src','data-url','data-video','data-source'].forEach(function(attr) {
+                                        var val = el.getAttribute(attr);
+                                        if (val && val.indexOf('http') === 0) dataUrls.push(val);
+                                    });
+                                });
+                            } catch(e) {}
+                            captured.dataUrls = dataUrls;
+
+                            // 7. Capturar fetch responses interceptadas
+                            try {
+                                captured.fetchResponses = window.__cs3FetchResponses || [];
                             } catch(e) {
+                                captured.fetchResponses = [];
+                            }
+
+                            // 8. Capturar HTML del body renderizado (para RSC extraction)
+                            try {
+                                captured.html = document.documentElement.outerHTML.substring(0, 500000);
+                            } catch(e) {}
+
+                            // 9. Capturar HTML length para diagnóstico
+                            try {
+                                captured.htmlLength = document.documentElement.outerHTML.length;
+                            } catch(e) {}
+
+                            // Enviar al Kotlin vía JavascriptInterface
+                            try {
+                                Android.onCaptured(JSON.stringify(captured));
+                            } catch(e) {
+                                // Si Android interface no está disponible, intentar inyectar en DOM
                                 try {
-                                    var errDiv = document.createElement('div');
-                                    errDiv.id = 'cs3-captured-error';
-                                    errDiv.style.display = 'none';
-                                    errDiv.textContent = 'ERROR: ' + e.toString() + ' STACK: ' + (e.stack || '');
-                                    document.body.appendChild(errDiv);
+                                    var div = document.createElement('div');
+                                    div.id = 'cs3-captured';
+                                    div.style.display = 'none';
+                                    div.textContent = JSON.stringify(captured);
+                                    document.body.appendChild(div);
                                 } catch(ee) {}
                             }
-                            resolve();
-                        }, 12000);  // 12s: dar tiempo a React hidrate + fetches client-side
-                    });
+                        } catch(e) {
+                            try {
+                                Android.onCaptured('{"error":"' + e.toString().replace(/"/g, '\\"') + '"}');
+                            } catch(ee) {}
+                        }
+                    }, 12000);  // 12s: dar tiempo a React hidrate + fetches
                 })();
             """.trimIndent()
 
-            val renderedHtml = WebViewResolver(
-                url = url,
-                referer = mainUrl,
-                timeout = 30L,
-                script = script
-            ).resolve()
+            // Usar WebView manual con suspendCoroutine
+            var webView: WebView? = null
+            val capturedJson = withTimeoutOrNull(30000L) {
+                suspendCoroutine<String?> { cont ->
+                    // WebView DEBE crearse en el main thread (UI thread)
+                    Handler(Looper.getMainLooper()).post {
+                        try {
+                            val wv = WebView(ctx)
+                            webView = wv
+                            wv.settings.javaScriptEnabled = true
+                            wv.settings.domStorageEnabled = true
+                            wv.settings.mediaPlaybackRequiresUserGesture = false
+                            wv.settings.blockNetworkImage = true  // No cargar imágenes (más rápido)
+                            // NO setear userAgentString custom — dejar el default de Chrome
 
-            if (renderedHtml.isNullOrEmpty()) {
-                Log.i(TAG, "$logKey v14 WEBVIEW: resolve() returned null/empty")
-                return null
+                            var finished = false
+
+                            // JavascriptInterface para recibir datos del JS
+                            wv.addJavascriptInterface(object {
+                                @JavascriptInterface
+                                fun onCaptured(json: String) {
+                                    Log.i(TAG, "$logKey v14 WEBVIEW: onCaptured len=${json.length}")
+                                    if (!finished) {
+                                        finished = true
+                                        cont.resume(json)
+                                    }
+                                }
+                            }, "Android")
+
+                            wv.webViewClient = object : WebViewClient() {
+                                override fun onPageFinished(view: WebView?, url: String?) {
+                                    super.onPageFinished(view, url)
+                                    Log.i(TAG, "$logKey v14 WEBVIEW: onPageFinished, injecting script")
+                                    // Inyectar el script que intercepta fetch y captura datos
+                                    view?.evaluateJavascript(script) { _ ->
+                                        Log.i(TAG, "$logKey v14 WEBVIEW: script injected, waiting 12s for capture...")
+                                        // El script tiene setTimeout(12000) que llamará Android.onCaptured
+                                        // Si no llama en 15s, el withTimeoutOrNull cancelará
+                                    }
+                                }
+
+                                override fun onReceivedError(
+                                    view: WebView?,
+                                    request: WebResourceRequest?,
+                                    error: WebResourceError?
+                                ) {
+                                    super.onReceivedError(view, request, error)
+                                    Log.i(TAG, "$logKey v14 WEBVIEW error: ${error?.description} url=${request?.url}")
+                                }
+                            }
+
+                            // Set headers browser-like
+                            val headers = mapOf(
+                                "Accept-Language" to "es-ES,es;q=0.9,en;q=0.8"
+                            )
+                            wv.loadUrl(url, headers)
+                        } catch (e: Exception) {
+                            Log.i(TAG, "$logKey v14 WEBVIEW: WebView creation error: ${e.message}")
+                            cont.resume(null)
+                        }
+                    }
+                }
             }
-            Log.i(TAG, "$logKey v14 WEBVIEW: resolved htmlLen=${renderedHtml.length}")
 
-            // Extraer el div #cs3-captured del HTML renderizado
-            val capturedJson = Regex(
-                """<div[^>]*id="cs3-captured"[^>]*>(.*?)</div>""",
-                RegexOption.DOT_MATCHES_ALL
-            ).find(renderedHtml)?.groupValues?.get(1)
-                ?.replace("&quot;", "\"")
-                ?.replace("&amp;", "&")
-                ?.replace("&lt;", "<")
-                ?.replace("&gt;", ">")
-                ?.replace("&#39;", "'")
+            // Limpiar WebView SIEMPRE (incluso si timeout)
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    webView?.stopLoading()
+                    webView?.removeJavascriptInterface("Android")
+                    webView?.destroy()
+                } catch (_: Exception) {}
+            }
+            webView = null
 
             if (capturedJson.isNullOrEmpty()) {
-                Log.i(TAG, "$logKey v14 WEBVIEW: no #cs3-captured div found in rendered HTML")
-                // Verificar si hay error
-                val errMsg = Regex(
-                    """<div[^>]*id="cs3-captured-error"[^>]*>(.*?)</div>""",
-                    RegexOption.DOT_MATCHES_ALL
-                ).find(renderedHtml)?.groupValues?.get(1)
-                if (!errMsg.isNullOrEmpty()) {
-                    Log.i(TAG, "$logKey v14 WEBVIEW SCRIPT ERROR: $errMsg")
-                }
-            } else {
-                Log.i(TAG, "$logKey v14 WEBVIEW CAPTURED len=${capturedJson.length}")
-                // Log resumido (no volcar todo el JSON al logcat)
-                try {
-                    val captured = parseJson<CapturedWebViewData>(capturedJson)
-                    Log.i(TAG, "$logKey v14 WEBVIEW: next_f len=${captured.next_f?.length ?: 0} " +
-                        "nextData len=${captured.nextData?.length ?: 0} " +
-                        "videos=${captured.videos?.size ?: 0} " +
-                        "dataUrls=${captured.dataUrls?.size ?: 0} " +
-                        "fetchResponses=${captured.fetchResponses?.size ?: 0} " +
-                        "htmlLength=${captured.htmlLength ?: 0}")
-                    // Log videos encontrados (lo más relevante)
-                    captured.videos?.take(5)?.forEachIndexed { idx, v ->
-                        Log.i(TAG, "$logKey v14 WEBVIEW video[$idx]=$v")
-                    }
-                    captured.dataUrls?.take(5)?.forEachIndexed { idx, u ->
-                        Log.i(TAG, "$logKey v14 WEBVIEW dataUrl[$idx]=$u")
-                    }
-                    captured.fetchResponses?.take(3)?.forEachIndexed { idx, fr ->
-                        Log.i(TAG, "$logKey v14 WEBVIEW fetchResp[$idx] url=${fr.url} status=${fr.status} bodyLen=${fr.body?.length ?: 0} bodyHead=${fr.body?.take(150)}")
-                    }
-                } catch (e: Exception) {
-                    Log.i(TAG, "$logKey v14 WEBVIEW: parse captured error: ${e.message}")
-                    Log.i(TAG, "$logKey v14 WEBVIEW raw head: ${capturedJson.take(500)}")
-                }
+                Log.i(TAG, "$logKey v14 WEBVIEW: no data captured (timeout or error)")
+                return null
             }
-            Pair(renderedHtml, capturedJson ?: "")
+
+            Log.i(TAG, "$logKey v14 WEBVIEW CAPTURED len=${capturedJson.length}")
+
+            // Extraer HTML del JSON capturado (si está disponible)
+            var renderedHtml = ""
+            try {
+                val captured = parseJson<CapturedWebViewData>(capturedJson)
+                renderedHtml = captured.html ?: ""
+                Log.i(TAG, "$logKey v14 WEBVIEW: next_f len=${captured.next_f?.length ?: 0} " +
+                    "nextData len=${captured.nextData?.length ?: 0} " +
+                    "videos=${captured.videos?.size ?: 0} " +
+                    "dataUrls=${captured.dataUrls?.size ?: 0} " +
+                    "fetchResponses=${captured.fetchResponses?.size ?: 0} " +
+                    "htmlLength=${captured.htmlLength ?: 0} " +
+                    "html len=${renderedHtml.length}")
+                // Log videos encontrados
+                captured.videos?.take(5)?.forEachIndexed { idx, v ->
+                    Log.i(TAG, "$logKey v14 WEBVIEW video[$idx]=$v")
+                }
+                captured.dataUrls?.take(5)?.forEachIndexed { idx, u ->
+                    Log.i(TAG, "$logKey v14 WEBVIEW dataUrl[$idx]=$u")
+                }
+                captured.fetchResponses?.take(3)?.forEachIndexed { idx, fr ->
+                    Log.i(TAG, "$logKey v14 WEBVIEW fetchResp[$idx] url=${fr.url} status=${fr.status} bodyLen=${fr.body?.length ?: 0} bodyHead=${fr.body?.take(150)}")
+                }
+            } catch (e: Exception) {
+                Log.i(TAG, "$logKey v14 WEBVIEW: parse captured error: ${e.message}")
+                Log.i(TAG, "$logKey v14 WEBVIEW raw head: ${capturedJson.take(500)}")
+            }
+
+            Pair(renderedHtml, capturedJson)
         } catch (e: Exception) {
             Log.i(TAG, "$logKey v14 WEBVIEW exception: ${e.message}")
             null
@@ -2424,7 +2499,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
     }
 
     /**
-     * v14: Data class para parsear el JSON capturado por WebViewResolver.
+     * v14: Data class para parsear el JSON capturado por WebView.
      * Usa Gson (vía AppUtils.parseJson) — los nombres de campo Kotlin coinciden
      * con las keys del JSON, no se necesitan anotaciones @SerializedName.
      */
@@ -2434,6 +2509,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val videos: List<String>? = null,
         val dataUrls: List<String>? = null,
         val fetchResponses: List<FetchResponseData>? = null,
+        val html: String? = null,
         val htmlLength: Int? = null
     )
 
