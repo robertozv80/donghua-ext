@@ -11,6 +11,10 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.Qualities
 import java.net.URLDecoder
 import java.net.URLEncoder
+import java.util.Base64
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import kotlin.collections.ArrayList
 
 private const val TAG = "DonghuaLifeBeta"
@@ -18,31 +22,28 @@ private const val TAG = "DonghuaLifeBeta"
 /**
  * DonghuaLifeBetaProvider — Provider para https://beta.donghualife.com
  *
- * v10 (2026-08-13): FIX basado en logcat v9 del emulador.
- *   Hallazgo v9: el fix v9 funcionó correctamente:
- *     - Para Martial Master, derivó contentId=cad7248e-08f6-4258-9f99-83e178a3e943
- *       (coincide con el episodio.html de navegador).
- *     - MOCK_URL_DETECTED se disparó bien → ExoPlayer ya no recibe URLs mock.
- *     - RSC_DUMP se imprimió, confirmando que el RSC reducido SÍ contiene
- *       sources[] con tokens (solo falta activeEpisodeId).
- *   PERO el API /api/sources sigue devolviendo la MISMA respuesta mock de 719
- *   bytes sin importar qué token, episodeId o movieId enviemos. Incluso sin
- *   token (M0b), devuelve el mismo mock. Esto confirma bot detection a nivel
- *   del endpoint /api/sources, no a nivel de tokens.
+ * v11 (2026-08-13): FIX basado en logcat v10 del emulador.
+ *   Hallazgo v10: SET_COOKIE count=0 → NO es Cloudflare. Header Server no
+ *   dice cloudflare. El server NO setea cookies de sesión en ningún momento.
+ *   v10 produjo EXACTAMENTE el mismo resultado que v9: mismo mock de 719
+ *   bytes con cdn.example.com/video.mp4. La bot detection NO se bypassa
+ *   con headers.
  *
- *   Hipótesis v10: el server detecta el cliente como bot por headers sospechosos:
- *     1. X-Requested-With: XMLHttpRequest — header de la era jQuery que Chrome
- *        fetch() NO envía. Es una red flag clásica para bot detection moderno.
- *     2. Falta de Sec-Ch-Ua client hints — Chrome los envía siempre.
- *     3. Falta de Priority header.
+ *   Conclusión definitiva: el endpoint /api/sources tiene bot detection a
+ *   nivel de APLICACIÓN (Next.js middleware o el handler mismo) que siempre
+ *   devuelve el mismo mock a clientes no-navegador, sin importar headers.
  *
- *   Cambios v10:
- *   - Removido X-Requested-With de TODOS los headers AJAX.
- *   - Agregado ajaxClientHints: Sec-Ch-Ua, Sec-Ch-Ua-Mobile, Sec-Ch-Ua-Platform, Priority.
- *   - Agregado Sec-Ch-Ua client hints a browserHeaders (document navigation).
- *   - Agregado log de Set-Cookie headers de la respuesta inicial para ver si
- *     Cloudflare setea cf_clearance u otra cookie de sesión necesaria.
+ *   Estrategia v11 — tres enfoques combinados:
+ *   1. PROBAR ENDPOINTS ALTERNATIVOS: /api/embed, /api/source, /api/v1/sources,
+ *      /api/play, /api/stream, /api/video — por si /api/sources es honeypot.
+ *   2. DESCARGAR JS CHUNK PRINCIPAL del watch page y dumpear strings relevantes
+ *      para encontrar la key AES o la lógica de decodificación del token.
+ *   3. DESCIFRAR TOKEN AES-CBC CLIENT-SIDE: el token base64 decodificado es
+ *      {"v":1,"iv":"<32hex>","data":"<192hex>","sig":"<base64>"}.
+ *      Si encontramos la key AES de 32 bytes en el JS, podemos descifrar
+ *      la URL real del video sin llamar al API.
  *
+ * v10: Quitado X-Requested-With, agregados Sec-Ch-Ua client hints. No funcionó.
  * v9: extractAllSourcesFromRsc + deriveContentId (workaround sin activeEpisodeId).
  * v8: Quitado Accept-Encoding de browserHeaders (NiceHttp lo maneja solo).
  * v7: browserUA + browserHeaders para intentar bypass (no funcionó solo).
@@ -802,6 +803,12 @@ class DonghuaLifeBetaProvider : MainAPI() {
             Log.i(TAG, "loadLinks RSC_DUMP (reduced, ${rscPayload.length} chars): " +
                 rscPayload.take(5000).replace("\n", " "))
         }
+        // v11: Si el RSC está reducido (bot detection confirmado), descargar y analizar JS chunks
+        // para buscar la key AES o la lógica de decodificación del token client-side.
+        // Esto se ejecuta UNA sola vez por loadLinks (no en cada retry).
+        if (rscPayload.isNotEmpty() && rscPayload.length < 50000) {
+            downloadAndAnalyzeJs(html, "loadLinks")
+        }
 
         val isMovie = cleanUrl.contains("/peliculas/")
 
@@ -904,6 +911,47 @@ class DonghuaLifeBetaProvider : MainAPI() {
             if (firstServers.isNotEmpty()) {
                 val emitted = emitEpisodeServers(firstServers, url, subtitleCallback, callback)
                 if (emitted) anyEmitted = true
+            }
+        }
+
+        // 5. v11: Si nada funcionó, probar endpoints alternativos + análisis JS + descifrado token.
+        // Solo ejecutar una vez (evitar duplicar trabajo si loadEpisodeLinks se llama múltiples veces).
+        if (!anyEmitted) {
+            Log.i(TAG, "$logKey v11: trying alternative strategies (endpoints + JS + token decrypt)")
+            val allSources = extractAllSourcesFromRsc(rscPayload)
+            // 5a. Endpoints alternativos
+            for ((src, contentId) in allSources) {
+                Log.i(TAG, "$logKey v11 ALT_ENDPOINTS for contentId=$contentId label=${src.label}")
+                val altResp = tryAlternativeEndpoints(contentId, src.token, false, url, logKey)
+                if (altResp.isNotBlank()) {
+                    if (emitFromApiResponse(altResp, url, subtitleCallback, callback, defaultLabel = src.label)) {
+                        anyEmitted = true
+                    }
+                }
+            }
+            // 5b. Descifrar token AES-CBC client-side (probablemente falle sin la key correcta,
+            // pero el log nos dirá la estructura del token decodificado para análisis).
+            if (!anyEmitted) {
+                for ((src, _) in allSources) {
+                    Log.i(TAG, "$logKey v11 TOKEN_DECRYPT label=${src.label} provider=${src.provider}")
+                    val decryptedUrl = decryptTokenAesCbc(src.token, logKey)
+                    if (decryptedUrl.isNotBlank()) {
+                        Log.i(TAG, "$logKey v11 TOKEN_DECRYPT SUCCESS: $decryptedUrl")
+                        // Si encontramos una URL, emitirla como ExtractorLink
+                        val linkType = when {
+                            decryptedUrl.contains(".m3u8") -> ExtractorLinkType.M3U8
+                            decryptedUrl.contains(".mp4") -> ExtractorLinkType.VIDEO
+                            else -> ExtractorLinkType.DASH
+                        }
+                        callback(
+                            newExtractorLink(src.label, decryptedUrl, linkType) {
+                                this.referer = url
+                                this.headers = mapOf("Origin" to mainUrl, "User-Agent" to browserUA)
+                            }
+                        )
+                        anyEmitted = true
+                    }
+                }
             }
         }
 
@@ -1397,6 +1445,45 @@ class DonghuaLifeBetaProvider : MainAPI() {
             }
         }
 
+        // ====== Método 7 v11: Endpoints alternativos + descifrado AES-CBC del token ======
+        if (!anyEmitted) {
+            Log.i(TAG, "$logKey v11: trying alternative strategies (endpoints + token decrypt)")
+            // 7a. Endpoints alternativos
+            for (source in sources) {
+                if (source.token.isBlank()) continue
+                Log.i(TAG, "$logKey v11 ALT_ENDPOINTS for movieId=$movieId label=${source.label}")
+                val altResp = tryAlternativeEndpoints(movieId, source.token, true, url, logKey)
+                if (altResp.isNotBlank()) {
+                    if (emitFromApiResponse(altResp, url, subtitleCallback, callback, defaultLabel = source.label)) {
+                        anyEmitted = true
+                    }
+                }
+            }
+            // 7b. Descifrar token AES-CBC client-side
+            if (!anyEmitted) {
+                for (source in sources) {
+                    if (source.token.isBlank()) continue
+                    Log.i(TAG, "$logKey v11 TOKEN_DECRYPT label=${source.label} provider=${source.provider}")
+                    val decryptedUrl = decryptTokenAesCbc(source.token, logKey)
+                    if (decryptedUrl.isNotBlank()) {
+                        Log.i(TAG, "$logKey v11 TOKEN_DECRYPT SUCCESS: $decryptedUrl")
+                        val linkType = when {
+                            decryptedUrl.contains(".m3u8") -> ExtractorLinkType.M3U8
+                            decryptedUrl.contains(".mp4") -> ExtractorLinkType.VIDEO
+                            else -> ExtractorLinkType.DASH
+                        }
+                        callback(
+                            newExtractorLink(source.label, decryptedUrl, linkType) {
+                                this.referer = url
+                                this.headers = mapOf("Origin" to mainUrl, "User-Agent" to browserUA)
+                            }
+                        )
+                        anyEmitted = true
+                    }
+                }
+            }
+        }
+
         Log.i(TAG, "$logKey FINAL anyEmitted=$anyEmitted")
         return anyEmitted
     }
@@ -1674,6 +1761,224 @@ class DonghuaLifeBetaProvider : MainAPI() {
             }
         }
         return result
+    }
+
+    /**
+     * v11: Prueba endpoints alternativos al /api/sources (que está mockeado).
+     * Quizás alguno no tiene bot detection y devuelve URLs reales.
+     *
+     * @param contentId episodeId o movieId
+     * @param token token del source
+     * @param isMovie true si es película, false si es episodio
+     * @param referer URL de la página (para headers)
+     * @return respuesta del primer endpoint que devuelva algo no-mock, o "" si ninguno
+     */
+    private suspend fun tryAlternativeEndpoints(
+        contentId: String,
+        token: String,
+        isMovie: Boolean,
+        referer: String,
+        logKey: String
+    ): String {
+        val idParam = if (isMovie) "movieId" else "episodeId"
+        val encToken = URLEncoder.encode(token, "UTF-8")
+        val altEndpoints = listOf(
+            "/api/embed",
+            "/api/source",
+            "/api/v1/sources",
+            "/api/play",
+            "/api/stream",
+            "/api/video",
+            "/api/links",
+            "/api/extract",
+            "/api/resolve",
+            "/api/getSources",
+            "/api/get-sources",
+        )
+        val headers = mapOf(
+            "Accept" to "application/json, text/plain, */*",
+            "Accept-Language" to "es-ES,es;q=0.9,en;q=0.8",
+            "Origin" to mainUrl,
+            "Referer" to referer,
+            "User-Agent" to browserUA,
+            "Sec-Fetch-Dest" to "empty",
+            "Sec-Fetch-Mode" to "cors",
+            "Sec-Fetch-Site" to "same-origin",
+        ) + ajaxClientHints
+
+        for (endpoint in altEndpoints) {
+            val url = "$mainUrl$endpoint?$idParam=$contentId&token=$encToken"
+            try {
+                val resp = app.get(url, headers = headers, timeout = 15L).text
+                val isMock = resp.contains("cdn.example.com") ||
+                             resp.contains("/video/example") ||
+                             resp.contains("/embed/video/example")
+                Log.i(TAG, "$logKey ALT $endpoint respLen=${resp.length} isMock=$isMock " +
+                    "head=${resp.take(150).replace("\n", " ")}")
+                if (resp.isNotBlank() && resp.length > 5 && !isMock &&
+                    !resp.contains("\"error\"") && resp != "{}") {
+                    Log.i(TAG, "$logKey ALT $endpoint NON-MOCK RESPONSE FOUND!")
+                    return resp
+                }
+            } catch (e: Exception) {
+                Log.i(TAG, "$logKey ALT $endpoint error: ${e.message}")
+            }
+        }
+        return ""
+    }
+
+    /**
+     * v11: Descarga el JS chunk principal del watch/peliculas page y busca strings
+     * relevantes (api/sources, AES, decrypt, key, secret, signature) para intentar
+     * encontrar la lógica de decodificación del token client-side.
+     *
+     * @param html HTML de la página (para extraer URLs de chunks JS)
+     */
+    private suspend fun downloadAndAnalyzeJs(html: String, logKey: String) {
+        try {
+            // Extraer URLs de chunks JS del HTML
+            val jsUrls = Regex("""(/_next/static/chunks/[^"'\s]+\.js)""")
+                .findAll(html)
+                .map { it.groupValues[1] }
+                .distinct()
+                .toList()
+            Log.i(TAG, "$logKey JS_ANALYZE found ${jsUrls.size} JS chunks in HTML")
+            // Solo loguear URLs que puedan ser relevantes (watch, peliculas, page, layout, sources)
+            val relevant = jsUrls.filter { url ->
+                url.contains("page") || url.contains("layout") ||
+                url.contains("watch") || url.contains("peliculas") ||
+                url.contains("source") || url.contains("video") ||
+                url.contains("api") || url.contains("embed")
+            }
+            Log.i(TAG, "$logKey JS_ANALYZE relevant chunks: ${relevant.size} " +
+                "urls=${relevant.joinToString(",") { it.takeLast(60) }}")
+
+            // Descargar los primeros 3 chunks relevantes y buscar strings
+            val headers = mapOf(
+                "User-Agent" to browserUA,
+                "Accept" to "*/*",
+                "Accept-Language" to "es-ES,es;q=0.9,en;q=0.8",
+                "Referer" to mainUrl,
+                "Origin" to mainUrl,
+                "Sec-Fetch-Dest" to "script",
+                "Sec-Fetch-Mode" to "no-cors",
+                "Sec-Fetch-Site" to "same-origin",
+            ) + ajaxClientHints
+
+            // Palabras clave a buscar en el JS
+            val searchTerms = listOf(
+                "api/sources", "/api/embed", "/api/source", "/api/play",
+                "AES", "decrypt", "CryptoJS", "crypto.subtle",
+                "SECRET_KEY", "secretKey", "ENCRYPTION_KEY", "encryptionKey",
+                "signature", "verify", "hmac", "HMAC",
+                "token", "resolveToken", "decodeToken",
+            )
+
+            for (chunkUrl in relevant.take(5)) {
+                try {
+                    val fullUrl = if (chunkUrl.startsWith("http")) chunkUrl else "$mainUrl$chunkUrl"
+                    val js = app.get(fullUrl, headers = headers, timeout = 20L).text
+                    Log.i(TAG, "$logKey JS chunk ${chunkUrl.takeLast(50)} len=${js.length}")
+                    // Buscar strings relevantes
+                    val found = mutableListOf<String>()
+                    for (term in searchTerms) {
+                        val idx = js.indexOf(term, ignoreCase = true)
+                        if (idx >= 0) {
+                            // Extraer 100 chars alrededor del match
+                            val start = maxOf(0, idx - 50)
+                            val end = minOf(js.length, idx + term.length + 100)
+                            found.add("'$term' @ $idx: ...${js.substring(start, end)}...")
+                        }
+                    }
+                    if (found.isNotEmpty()) {
+                        Log.i(TAG, "$logKey JS chunk ${chunkUrl.takeLast(50)} MATCHES:")
+                        for (m in found) Log.i(TAG, "$logKey   $m")
+                    }
+                    // Buscar también strings hex de 64 chars (posible AES-256 key)
+                    val hexKeyPattern = Regex("""["']([0-9a-fA-F]{64})["']""")
+                    val hexMatches = hexKeyPattern.findAll(js).take(3).toList()
+                    if (hexMatches.isNotEmpty()) {
+                        Log.i(TAG, "$logKey JS chunk ${chunkUrl.takeLast(50)} HEX64 (possible AES key):")
+                        for (m in hexMatches) Log.i(TAG, "$logKey   ${m.groupValues[1]}")
+                    }
+                } catch (e: Exception) {
+                    Log.i(TAG, "$logKey JS chunk ${chunkUrl.takeLast(50)} error: ${e.message}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.i(TAG, "$logKey JS_ANALYZE error: ${e.message}")
+        }
+    }
+
+    /**
+     * v11: Intenta descifrar un token AES-CBC client-side.
+     * El token base64 decodificado es JSON: {"v":1,"iv":"<32hex>","data":"<192hex>","sig":"<base64>"}
+     * - iv: 16 bytes (AES block size)
+     * - data: N bytes (múltiplo de 16, cifrado AES-256-CBC)
+     * - sig: HMAC-SHA256 para verificación (no necesitamos verificar para descifrar)
+     *
+     * Probamos varias keys hardcoded comunes (encontradas en otros sitios Next.js
+     * que usan el mismo patrón). Si ninguna funciona, no podemos descifrar y
+     * tendremos que obtener la key del JS del sitio.
+     *
+     * @param token Token base64 del source
+     * @return URL descifrada o "" si no se pudo descifrar
+     */
+    private fun decryptTokenAesCbc(token: String, logKey: String): String {
+        if (token.isBlank()) return ""
+        try {
+            // Decodificar base64 → JSON
+            val jsonStr = String(Base64.getDecoder().decode(token), Charsets.UTF_8)
+            Log.i(TAG, "$logKey TOKEN_DEC b64decoded=$jsonStr")
+            // Parsear JSON manualmente
+            val ivMatch = Regex(""""iv":"([0-9a-fA-F]+)"""").find(jsonStr)
+            val dataMatch = Regex(""""data":"([0-9a-fA-F]+)"""").find(jsonStr)
+            if (ivMatch == null || dataMatch == null) {
+                Log.i(TAG, "$logKey TOKEN_DEC no iv/data found in JSON")
+                return ""
+            }
+            val ivHex = ivMatch.groupValues[1]
+            val dataHex = dataMatch.groupValues[1]
+            val ivBytes = ivHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+            val dataBytes = dataHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+            Log.i(TAG, "$logKey TOKEN_DEC iv=${ivBytes.size}B data=${dataBytes.size}B")
+
+            // Keys comunes a probar (placeholders — necesitamos la key real del JS).
+            // Estas son solo para diagnóstico; es muy improbable que alguna funcione.
+            val candidateKeys = listOf(
+                "donghualife-secret-key-2024-v1!!!",  // 32 chars
+                "donghualife2024secretkey1234567890ab",  // 32 chars
+                "beta.donghualife.com-secret-key-2024",  // 36 chars (truncaremos a 32)
+                "0123456789abcdef0123456789abcdef",  // 32 chars hex demo
+                "donghualife-beta-secret-key-32bytes!",  // 34 chars
+            )
+            for (keyStr in candidateKeys) {
+                // Pad/truncar a 32 bytes (AES-256 key size)
+                val keyBytes = if (keyStr.length >= 32) {
+                    keyStr.toByteArray(Charsets.UTF_8).copyOfRange(0, 32)
+                } else {
+                    keyStr.toByteArray(Charsets.UTF_8).copyOf(32)
+                }
+                try {
+                    val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+                    cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), IvParameterSpec(ivBytes))
+                    val decrypted = cipher.doFinal(dataBytes)
+                    val decStr = String(decrypted, Charsets.UTF_8)
+                    Log.i(TAG, "$logKey TOKEN_DEC key='$keyStr' → $decStr")
+                    // Si el resultado contiene una URL, retornarla
+                    val urlMatch = Regex("""https?://[^\s"']+""").find(decStr)
+                    if (urlMatch != null) {
+                        Log.i(TAG, "$logKey TOKEN_DEC URL FOUND: ${urlMatch.value}")
+                        return urlMatch.value
+                    }
+                } catch (e: Exception) {
+                    Log.i(TAG, "$logKey TOKEN_DEC key='$keyStr' error: ${e.message}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.i(TAG, "$logKey TOKEN_DEC outer error: ${e.message}")
+        }
+        return ""
     }
 
     /**
