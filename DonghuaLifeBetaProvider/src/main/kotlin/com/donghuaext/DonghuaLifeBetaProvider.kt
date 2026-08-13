@@ -16,6 +16,7 @@ import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.collections.ArrayList
+import kotlinx.coroutines.delay
 
 private const val TAG = "DonghuaLifeBeta"
 
@@ -764,9 +765,9 @@ class DonghuaLifeBetaProvider : MainAPI() {
             data to ""
         }
 
-        val response = app.get(cleanUrl, headers = browserHeaders, timeout = 60)
-        val html = response.text
-        val rscPayload = extractRscPayload(html)
+        var response = app.get(cleanUrl, headers = browserHeaders, timeout = 60)
+        var html = response.text
+        var rscPayload = extractRscPayload(html)
         // Log diagnóstico: tamaño, presencia de marcadores clave, y preview del HTML
         Log.i(TAG, "loadLinks url=$cleanUrl htmlLen=${html.length} rscLen=${rscPayload.length} " +
             "hasActiveEpId=${rscPayload.contains("\"activeEpisodeId\":")} " +
@@ -792,16 +793,39 @@ class DonghuaLifeBetaProvider : MainAPI() {
         } catch (e: Exception) {
             Log.i(TAG, "loadLinks SET_COOKIE error reading: ${e.message}")
         }
-        // Preview del inicio y final del HTML para diagnóstico
-        if (rscPayload.isEmpty()) {
-            Log.i(TAG, "loadLinks HTML head=${html.take(300).replace("\n", " ")}")
-            Log.i(TAG, "loadLinks HTML tail=${html.takeLast(300).replace("\n", " ")}")
-        }
-        // v9: Si el RSC es sospechosamente pequeño (bot detection), dumpear primeros 5000 chars
-        // para ver qué data logró llegar. Esto nos permite ver la estructura real del RSC reducido.
+        // v13: Si el RSC está reducido (bot detection rate-based), hacer retry con delay.
+        // El log muestra que requests rápidos seguidos reciben RSC reducido (~26KB),
+        // pero después de un gap de ~12s el RSC vuelve a la normalidad (~200KB).
+        // Estrategia: esperar 3s y reintentar hasta 2 veces.
         if (rscPayload.isNotEmpty() && rscPayload.length < 50000) {
             Log.i(TAG, "loadLinks RSC_DUMP (reduced, ${rscPayload.length} chars): " +
                 rscPayload.take(5000).replace("\n", " "))
+            Log.i(TAG, "loadLinks v13 RETRY: RSC reduced (${rscPayload.length} < 50000), " +
+                "bot detection suspected. Retrying with delay...")
+            var retryCount = 0
+            while (rscPayload.length < 50000 && retryCount < 2) {
+                retryCount++
+                Log.i(TAG, "loadLinks v13 RETRY #$retryCount: waiting 3s before retry...")
+                delay(3000L)
+                try {
+                    response = app.get(cleanUrl, headers = browserHeaders, timeout = 60)
+                    html = response.text
+                    rscPayload = extractRscPayload(html)
+                    Log.i(TAG, "loadLinks v13 RETRY #$retryCount done: htmlLen=${html.length} " +
+                        "rscLen=${rscPayload.length} " +
+                        "hasActiveEpId=${rscPayload.contains("\"activeEpisodeId\":")}")
+                } catch (e: Exception) {
+                    Log.i(TAG, "loadLinks v13 RETRY #$retryCount error: ${e.message}")
+                    break
+                }
+            }
+            if (rscPayload.length >= 50000) {
+                Log.i(TAG, "loadLinks v13 RETRY SUCCESS: got full RSC (${rscPayload.length} chars) " +
+                    "after $retryCount retries")
+            } else {
+                Log.i(TAG, "loadLinks v13 RETRY FAILED: RSC still reduced after $retryCount retries " +
+                    "(${rscPayload.length} chars). Proceeding with fallback strategies.")
+            }
         }
         // v11: Si el RSC está reducido (bot detection confirmado), descargar y analizar JS chunks
         // para buscar la key AES o la lógica de decodificación del token client-side.
