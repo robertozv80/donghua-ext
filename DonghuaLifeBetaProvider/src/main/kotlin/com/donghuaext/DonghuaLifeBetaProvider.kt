@@ -18,26 +18,32 @@ private const val TAG = "DonghuaLifeBeta"
 /**
  * DonghuaLifeBetaProvider — Provider para https://beta.donghualife.com
  *
- * v9 (2026-08-13): FIX CRÍTICO basado en logcat v8 del emulador.
- *   Hallazgo v8: con el fix de Accept-Encoding, el RSC vuelve a extraerse
- *   (rscLen=26896 para Martial Master), pero sigue siendo el RSC REDUCIDO
- *   por bot detection (367KB real vs 27KB reducido). El server sigue:
- *     - Omitiendo activeEpisodeId del RSC reducido
- *     - Devolviendo URLs mock (cdn.example.com/video.mp4) en /api/sources
- *   Conclusión: la bot detection del server NO se bypassa solo con headers.
- *   El server probablemente usa fingerprinting TLS/HTTP/2 o cookies de sesión
- *   que OkHttp no puede reproducir.
+ * v10 (2026-08-13): FIX basado en logcat v9 del emulador.
+ *   Hallazgo v9: el fix v9 funcionó correctamente:
+ *     - Para Martial Master, derivó contentId=cad7248e-08f6-4258-9f99-83e178a3e943
+ *       (coincide con el episodio.html de navegador).
+ *     - MOCK_URL_DETECTED se disparó bien → ExoPlayer ya no recibe URLs mock.
+ *     - RSC_DUMP se imprimió, confirmando que el RSC reducido SÍ contiene
+ *       sources[] con tokens (solo falta activeEpisodeId).
+ *   PERO el API /api/sources sigue devolviendo la MISMA respuesta mock de 719
+ *   bytes sin importar qué token, episodeId o movieId enviemos. Incluso sin
+ *   token (M0b), devuelve el mismo mock. Esto confirma bot detection a nivel
+ *   del endpoint /api/sources, no a nivel de tokens.
  *
- *   Estrategia v9: WORKAROUND en lugar de bypass.
- *   1. DUMPEAR RSC reducido (primeros 5000 chars) para ver qué data llega.
- *   2. EXTRAER TODOS los sources con token del RSC, sin depender de
- *      activeEpisodeId. Cada source.id tiene formato "<contentId>-<index>",
- *      de donde derivamos el episodeId/movieId vía MovieSource.deriveContentId().
- *   3. Para cada source + contentId derivado, llamar /api/sources?episodeId=X&token=Y.
- *   4. DETECTAR URLs mock en respuestas del API (cdn.example.com, /video/example)
- *      y NO emitirlas como ExtractorLink (evita errores en ExoPlayer).
- *      Se loguea como MOCK_URL_DETECTED para diagnóstico.
+ *   Hipótesis v10: el server detecta el cliente como bot por headers sospechosos:
+ *     1. X-Requested-With: XMLHttpRequest — header de la era jQuery que Chrome
+ *        fetch() NO envía. Es una red flag clásica para bot detection moderno.
+ *     2. Falta de Sec-Ch-Ua client hints — Chrome los envía siempre.
+ *     3. Falta de Priority header.
  *
+ *   Cambios v10:
+ *   - Removido X-Requested-With de TODOS los headers AJAX.
+ *   - Agregado ajaxClientHints: Sec-Ch-Ua, Sec-Ch-Ua-Mobile, Sec-Ch-Ua-Platform, Priority.
+ *   - Agregado Sec-Ch-Ua client hints a browserHeaders (document navigation).
+ *   - Agregado log de Set-Cookie headers de la respuesta inicial para ver si
+ *     Cloudflare setea cf_clearance u otra cookie de sesión necesaria.
+ *
+ * v9: extractAllSourcesFromRsc + deriveContentId (workaround sin activeEpisodeId).
  * v8: Quitado Accept-Encoding de browserHeaders (NiceHttp lo maneja solo).
  * v7: browserUA + browserHeaders para intentar bypass (no funcionó solo).
  * v6: M0/EE/EF/M0b métodos GET con episodeId/movieId + token.
@@ -72,6 +78,8 @@ class DonghuaLifeBetaProvider : MainAPI() {
      * Headers completos de navegador para todas las peticiones a beta.donghualife.com.
      * NOTA: NO incluimos Accept-Encoding porque NiceHttp/OkHttp ya maneja gzip
      * automáticamente y agregarlo manualmente puede causar problemas de descompresión.
+     *
+     * v10: agregados Sec-Ch-Ua client hints (Chrome los envía siempre) y Priority.
      */
     private val browserHeaders = mapOf(
         "User-Agent" to browserUA,
@@ -84,6 +92,21 @@ class DonghuaLifeBetaProvider : MainAPI() {
         "Sec-Fetch-Mode" to "navigate",
         "Sec-Fetch-Site" to "none",
         "Sec-Fetch-User" to "?1",
+        "Sec-Ch-Ua" to "\"Not?A_Brand\";v=\"99\", \"Chromium\";v=\"149\", \"Google Chrome\";v=\"149\"",
+        "Sec-Ch-Ua-Mobile" to "?0",
+        "Sec-Ch-Ua-Platform" to "\"Windows\"",
+        "Priority" to "u=0, i",
+    )
+
+    /**
+     * v10: Client hints compartidos para peticiones AJAX (fetch() desde el navegador).
+     * Aplicar a todos los headers de /api/sources.
+     */
+    private val ajaxClientHints = mapOf(
+        "Sec-Ch-Ua" to "\"Not?A_Brand\";v=\"99\", \"Chromium\";v=\"149\", \"Google Chrome\";v=\"149\"",
+        "Sec-Ch-Ua-Mobile" to "?0",
+        "Sec-Ch-Ua-Platform" to "\"Windows\"",
+        "Priority" to "u=1, i",
     )
 
     override val mainPage = mainPageOf(
@@ -751,6 +774,22 @@ class DonghuaLifeBetaProvider : MainAPI() {
             "hasNextF=${html.contains("self.__next_f")} " +
             "hasCloudflare=${html.contains("cloudflare") || html.contains("cf-")} " +
             "httpCode=${response.code}")
+        // v10: Log de cookies Set-Cookie de la respuesta inicial.
+        // Si Cloudflare setea cf_clearance u otra cookie de sesión, la veremos aquí.
+        // NiceHttp expone las cookies del response en response.cookies o response.headers.
+        try {
+            val setCookieHeaders = response.headers.keys
+                .filter { it.equals("set-cookie", ignoreCase = true) }
+                .flatMap { response.headers.values(it) }
+            if (setCookieHeaders.isNotEmpty()) {
+                Log.i(TAG, "loadLinks SET_COOKIE count=${setCookieHeaders.size} " +
+                    "cookies=${setCookieHeaders.joinToString(" | ") { it.take(120) }}")
+            } else {
+                Log.i(TAG, "loadLinks SET_COOKIE count=0 (no cookies returned)")
+            }
+        } catch (e: Exception) {
+            Log.i(TAG, "loadLinks SET_COOKIE error reading: ${e.message}")
+        }
         // Preview del inicio y final del HTML para diagnóstico
         if (rscPayload.isEmpty()) {
             Log.i(TAG, "loadLinks HTML head=${html.take(300).replace("\n", " ")}")
@@ -1190,6 +1229,8 @@ class DonghuaLifeBetaProvider : MainAPI() {
 
         // Headers tipo AJAX de navegador real (Next.js / API routes los valida).
         // Sin Sec-Fetch-* y Accept correcto, el server puede devolver respuestas mock.
+        // v10: quitado X-Requested-With (jQuery-era, Chrome fetch() no lo envía —
+        // era una red flag para bot detection). Agregados Sec-Ch-Ua client hints.
         val headers = mapOf(
             "Accept" to "application/json, text/plain, */*",
             "Accept-Language" to "es-ES,es;q=0.9,en;q=0.8",
@@ -1197,11 +1238,10 @@ class DonghuaLifeBetaProvider : MainAPI() {
             "Origin" to mainUrl,
             "Referer" to url,
             "User-Agent" to browserUA,
-            "X-Requested-With" to "XMLHttpRequest",
             "Sec-Fetch-Dest" to "empty",
             "Sec-Fetch-Mode" to "cors",
             "Sec-Fetch-Site" to "same-origin",
-        )
+        ) + ajaxClientHints
 
         var anyEmitted = false
 
@@ -1429,6 +1469,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
         if (sources.isEmpty()) return false
 
         // Headers tipo AJAX de navegador real (mismo que loadMovieLinks).
+        // v10: sin X-Requested-With, con Sec-Ch-Ua client hints.
         val headers = mapOf(
             "Accept" to "application/json, text/plain, */*",
             "Accept-Language" to "es-ES,es;q=0.9,en;q=0.8",
@@ -1436,11 +1477,10 @@ class DonghuaLifeBetaProvider : MainAPI() {
             "Origin" to mainUrl,
             "Referer" to referer,
             "User-Agent" to browserUA,
-            "X-Requested-With" to "XMLHttpRequest",
             "Sec-Fetch-Dest" to "empty",
             "Sec-Fetch-Mode" to "cors",
             "Sec-Fetch-Site" to "same-origin",
-        )
+        ) + ajaxClientHints
 
         var anyEmitted = false
 
