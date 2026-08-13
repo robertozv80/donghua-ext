@@ -62,13 +62,16 @@ class DonghuaLifeBetaProvider : MainAPI() {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 
-    /** Headers completos de navegador para todas las peticiones a beta.donghualife.com. */
+    /**
+     * Headers completos de navegador para todas las peticiones a beta.donghualife.com.
+     * NOTA: NO incluimos Accept-Encoding porque NiceHttp/OkHttp ya maneja gzip
+     * automáticamente y agregarlo manualmente puede causar problemas de descompresión.
+     */
     private val browserHeaders = mapOf(
         "User-Agent" to browserUA,
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9," +
                     "image/avif,image/webp,*/*;q=0.8",
         "Accept-Language" to "es-ES,es;q=0.9,en;q=0.8",
-        "Accept-Encoding" to "gzip, deflate, br",
         "Connection" to "keep-alive",
         "Upgrade-Insecure-Requests" to "1",
         "Sec-Fetch-Dest" to "document",
@@ -734,11 +737,19 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val response = app.get(cleanUrl, headers = browserHeaders, timeout = 60)
         val html = response.text
         val rscPayload = extractRscPayload(html)
-        // Log diagnóstico del tamaño del RSC y presencia de marcadores clave
+        // Log diagnóstico: tamaño, presencia de marcadores clave, y preview del HTML
         Log.i(TAG, "loadLinks url=$cleanUrl htmlLen=${html.length} rscLen=${rscPayload.length} " +
             "hasActiveEpId=${rscPayload.contains("\"activeEpisodeId\":")} " +
             "hasSources=${rscPayload.contains("\"sources\":[")} " +
-            "hasTokens=${rscPayload.contains("\"token\":")}")
+            "hasTokens=${rscPayload.contains("\"token\":")} " +
+            "hasNextF=${html.contains("self.__next_f")} " +
+            "hasCloudflare=${html.contains("cloudflare") || html.contains("cf-")} " +
+            "httpCode=${response.code}")
+        // Preview del inicio y final del HTML para diagnóstico
+        if (rscPayload.isEmpty()) {
+            Log.i(TAG, "loadLinks HTML head=${html.take(300).replace("\n", " ")}")
+            Log.i(TAG, "loadLinks HTML tail=${html.takeLast(300).replace("\n", " ")}")
+        }
 
         val isMovie = cleanUrl.contains("/peliculas/")
 
