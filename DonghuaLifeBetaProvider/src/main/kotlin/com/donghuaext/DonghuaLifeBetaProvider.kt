@@ -944,7 +944,12 @@ class DonghuaLifeBetaProvider : MainAPI() {
                             else -> ExtractorLinkType.DASH
                         }
                         callback(
-                            newExtractorLink(src.label, decryptedUrl, linkType) {
+                            newExtractorLink(
+                                source = src.label,
+                                name = src.label,
+                                url = decryptedUrl,
+                                type = linkType
+                            ) {
                                 this.referer = url
                                 this.headers = mapOf("Origin" to mainUrl, "User-Agent" to browserUA)
                             }
@@ -1473,7 +1478,12 @@ class DonghuaLifeBetaProvider : MainAPI() {
                             else -> ExtractorLinkType.DASH
                         }
                         callback(
-                            newExtractorLink(source.label, decryptedUrl, linkType) {
+                            newExtractorLink(
+                                source = source.label,
+                                name = source.label,
+                                url = decryptedUrl,
+                                type = linkType
+                            ) {
                                 this.referer = url
                                 this.headers = mapOf("Origin" to mainUrl, "User-Agent" to browserUA)
                             }
