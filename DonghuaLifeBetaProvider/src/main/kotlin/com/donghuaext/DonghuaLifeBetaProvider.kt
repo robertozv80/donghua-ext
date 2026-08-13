@@ -3055,89 +3055,181 @@ class DonghuaLifeBetaProvider : MainAPI() {
             emitted = true
             callback(link)
         }
+
+        // v15 FIX: Rumble ahora devuelve HTTP 410 (Gone) para /embed/<vkey> con bot detection.
+        // Solución: usar la API pública JSON de Rumble: /api/Media?vkey=<vkey>
+        // Esta API devuelve JSON estructurado con URLs directas m3u8/mp4 y NO tiene el 410 block.
+        val vkey = Regex("""/embed/([A-Za-z0-9_]+)""").find(embedUrl)?.groupValues?.get(1)
+            ?: Regex("""vkey=([A-Za-z0-9_]+)""").find(embedUrl)?.groupValues?.get(1)
+
+        val rumbleHeaders = mapOf(
+            "User-Agent" to browserUA,
+            "Accept" to "application/json, text/plain, */*",
+            "Accept-Language" to "en-US,en;q=0.9",
+            "Referer" to "https://rumble.com/",
+            "Origin" to "https://rumble.com",
+        )
+
+        // ===================== MÉTODO 1: API pública /api/Media?vkey=<vkey> =====================
+        if (vkey != null) {
+            try {
+                val apiUrl = "https://rumble.com/api/Media?vkey=$vkey"
+                val resp = app.get(apiUrl, headers = rumbleHeaders, timeout = 20L)
+                val jsonText = resp.text
+                Log.i(TAG, "extractRumble: API vkey=$vkey httpCode=${resp.code} jsonLen=${jsonText.length} head=${jsonText.take(200)}")
+
+                // La API devuelve: {"data":{"<vkey>":{"hls":{"auto":{"url":"...m3u8"}},"ua":{"tar":{"1080":{"url":"...mp4"}}}}}}
+                // o variante con "video" key directa
+                val json = try { AppUtils.parseJson(jsonText) } catch (_: Throwable) { null }
+                if (json != null) {
+                    val dataObj = json.asJsonObject?.getAsJsonObject("data")
+                    val vidObj = dataObj?.getAsJsonObject(vkey)
+                        ?: dataObj?.entrySet()?.firstOrNull()?.value?.asJsonObject
+                        ?: json.asJsonObject
+
+                    // hls.auto.url
+                    val hlsAutoUrl = vidObj
+                        ?.getAsJsonObject("hls")
+                        ?.getAsJsonObject("auto")
+                        ?.get("url")?.asString
+                    if (!hlsAutoUrl.isNullOrEmpty()) {
+                        try {
+                            generateM3u8(serverName, hlsAutoUrl, "https://rumble.com").forEach(trackingCb)
+                            Log.i(TAG, "extractRumble: API hls.auto emitted: ${hlsAutoUrl.take(80)}")
+                            if (emitted) return true
+                        } catch (e: Exception) {
+                            Log.w(TAG, "extractRumble: API hls.auto generateM3u8 failed: ${e.message}")
+                        }
+                    }
+
+                    // hls.url (fallback si no hay hls.auto)
+                    if (!emitted) {
+                        val hlsUrl = vidObj?.getAsJsonObject("hls")?.get("url")?.asString
+                        if (!hlsUrl.isNullOrEmpty() && hlsUrl.contains(".m3u8")) {
+                            try {
+                                generateM3u8(serverName, hlsUrl, "https://rumble.com").forEach(trackingCb)
+                                Log.i(TAG, "extractRumble: API hls.url emitted: ${hlsUrl.take(80)}")
+                                if (emitted) return true
+                            } catch (e: Exception) {
+                                Log.w(TAG, "extractRumble: API hls.url generateM3u8 failed: ${e.message}")
+                            }
+                        }
+                    }
+
+                    // ua.tar.<quality>.url (multiple qualities)
+                    val tarObj = vidObj?.getAsJsonObject("ua")?.getAsJsonObject("tar")
+                    if (tarObj != null) {
+                        var tarEmitted = false
+                        for ((qLabel, qEntry) in tarObj.entrySet()) {
+                            try {
+                                val u = qEntry.asJsonObject?.get("url")?.asString ?: continue
+                                if (u.isBlank()) continue
+                                val quality = when (qLabel) {
+                                    "2160", "1440" -> Qualities.P2160.value
+                                    "1080" -> Qualities.P1080.value
+                                    "720" -> Qualities.P720.value
+                                    "480" -> Qualities.P480.value
+                                    "360" -> Qualities.P360.value
+                                    else -> Qualities.Unknown.value
+                                }
+                                val isM3u8 = u.contains(".m3u8")
+                                trackingCb(
+                                    newExtractorLink(
+                                        source = serverName,
+                                        name = "$serverName ${qLabel}p",
+                                        url = u,
+                                        type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                                    ) {
+                                        this.referer = "https://rumble.com"
+                                        this.quality = quality
+                                    }
+                                )
+                                tarEmitted = true
+                            } catch (_: Throwable) {}
+                        }
+                        if (tarEmitted) {
+                            Log.i(TAG, "extractRumble: API ua.tar emitted ${tarObj.size()} qualities")
+                            if (emitted) return true
+                        }
+                    }
+
+                    // Fallback: scan any .m3u8 or .mp4 URL en el JSON completo
+                    if (!emitted) {
+                        for (m in Regex("""(https?://[^"]+\.(?:m3u8|mp4)[^"]*)""").findAll(jsonText)) {
+                            val u = m.groupValues[1].replace("\\/", "/")
+                            val isM3u8 = u.contains(".m3u8")
+                            trackingCb(
+                                newExtractorLink(
+                                    source = serverName,
+                                    name = serverName,
+                                    url = u,
+                                    type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                                ) {
+                                    this.referer = "https://rumble.com"
+                                    this.quality = Qualities.Unknown.value
+                                }
+                            )
+                        }
+                        if (emitted) {
+                            Log.i(TAG, "extractRumble: API regex fallback emitted")
+                            return true
+                        }
+                    }
+                } else {
+                    Log.w(TAG, "extractRumble: API response not JSON parseable")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "extractRumble: API call failed for vkey=$vkey: ${e.message}")
+            }
+        } else {
+            Log.w(TAG, "extractRumble: could not extract vkey from $embedUrl")
+        }
+
+        // ===================== MÉTODO 2: fallback al scrape del embed page (caso 200) =====================
+        // Algunos videos (poco frecuentes) sí devuelven 200 con HTML scrolleable.
         try {
-            // v15 FIX: Rumble bloquea requests sin User-Agent y headers de browser.
-            // Sin estos headers, app.get devuelve 403/empty y todos los patrones fallan.
-            val rumbleHeaders = mapOf(
+            val embedHeaders = mapOf(
                 "User-Agent" to browserUA,
                 "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Accept-Language" to "en-US,en;q=0.9,es;q=0.8",
-                "Accept-Encoding" to "gzip, deflate, br",
+                "Accept-Language" to "en-US,en;q=0.9",
+                "Referer" to "https://rumble.com/",
                 "Sec-Fetch-Dest" to "iframe",
                 "Sec-Fetch-Mode" to "navigate",
-                "Sec-Fetch-Site" to "cross-site",
+                "Sec-Fetch-Site" to "same-origin",
                 "Upgrade-Insecure-Requests" to "1",
             )
-            val resp = app.get(embedUrl, referer = referer, headers = rumbleHeaders, timeout = 30L)
+            val resp = app.get(embedUrl, referer = "https://rumble.com/", headers = embedHeaders, timeout = 30L)
             val html = resp.text
-            Log.i(TAG, "extractRumble: url=$embedUrl httpCode=${resp.code} htmlLen=${html.length}")
+            Log.i(TAG, "extractRumble: embedPage httpCode=${resp.code} htmlLen=${html.length}")
 
-            // Método 1: HLS master playlist "hls":{"auto":{"url":"..."}}
-            val hlsAutoPatterns = listOf(
-                Regex(""""hls"\s*:\s*\{[^{}]*"auto"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+)""""),
-                Regex(""""hls"\s*:\s*\{\s*"url"\s*:\s*"([^"]+\.m3u8[^"]*)""""),
-                Regex(""""url"\s*:\s*"(https?://rumble\.com/hls-vod/[^"]+\.m3u8[^"]*)""""),
-            )
-            for (pattern in hlsAutoPatterns) {
-                val m = pattern.find(html)
-                if (m != null) {
-                    val u = m.destructured.component1().replace("\\/", "/").replace("\\u0026", "&")
+            if (resp.code == 200 && html.length > 5000) {
+                // HLS auto
+                val hlsAutoPattern = Regex(""""hls"\s*:\s*\{[^{}]*"auto"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+)"""")
+                hlsAutoPattern.find(html)?.let { m ->
+                    val u = m.groupValues[1].replace("\\/", "/").replace("\\u0026", "&")
                     try {
                         generateM3u8(serverName, u, referer).forEach(trackingCb)
                         if (emitted) return true
-                    } catch (e: Exception) {
-                        Log.w(TAG, "extractRumble: hls method failed: ${e.message}")
-                    }
+                    } catch (_: Throwable) {}
                 }
-            }
-
-            // Método 2: "ua":{"tar":{"<quality>":{"url":"..."}}}
-            val tarBlockMatch = Regex(""""ua"\s*:\s*\{[^{}]*"tar"\s*:\s*(\{[^}]+\})""").find(html)
-            if (tarBlockMatch != null) {
-                val tarBlock = tarBlockMatch.groupValues[1]
-                var foundAny = false
-                val tarQualityPattern = Regex(""""(\d{3,4})"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+)"""")
-                tarQualityPattern.findAll(tarBlock).forEach { match ->
-                    val qLabel = match.groupValues[1]
-                    val u = match.groupValues[2].replace("\\/", "/").replace("\\u0026", "&")
-                    val quality = when (qLabel) {
-                        "2160", "1440" -> Qualities.P2160.value
-                        "1080" -> Qualities.P1080.value
-                        "720" -> Qualities.P720.value
-                        "480" -> Qualities.P480.value
-                        "360" -> Qualities.P360.value
-                        else -> Qualities.Unknown.value
-                    }
-                    trackingCb(
-                        newExtractorLink(source = serverName, name = "$serverName ${qLabel}p", url = u, type = ExtractorLinkType.M3U8) {
-                            this.referer = referer
-                            this.quality = quality
-                        }
-                    )
-                    foundAny = true
-                }
-                if (foundAny) return true
-            }
-
-            // Método 3: URLs CDN rmbl.ws
-            val rmblPatterns = listOf(
-                Regex("""["'](https?://[^"']*rmbl\.ws[^"']*\.mp4[^"']*)["']"""),
-                Regex("""["'](https?://[^"']*rmbl\.ws[^"']*)["']"""),
-            )
-            for (pattern in rmblPatterns) {
-                val matches = pattern.findAll(html).toList()
-                if (matches.isNotEmpty()) {
-                    for (match in matches) {
-                        val u = match.destructured.component1()
-                        val quality = when {
-                            u.contains("1080") -> Qualities.P1080.value
-                            u.contains("720") -> Qualities.P720.value
-                            u.contains("480") -> Qualities.P480.value
-                            u.contains("360") -> Qualities.P360.value
+                // tar qualities
+                val tarBlockMatch = Regex(""""ua"\s*:\s*\{[^{}]*"tar"\s*:\s*(\{[^}]+\})""").find(html)
+                if (tarBlockMatch != null) {
+                    val tarBlock = tarBlockMatch.groupValues[1]
+                    Regex(""""(\d{3,4})"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+)"""").findAll(tarBlock).forEach { match ->
+                        val qLabel = match.groupValues[1]
+                        val u = match.groupValues[2].replace("\\/", "/").replace("\\u0026", "&")
+                        val quality = when (qLabel) {
+                            "2160", "1440" -> Qualities.P2160.value
+                            "1080" -> Qualities.P1080.value
+                            "720" -> Qualities.P720.value
+                            "480" -> Qualities.P480.value
+                            "360" -> Qualities.P360.value
                             else -> Qualities.Unknown.value
                         }
                         trackingCb(
-                            newExtractorLink(source = serverName, name = "$serverName ${quality / 1000}p", url = u, type = ExtractorLinkType.VIDEO) {
+                            newExtractorLink(source = serverName, name = "$serverName ${qLabel}p", url = u,
+                                type = ExtractorLinkType.M3U8) {
                                 this.referer = referer
                                 this.quality = quality
                             }
@@ -3145,53 +3237,38 @@ class DonghuaLifeBetaProvider : MainAPI() {
                     }
                     if (emitted) return true
                 }
-            }
-
-            // Método 4: m3u8 genérico
-            val m3u8Patterns = listOf(
-                Regex("""["'](https?://[^"']+\.m3u8[^"']*)["']"""),
-            )
-            for (pattern in m3u8Patterns) {
-                val match = pattern.find(html)
-                if (match != null) {
-                    val u = match.destructured.component1()
-                    try {
-                        generateM3u8(serverName, u, referer).forEach(trackingCb)
+                // rmbl.ws CDN
+                for (pattern in listOf(
+                    Regex("""["'](https?://[^"']*rmbl\.ws[^"']*\.mp4[^"']*)["']"""),
+                    Regex("""["'](https?://[^"']*rmbl\.ws[^"']*)["']"""),
+                )) {
+                    val matches = pattern.findAll(html).toList()
+                    if (matches.isNotEmpty()) {
+                        for (match in matches) {
+                            val u = match.groupValues[1]
+                            val quality = when {
+                                u.contains("1080") -> Qualities.P1080.value
+                                u.contains("720") -> Qualities.P720.value
+                                u.contains("480") -> Qualities.P480.value
+                                else -> Qualities.Unknown.value
+                            }
+                            trackingCb(
+                                newExtractorLink(source = serverName, name = "$serverName ${quality / 1000}p",
+                                    url = u, type = ExtractorLinkType.VIDEO) {
+                                    this.referer = referer
+                                    this.quality = quality
+                                }
+                            )
+                        }
                         if (emitted) return true
-                    } catch (e: Exception) {
-                        Log.w(TAG, "extractRumble: m3u8 method failed: ${e.message}")
                     }
                 }
             }
-
-            // Método 5 (NUEVO v15): patrones adicionales para Rumble reestructurado
-            // Rumble a veces usa "stream":"<url>" o "embedUrl":"<url>" en JSON
-            val extraPatterns = listOf(
-                Regex(""""stream"\s*:\s*"(https?://[^"]+\.(?:m3u8|mp4)[^"]*)""""),
-                Regex(""""embedUrl"\s*:\s*"(https?://[^"]+\.(?:m3u8|mp4)[^"]*)""""),
-                Regex("""(https?://[a-z0-9-]+\.rumble\.cloud[^"\s]+\.(?:m3u8|mp4)[^"\s]*)"""),
-                Regex("""(https?://[a-z0-9-]+\.akamaized\.net[^"\s]+/rumble[^"\s]+\.(?:m3u8|mp4)[^"\s]*)"""),
-            )
-            for (pattern in extraPatterns) {
-                val match = pattern.find(html)
-                if (match != null) {
-                    val u = match.destructured.component1().replace("\\/", "/").replace("\\u0026", "&")
-                    val isM3u8 = u.contains(".m3u8")
-                    trackingCb(
-                        newExtractorLink(source = serverName, name = serverName, url = u,
-                            type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
-                            this.referer = referer
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                    return true
-                }
-            }
-
-            Log.w(TAG, "extractRumble: no patterns matched in ${html.length} chars, htmlHead=${html.take(300)}")
         } catch (e: Exception) {
-            Log.w(TAG, "extractRumble: fetch failed for $embedUrl: ${e.message}")
+            Log.w(TAG, "extractRumble: embedPage fetch failed: ${e.message}")
         }
+
+        Log.w(TAG, "extractRumble: all methods failed for $embedUrl (vkey=$vkey)")
         return emitted
     }
 
