@@ -571,24 +571,25 @@ class DonghuaLifeBetaProvider : MainAPI() {
             val seasonNum = idx + 1
             val seasonSlug = season.slug
             val episodeCount = season.episodeCount
-            // initialEpisodes está ordenado ASCENDENTE por número
-            // El primer elemento nos dice cuál es el primer episodio disponible
-            val startEpNum = season.firstEpNumber.takeIf { it > 0 } ?: 1
+            // Si episodeNumbers está disponible (extraído de initialEpisodes[]), usar esos
+            // números reales — algunas series tienen saltos (ej: 10, 106, 566 en Supreme God Emperor).
+            // Si está vacío, asumir secuenciales: firstEpNumber..firstEpNumber+episodeCount-1.
+            val epNumbersToUse = if (season.episodeNumbers.isNotEmpty()) {
+                season.episodeNumbers
+            } else {
+                val start = season.firstEpNumber.takeIf { it > 0 } ?: 1
+                (0 until episodeCount).map { start + it }
+            }
 
-            if (episodeCount > 0) {
-                // Construir URLs /watch/{seasonSlug}-{N} para cada episodio
-                // Los episodios se numeran desde startEpNum hasta startEpNum+episodeCount-1
-                for (i in 0 until episodeCount) {
-                    val epNum = startEpNum + i
-                    val epUrl = "$mainUrl/watch/$seasonSlug-$epNum"
-                    episodes.add(
-                        newEpisode(epUrl) {
-                            this.season = seasonNum
-                            this.episode = epNum
-                            this.name = "Episodio $epNum"
-                        }
-                    )
-                }
+            for (epNum in epNumbersToUse) {
+                val epUrl = "$mainUrl/watch/$seasonSlug-$epNum"
+                episodes.add(
+                    newEpisode(epUrl) {
+                        this.season = seasonNum
+                        this.episode = epNum
+                        this.name = "Episodio $epNum"
+                    }
+                )
             }
         }
 
@@ -596,19 +597,21 @@ class DonghuaLifeBetaProvider : MainAPI() {
         for (season in specialSeasons) {
             val seasonSlug = season.slug
             val episodeCount = season.episodeCount
-            val startEpNum = season.firstEpNumber.takeIf { it > 0 } ?: 1
-            if (episodeCount > 0) {
-                for (i in 0 until episodeCount) {
-                    val epNum = startEpNum + i
-                    val epUrl = "$mainUrl/watch/$seasonSlug-$epNum"
-                    episodes.add(
-                        newEpisode(epUrl) {
-                            this.season = 0  // 0 = Especiales en CS3
-                            this.episode = epNum
-                            this.name = "Especial $epNum"
-                        }
-                    )
-                }
+            val epNumbersToUse = if (season.episodeNumbers.isNotEmpty()) {
+                season.episodeNumbers
+            } else {
+                val start = season.firstEpNumber.takeIf { it > 0 } ?: 1
+                (0 until episodeCount).map { start + it }
+            }
+            for (epNum in epNumbersToUse) {
+                val epUrl = "$mainUrl/watch/$seasonSlug-$epNum"
+                episodes.add(
+                    newEpisode(epUrl) {
+                        this.season = 0  // 0 = Especiales en CS3
+                        this.episode = epNum
+                        this.name = "Especial $epNum"
+                    }
+                )
             }
         }
 
@@ -724,16 +727,38 @@ class DonghuaLifeBetaProvider : MainAPI() {
             val countStr = m.groupValues[4]
             val episodeCount = countStr.toIntOrNull() ?: 0
 
-            // Buscar el primer número de episodio en initialEpisodes[]
-            // Estructura: ..."initialEpisodes":[{"id":"...","title":"...","number":N,...}]
-            // Buscamos el primer "number":N después de "initialEpisodes":[ dentro de esta temporada
-            val initialEpStart = seasonsArrayStr.find("\"initialEpisodes\":[", m.range.first)
-            val firstEpNumber = if (initialEpStart >= 0 && initialEpStart > m.range.first) {
-                // Tomar el primer "number":N después de "initialEpisodes":[
+            // Buscar TODOS los números de episodio en initialEpisodes[] de esta temporada.
+            // Estructura: ..."initialEpisodes":[{"id":"...","title":"...","number":N,...},{"id":"...","number":M,...}]
+            // initialEpisodes[] puede estar truncado (los primeros N episodios), pero los
+            // números pueden NO ser secuenciales (ej: Supreme God Emperor tiene 10, 106, 566).
+            // Para estas series con saltos, es crítico usar los números reales en vez de
+            // asumir startEpNum..startEpNum+N-1.
+            val nextSeasonStart = seasonsArrayStr.indexOf(
+                "\"slug\":\"", m.range.last
+            ).let { if (it < 0 || it <= m.range.first) seasonsArrayStr.length else it }
+            val seasonBlock = seasonsArrayStr.substring(m.range.first, nextSeasonStart)
+            val initialEpStart = seasonBlock.find("\"initialEpisodes\":[")
+            val episodeNumbers = if (initialEpStart >= 0) {
                 val searchStart = initialEpStart + "\"initialEpisodes\":[".length
-                val numMatch = Regex(""""number":(\d+)""").find(seasonsArrayStr.substring(searchStart))
-                numMatch?.groupValues?.get(1)?.toIntOrNull() ?: 0
-            } else 0
+                // Buscar el cierre del array initialEpisodes
+                var depth = 0
+                var endIdx = searchStart
+                var j = searchStart
+                while (j < seasonBlock.length) {
+                    when (seasonBlock[j]) {
+                        '[' -> depth++
+                        ']' -> { if (depth == 0) { endIdx = j; break } else depth-- }
+                    }
+                    j++
+                }
+                val initialEpArrayStr = seasonBlock.substring(searchStart, endIdx)
+                // Extraer TODOS los "number":N en orden
+                Regex(""""number":(\d+)""")
+                    .findAll(initialEpArrayStr)
+                    .mapNotNull { it.groupValues[1].toIntOrNull() }
+                    .toList()
+            } else emptyList()
+            val firstEpNumber = episodeNumbers.firstOrNull() ?: 0
 
             seasons.add(
                 SeasonMeta(
@@ -742,6 +767,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
                     episodeCount = episodeCount,
                     isSpecial = isSpecial,
                     firstEpNumber = firstEpNumber,
+                    episodeNumbers = episodeNumbers,
                 )
             )
         }
@@ -804,45 +830,18 @@ class DonghuaLifeBetaProvider : MainAPI() {
         } catch (e: Exception) {
             Log.i(TAG, "loadLinks SET_COOKIE error reading: ${e.message}")
         }
-        // v13: Si el RSC está reducido (bot detection rate-based), hacer retry con delay.
-        // El log muestra que requests rápidos seguidos reciben RSC reducido (~26KB),
-        // pero después de un gap de ~12s el RSC vuelve a la normalidad (~200KB).
-        // Estrategia: esperar 3s y reintentar hasta 2 veces.
+        // v15 OPTIMIZATION: Si el RSC está reducido (bot detection), NO hacer retries ni
+        // JS_ANALYZE automático — el log histórico muestra que:
+        //   - Los 2 retries de 3s NUNCA recuperan el RSC completo (siempre vuelve reducido).
+        //     Esto es porque la bot detection es determinística basada en TLS fingerprint,
+        //     no rate-limiting. Esperar no cambia nada. → Perdíamos 6s por episodio.
+        //   - JS_ANALYZE nunca ha encontrado la key AES — todas las keys probadas fallan.
+        //     Sirve solo para diagnóstico, no para producción. → Perdíamos 7s por episodio.
+        // En su lugar, ir DIRECTO al WebView, que es la única estrategia que funciona.
         if (rscPayload.isNotEmpty() && rscPayload.length < 50000) {
-            Log.i(TAG, "loadLinks RSC_DUMP (reduced, ${rscPayload.length} chars): " +
-                rscPayload.take(5000).replace("\n", " "))
-            Log.i(TAG, "loadLinks v13 RETRY: RSC reduced (${rscPayload.length} < 50000), " +
-                "bot detection suspected. Retrying with delay...")
-            var retryCount = 0
-            while (rscPayload.length < 50000 && retryCount < 2) {
-                retryCount++
-                Log.i(TAG, "loadLinks v13 RETRY #$retryCount: waiting 3s before retry...")
-                delay(3000L)
-                try {
-                    response = app.get(cleanUrl, headers = browserHeaders, timeout = 60)
-                    html = response.text
-                    rscPayload = extractRscPayload(html)
-                    Log.i(TAG, "loadLinks v13 RETRY #$retryCount done: htmlLen=${html.length} " +
-                        "rscLen=${rscPayload.length} " +
-                        "hasActiveEpId=${rscPayload.contains("\"activeEpisodeId\":")}")
-                } catch (e: Exception) {
-                    Log.i(TAG, "loadLinks v13 RETRY #$retryCount error: ${e.message}")
-                    break
-                }
-            }
-            if (rscPayload.length >= 50000) {
-                Log.i(TAG, "loadLinks v13 RETRY SUCCESS: got full RSC (${rscPayload.length} chars) " +
-                    "after $retryCount retries")
-            } else {
-                Log.i(TAG, "loadLinks v13 RETRY FAILED: RSC still reduced after $retryCount retries " +
-                    "(${rscPayload.length} chars). Proceeding with fallback strategies.")
-            }
-        }
-        // v11: Si el RSC está reducido (bot detection confirmado), descargar y analizar JS chunks
-        // para buscar la key AES o la lógica de decodificación del token client-side.
-        // Esto se ejecuta UNA sola vez por loadLinks (no en cada retry).
-        if (rscPayload.isNotEmpty() && rscPayload.length < 50000) {
-            downloadAndAnalyzeJs(html, "loadLinks")
+            Log.i(TAG, "loadLinks BOT_DETECTED: RSC reduced (${rscPayload.length} chars), " +
+                "skipping retries and JS_ANALYZE, going directly to WebView fallback")
+            // Solo loguear el RSC_DUMP si está en modo debug verbose (no siempre, para no spamear)
         }
 
         // v14: Última estrategia — usar WebViewResolver para renderizar la página en
@@ -922,6 +921,20 @@ class DonghuaLifeBetaProvider : MainAPI() {
             .find(rscPayload)
         val activeEpId = activeEpIdMatch?.groupValues?.get(1) ?: ""
         Log.i(TAG, "$logKey loadEpisodeLinks url=$url activeEpId=$activeEpId rscSize=${rscPayload.length} htmlLen=${html.length} webViewCapturedLen=${webViewCaptured.length}")
+
+        // v15 OPTIMIZATION: Si tenemos datos del WebView Y el RSC está reducido (bot detection),
+        // emitir directamente desde el WebView en vez de pasar por todas las estrategias v9/v11
+        // que sabemos van a fallar (todas reciben mock 719 bytes del API).
+        // Esto ahorra ~6-8 segundos por episodio.
+        if (webViewCaptured.isNotEmpty() && activeEpId.isBlank() && rscPayload.length < 50000) {
+            Log.i(TAG, "$logKey v15 FAST PATH: bot detection + WebView data available, emitting directly")
+            val emitted = emitFromWebViewCaptured(webViewCaptured, url, logKey, subtitleCallback, callback)
+            if (emitted) {
+                Log.i(TAG, "$logKey FINAL anyEmitted=true (v15 fast path via WebView)")
+                return true
+            }
+            Log.i(TAG, "$logKey v15 FAST PATH: WebView emit failed, falling through to v9/v11 strategies")
+        }
 
         // v12: Si el RSC está reducido (bot detection) y no tiene activeEpId,
         // buscar servers[] directamente en el HTML crudo. El HTML tiene mucha más
@@ -1252,53 +1265,71 @@ class DonghuaLifeBetaProvider : MainAPI() {
         )
         for ((serverName, serverUrl) in servers) {
             val name = serverName.trim().ifBlank { "Server" }
+            // Reparar URLs m3u8 truncadas (algunas respuestas del server cortan en .m3)
+            val serverUrlFixed = when {
+                serverUrl.endsWith(".m3") -> serverUrl + "u8"
+                serverUrl.endsWith(".m3u") -> serverUrl + "8"
+                serverUrl.contains("chunklist.m3") && !serverUrl.contains("chunklist.m3u8") ->
+                    serverUrl.replace("chunklist.m3", "chunklist.m3u8")
+                else -> serverUrl
+            }
             // Normalizar URL:
             // - Para Ok.ru, el sitio usa /videoembed/<id> pero CS3 solo reconoce /video/<id>.
             //   Convertimos al formato esperado por el extractor nativo.
             // - Algunos extractores además requieren www.
             val normalizedUrl = when {
-                serverUrl.contains("ok.ru/videoembed/") ->
-                    serverUrl.replace("ok.ru/videoembed/", "www.ok.ru/video/")
-                serverUrl.contains("ok.ru") && !serverUrl.contains("www.ok.ru") ->
-                    serverUrl.replace("ok.ru", "www.ok.ru")
-                else -> serverUrl
+                serverUrlFixed.contains("ok.ru/videoembed/") ->
+                    serverUrlFixed.replace("ok.ru/videoembed/", "www.ok.ru/video/")
+                serverUrlFixed.contains("ok.ru") && !serverUrlFixed.contains("www.ok.ru") ->
+                    serverUrlFixed.replace("ok.ru", "www.ok.ru")
+                else -> serverUrlFixed
             }
             try {
                 when {
                     // Rumble
-                    serverUrl.contains("rumble.com") -> {
-                        extractRumble(serverUrl, referer, name, trackingCallback)
+                    serverUrlFixed.contains("rumble.com") -> {
+                        extractRumble(serverUrlFixed, referer, name, trackingCallback)
                     }
                     // Dailymotion (incluye geo.dailymotion.com)
-                    serverUrl.contains("dailymotion.com") || serverUrl.contains("geo.dailymotion.com") -> {
-                        extractDailymotion(serverUrl, referer, name, trackingCallback)
+                    serverUrlFixed.contains("dailymotion.com") || serverUrlFixed.contains("geo.dailymotion.com") -> {
+                        extractDailymotion(serverUrlFixed, referer, name, trackingCallback)
                     }
                     // Stremeable = streamable.com
-                    serverUrl.contains("streamable.com") -> {
-                        extractStreamable(serverUrl, referer, name, subtitleCallback, trackingCallback)
+                    serverUrlFixed.contains("streamable.com") -> {
+                        extractStreamable(serverUrlFixed, referer, name, subtitleCallback, trackingCallback)
                     }
                     // Ok.ru (CS3 tiene extractor nativo; usar URL normalizada con www.)
-                    serverUrl.contains("ok.ru") -> {
+                    serverUrlFixed.contains("ok.ru") -> {
                         loadExtractor(normalizedUrl, referer, subtitleCallback, trackingCallback)
                         // Si loadExtractor no emitió nada, intentar con la URL original también
                         if (!anyEmitted) {
-                            try { loadExtractor(serverUrl, referer, subtitleCallback, trackingCallback) } catch (_: Exception) {}
+                            try { loadExtractor(serverUrlFixed, referer, subtitleCallback, trackingCallback) } catch (_: Exception) {}
                         }
                         // Si aún no emitió, intentar scrapear ok.ru directamente
                         // (algunos videos tienen metadata embebida en el HTML)
                         if (!anyEmitted) {
-                            try { extractOkruDirect(serverUrl, referer, name, trackingCallback) } catch (_: Exception) {}
+                            try { extractOkruDirect(serverUrlFixed, referer, name, trackingCallback) } catch (_: Exception) {}
                         }
                     }
-                    // Direct mp4/m3u8 URLs (raro pero posible)
-                    serverUrl.endsWith(".mp4") || serverUrl.endsWith(".m3u8") ||
-                    serverUrl.contains("r2.cloudflarestorage") || serverUrl.contains("hcdn.dev") -> {
-                        val linkType = if (serverUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    // Direct mp4/m3u8 URLs (incluye URLs reparadas de chunklist.m3u8)
+                    serverUrlFixed.endsWith(".mp4") || serverUrlFixed.endsWith(".m3u8") ||
+                    serverUrlFixed.contains("chunklist") || serverUrlFixed.contains("index.m3u8") ||
+                    serverUrlFixed.contains("r2.cloudflarestorage") || serverUrlFixed.contains("hcdn.dev") ||
+                    serverUrlFixed.contains("donghualife.com/video") ||
+                    serverUrlFixed.contains("donghualife.com/episodes") ||
+                    serverUrlFixed.contains("donghualife.com/movie") -> {
+                        val linkType = if (serverUrlFixed.contains(".m3u8") ||
+                                           serverUrlFixed.contains("chunklist") ||
+                                           serverUrlFixed.contains("index.m3u8")) {
+                            ExtractorLinkType.M3U8
+                        } else {
+                            ExtractorLinkType.VIDEO
+                        }
                         callback(
                             newExtractorLink(
                                 source = name,
                                 name = name,
-                                url = serverUrl,
+                                url = serverUrlFixed,
                                 type = linkType
                             ) {
                                 this.referer = referer
@@ -1309,16 +1340,16 @@ class DonghuaLifeBetaProvider : MainAPI() {
                         anyEmitted = true
                     }
                     // Voe.sx
-                    serverUrl.contains("voe.sx") -> {
-                        loadExtractor(serverUrl, referer, subtitleCallback, trackingCallback)
+                    serverUrlFixed.contains("voe.sx") -> {
+                        loadExtractor(serverUrlFixed, referer, subtitleCallback, trackingCallback)
                     }
                     // Filemoon
-                    serverUrl.contains("filemoon") || serverUrl.contains("moonplayer") -> {
-                        loadExtractor(serverUrl, referer, subtitleCallback, trackingCallback)
+                    serverUrlFixed.contains("filemoon") || serverUrlFixed.contains("moonplayer") -> {
+                        loadExtractor(serverUrlFixed, referer, subtitleCallback, trackingCallback)
                     }
                     // Otros: loadExtractor genérico
                     else -> {
-                        loadExtractor(serverUrl, referer, subtitleCallback, trackingCallback)
+                        loadExtractor(serverUrlFixed, referer, subtitleCallback, trackingCallback)
                     }
                 }
             } catch (_: Exception) {}
@@ -1363,7 +1394,15 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 url.contains("r2.cloudflarestorage") ||
                 url.contains("hcdn.dev") ||
                 url.contains("cloudflarestorage") ||
-                url.contains(".mp4") || url.contains(".m3u8")
+                url.contains(".mp4") || url.contains(".m3u8") ||
+                // Algunas CDN sirven m3u8 con URLs tipo .../chunklist.m3u8 o .../index.m3u8
+                // Si la URL está truncada (termina en .m3), aceptar también.
+                url.contains("chunklist") || url.contains("index.m3") ||
+                // CDN propia del sitio (videos.donghualife.com) y CDNs tipo 1a-XXXX.com
+                url.contains("donghualife.com/video") ||
+                url.contains("donghualife.com/episodes") ||
+                url.contains("donghualife.com/movie") ||
+                Regex("""https?://[a-z0-9-]+\.[a-z0-9-]+\.\w+/video/""").containsMatchIn(url)
         }
 
         // Helper: verifica si una URL es mock/placeholder del sitio
@@ -1374,6 +1413,18 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 url.contains("dailymotion.com/embed/video/example")
         }
 
+        // Helper: reparar URLs m3u8 truncadas.
+        // El server a veces devuelve URLs cortadas en .m3 (debería ser .m3u8) o en chunklist.m3
+        fun repairM3u8Url(url: String): String {
+            return when {
+                url.endsWith(".m3") -> url + "u8"
+                url.endsWith(".m3u") -> url + "8"
+                url.contains("chunklist.m3") && !url.contains("chunklist.m3u8") ->
+                    url.replace("chunklist.m3", "chunklist.m3u8")
+                else -> url
+            }
+        }
+
         // Helper: extrae URLs de video de un texto (RSC o API response)
         fun extractVideoUrls(text: String, sourceLabel: String) {
             if (text.isEmpty()) return
@@ -1381,10 +1432,11 @@ class DonghuaLifeBetaProvider : MainAPI() {
             val serverPattern = Regex("""\{\\?"name\\?":"([^"\\]+)\\?",\\?"url\\?":"([^"\\]+)\\?"\}""")
             for (m in serverPattern.findAll(text)) {
                 val name = m.groupValues[1]
-                val url = m.groupValues[2]
+                val rawUrl = m.groupValues[2]
                     .replace("\\/", "/")
                     .replace("\\u0026", "&")
                     .replace("\\\"", "\"")
+                val url = repairM3u8Url(rawUrl)
                 if (isVideoUrl(url) && !isMockUrl(url) && url.length >= 20) {
                     servers.add(name to url)
                     Log.i(TAG, "$logKey v14 EMIT found (RSC format): name=$name url=${url.take(80)}")
@@ -1394,9 +1446,10 @@ class DonghuaLifeBetaProvider : MainAPI() {
             // Busca nombres cercanos para asociarlos
             val urlPattern = Regex(""""url"\s*:\s*"([^"]+)"""")
             for (m in urlPattern.findAll(text)) {
-                val url = m.groupValues[1]
+                val rawUrl = m.groupValues[1]
                     .replace("\\/", "/")
                     .replace("\\u0026", "&")
+                val url = repairM3u8Url(rawUrl)
                 if (!isVideoUrl(url) || isMockUrl(url) || url.length < 20) continue
                 // Buscar "name":"X" cercano (hasta 200 chars antes)
                 val urlPos = m.range.first
@@ -1415,9 +1468,10 @@ class DonghuaLifeBetaProvider : MainAPI() {
             val labelUrlPattern = Regex(""""label"\s*:\s*"([^"]+)"[^}]*?"url"\s*:\s*"([^"]+)"""")
             for (m in labelUrlPattern.findAll(text)) {
                 val name = m.groupValues[1]
-                val url = m.groupValues[2]
+                val rawUrl = m.groupValues[2]
                     .replace("\\/", "/")
                     .replace("\\u0026", "&")
+                val url = repairM3u8Url(rawUrl)
                 if (!isVideoUrl(url) || isMockUrl(url) || url.length < 20) continue
                 if (servers.none { it.second == url }) {
                     servers.add(name to url)
@@ -1612,6 +1666,20 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val movieId = if (preloadedContentId.isNotBlank()) preloadedContentId
             else extractContentIdFromPayload(rscPayload, "movieId") ?: ""
         Log.i(TAG, "$logKey loadMovieLinks url=$url movieId=$movieId rscSize=${rscPayload.length} htmlLen=${html.length} webViewCapturedLen=${webViewCaptured.length}")
+
+        // v15 OPTIMIZATION: Si tenemos datos del WebView Y el RSC está reducido (bot detection),
+        // emitir directamente desde el WebView en vez de pasar por todas las estrategias que
+        // sabemos van a fallar (reciben mock 719 bytes del API).
+        // Esto ahorra ~6-8 segundos por película.
+        if (webViewCaptured.isNotEmpty() && rscPayload.length < 50000) {
+            Log.i(TAG, "$logKey v15 FAST PATH: bot detection + WebView data available, emitting directly")
+            val emitted = emitFromWebViewCaptured(webViewCaptured, url, logKey, subtitleCallback, callback)
+            if (emitted) {
+                Log.i(TAG, "$logKey FINAL anyEmitted=true (v15 fast path via WebView)")
+                return true
+            }
+            Log.i(TAG, "$logKey v15 FAST PATH: WebView emit failed, falling through to v9/v11 strategies")
+        }
 
         // v12: Si el RSC está reducido (bot detection), buscar servers[] en el HTML crudo.
         // Para películas, el HTML puede contener los servers del movieId.
@@ -2312,6 +2380,22 @@ class DonghuaLifeBetaProvider : MainAPI() {
                                                     });
                                                 }
                                             }).catch(function(){});
+
+                                            // v15 EARLY CAPTURE: si vemos que llegó /api/player/source
+                                            // (que es el endpoint crítico con la URL real del video),
+                                            // disparar la captura inmediatamente sin esperar al setTimeout.
+                                            if (fetchUrl && fetchUrl.indexOf('/api/player/source') >= 0) {
+                                                try {
+                                                    if (!window.__cs3EarlyCaptureFired) {
+                                                        window.__cs3EarlyCaptureFired = true;
+                                                        setTimeout(function() {
+                                                            // Dar 500ms extra para que lleguen más fetches
+                                                            // (subtitles, banners, etc.) antes de capturar.
+                                                            fireCapture();
+                                                        }, 500);
+                                                    }
+                                                } catch(ee) {}
+                                            }
                                         }
                                     } catch(e) {}
                                     return resp;
@@ -2320,104 +2404,117 @@ class DonghuaLifeBetaProvider : MainAPI() {
                         }
                     } catch(e) {}
 
-                    // 2. Esperar 12s a que React hidrate y haga fetches client-side
+                    // Función para recolectar datos capturados (reutilizable)
+                    function collectCaptured() {
+                        var captured = {};
+
+                        // 3. Capturar window.__next_f (RSC data client-side)
+                        var nextF = '';
+                        try {
+                            if (window.__next_f && window.__next_f.length) {
+                                for (var i = 0; i < window.__next_f.length; i++) {
+                                    try {
+                                        var part = window.__next_f[i];
+                                        if (part && part.length >= 2) {
+                                            nextF += part[1] + '\n';
+                                        }
+                                    } catch(e) {}
+                                }
+                            }
+                        } catch(e) {}
+                        captured.next_f = nextF.substring(0, 300000);
+
+                        // 4. Capturar __NEXT_DATA__ (legacy hydration)
+                        try {
+                            if (window.__NEXT_DATA__) {
+                                captured.nextData = JSON.stringify(window.__NEXT_DATA__).substring(0, 100000);
+                            }
+                        } catch(e) {}
+
+                        // 5. Capturar video/iframe/source URLs del DOM
+                        var videos = [];
+                        try {
+                            document.querySelectorAll('video').forEach(function(v) {
+                                if (v.src) videos.push(v.src);
+                                if (v.currentSrc) videos.push(v.currentSrc);
+                            });
+                            document.querySelectorAll('iframe').forEach(function(i) {
+                                if (i.src) videos.push(i.src);
+                            });
+                            document.querySelectorAll('source').forEach(function(s) {
+                                if (s.src) videos.push(s.src);
+                            });
+                        } catch(e) {}
+                        captured.videos = videos;
+
+                        // 6. Capturar data-src, data-url, data-video attributes
+                        var dataUrls = [];
+                        try {
+                            document.querySelectorAll('[data-src],[data-url],[data-video],[data-source]').forEach(function(el) {
+                                ['data-src','data-url','data-video','data-source'].forEach(function(attr) {
+                                    var val = el.getAttribute(attr);
+                                    if (val && val.indexOf('http') === 0) dataUrls.push(val);
+                                });
+                            });
+                        } catch(e) {}
+                        captured.dataUrls = dataUrls;
+
+                        // 7. Capturar fetch responses interceptadas
+                        try {
+                            captured.fetchResponses = window.__cs3FetchResponses || [];
+                        } catch(e) {
+                            captured.fetchResponses = [];
+                        }
+
+                        // 8. Capturar HTML del body renderizado (para RSC extraction)
+                        try {
+                            captured.html = document.documentElement.outerHTML.substring(0, 500000);
+                        } catch(e) {}
+
+                        // 9. Capturar HTML length para diagnóstico
+                        try {
+                            captured.htmlLength = document.documentElement.outerHTML.length;
+                        } catch(e) {}
+
+                        return captured;
+                    }
+
+                    // Helper: envía captured a Kotlin respetando el flag de "ya capturado"
+                    function fireCapture() {
+                        if (window.__cs3Captured) return;
+                        window.__cs3Captured = true;
+                        try {
+                            Android.onCaptured(JSON.stringify(collectCaptured()));
+                        } catch(e) {
+                            // Si Android interface no está disponible, intentar inyectar en DOM
+                            try {
+                                var div = document.createElement('div');
+                                div.id = 'cs3-captured';
+                                div.style.display = 'none';
+                                div.textContent = JSON.stringify(collectCaptured());
+                                document.body.appendChild(div);
+                            } catch(ee) {}
+                        }
+                    }
+
+                    // 2. Esperar 8s a que React hidrate y haga fetches client-side.
+                    // Si el early-capture ya disparó (porque llegó /api/player/source),
+                    // este setTimeout será no-op gracias al flag __cs3Captured.
                     setTimeout(function() {
                         try {
-                            var captured = {};
-
-                            // 3. Capturar window.__next_f (RSC data client-side)
-                            var nextF = '';
-                            try {
-                                if (window.__next_f && window.__next_f.length) {
-                                    for (var i = 0; i < window.__next_f.length; i++) {
-                                        try {
-                                            var part = window.__next_f[i];
-                                            if (part && part.length >= 2) {
-                                                nextF += part[1] + '\n';
-                                            }
-                                        } catch(e) {}
-                                    }
-                                }
-                            } catch(e) {}
-                            captured.next_f = nextF.substring(0, 300000);
-
-                            // 4. Capturar __NEXT_DATA__ (legacy hydration)
-                            try {
-                                if (window.__NEXT_DATA__) {
-                                    captured.nextData = JSON.stringify(window.__NEXT_DATA__).substring(0, 100000);
-                                }
-                            } catch(e) {}
-
-                            // 5. Capturar video/iframe/source URLs del DOM
-                            var videos = [];
-                            try {
-                                document.querySelectorAll('video').forEach(function(v) {
-                                    if (v.src) videos.push(v.src);
-                                    if (v.currentSrc) videos.push(v.currentSrc);
-                                });
-                                document.querySelectorAll('iframe').forEach(function(i) {
-                                    if (i.src) videos.push(i.src);
-                                });
-                                document.querySelectorAll('source').forEach(function(s) {
-                                    if (s.src) videos.push(s.src);
-                                });
-                            } catch(e) {}
-                            captured.videos = videos;
-
-                            // 6. Capturar data-src, data-url, data-video attributes
-                            var dataUrls = [];
-                            try {
-                                document.querySelectorAll('[data-src],[data-url],[data-video],[data-source]').forEach(function(el) {
-                                    ['data-src','data-url','data-video','data-source'].forEach(function(attr) {
-                                        var val = el.getAttribute(attr);
-                                        if (val && val.indexOf('http') === 0) dataUrls.push(val);
-                                    });
-                                });
-                            } catch(e) {}
-                            captured.dataUrls = dataUrls;
-
-                            // 7. Capturar fetch responses interceptadas
-                            try {
-                                captured.fetchResponses = window.__cs3FetchResponses || [];
-                            } catch(e) {
-                                captured.fetchResponses = [];
-                            }
-
-                            // 8. Capturar HTML del body renderizado (para RSC extraction)
-                            try {
-                                captured.html = document.documentElement.outerHTML.substring(0, 500000);
-                            } catch(e) {}
-
-                            // 9. Capturar HTML length para diagnóstico
-                            try {
-                                captured.htmlLength = document.documentElement.outerHTML.length;
-                            } catch(e) {}
-
-                            // Enviar al Kotlin vía JavascriptInterface
-                            try {
-                                Android.onCaptured(JSON.stringify(captured));
-                            } catch(e) {
-                                // Si Android interface no está disponible, intentar inyectar en DOM
-                                try {
-                                    var div = document.createElement('div');
-                                    div.id = 'cs3-captured';
-                                    div.style.display = 'none';
-                                    div.textContent = JSON.stringify(captured);
-                                    document.body.appendChild(div);
-                                } catch(ee) {}
-                            }
+                            fireCapture();
                         } catch(e) {
                             try {
                                 Android.onCaptured('{"error":"' + e.toString().replace(/"/g, '\\"') + '"}');
                             } catch(ee) {}
                         }
-                    }, 12000);  // 12s: dar tiempo a React hidrate + fetches
+                    }, 8000);  // 8s: dar tiempo a React hidrate + fetches (reducido de 12s)
                 })();
             """.trimIndent()
 
             // Usar WebView manual con suspendCoroutine
             var webView: WebView? = null
-            val capturedJson = withTimeoutOrNull(30000L) {
+            val capturedJson = withTimeoutOrNull(20000L) {
                 suspendCoroutine<String?> { cont ->
                     // WebView DEBE crearse en el main thread (UI thread)
                     Handler(Looper.getMainLooper()).post {
@@ -2450,9 +2547,9 @@ class DonghuaLifeBetaProvider : MainAPI() {
                                     Log.i(TAG, "$logKey v14 WEBVIEW: onPageFinished, injecting script")
                                     // Inyectar el script que intercepta fetch y captura datos
                                     view?.evaluateJavascript(script) { _ ->
-                                        Log.i(TAG, "$logKey v14 WEBVIEW: script injected, waiting 12s for capture...")
-                                        // El script tiene setTimeout(12000) que llamará Android.onCaptured
-                                        // Si no llama en 15s, el withTimeoutOrNull cancelará
+                                        Log.i(TAG, "$logKey v14 WEBVIEW: script injected, waiting 8s for capture...")
+                                        // El script tiene setTimeout(8000) que llamará Android.onCaptured
+                                        // Si no llama en 20s, el withTimeoutOrNull cancelará
                                     }
                                 }
 
@@ -3122,6 +3219,9 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val episodeCount: Int,
         val isSpecial: Boolean = false,
         val firstEpNumber: Int = 0,  // Primer número de episodio (de initialEpisodes[0])
+        /** Lista COMPLETA de números de episodio disponibles (de initialEpisodes[]).
+         *  Vacía si solo conocemos episodeCount + firstEpNumber. */
+        val episodeNumbers: List<Int> = emptyList(),
     )
 
     private data class MovieSource(
