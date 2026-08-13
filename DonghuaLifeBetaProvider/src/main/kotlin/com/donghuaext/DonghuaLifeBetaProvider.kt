@@ -18,33 +18,24 @@ private const val TAG = "DonghuaLifeBeta"
 /**
  * DonghuaLifeBetaProvider — Provider para https://beta.donghualife.com
  *
- * v6 (2026-08-13): FIX CRÍTICO basado en logcat real del emulador.
- *   Hallazgo: el server /api/sources NO acepta POST (responde cuerpo vacío
- *   a todos los POST). Solo acepta GET, y exige episodeId o movieId en URL.
- *   El mensaje del server es textual: "episodeId or movieId required".
+ * v7 (2026-08-13): FIX CRÍTICO basado en logcat v6 del emulador.
+ *   Hallazgo v6: aunque M0 (GET ?mv&token) funciona, el server devuelve
+ *   URLs MOCK (cdn.example.com, /video/example) → ExoPlayer error.
+ *   Y para Martial Master, el RSC llega SIN activeEpisodeId (27KB vs 200KB).
+ *   Causa: bot detection del server. NiceHttp manda UA "CloudStream" y el
+ *   server devuelve RSC reducido + respuestas mock a clientes no-navegador.
  *
- *   - NUEVO Método EE (episodios): GET /api/sources?episodeId=X&token=Y
- *     como PRIMER intento. Esto es lo que el server pide.
- *   - NUEVO Método M0 (películas): GET /api/sources?movieId=X&token=Y
- *     como PRIMER intento.
- *   - Reordenar: los métodos GET van PRIMERO, los POST quedan como fallback.
- *   - Agregar variante GET ?episodeId=X sola (sin token) por si el server
- *     puede derivar el token del episodeId.
+ *   - browserUA: UA Chrome 149 desktop real (no USER_AGENT de CS3).
+ *   - browserHeaders: Accept, Accept-Language, Sec-Fetch-*, Upgrade-Insecure-Requests
+ *     (todos los headers que manda un browser real en petición de documento).
+ *   - API headers: Accept application/json, Sec-Fetch-Dest=empty, Sec-Fetch-Mode=cors,
+ *     Sec-Fetch-Site=same-origin (headers típicos de un fetch AJAX desde el navegador).
+ *   - Reemplazados TODOS los USER_AGENT por browserUA.
+ *   - Agregado log diagnóstico: loadLinks ahora imprime htmlLen, rscLen,
+ *     hasActiveEpId, hasSources, hasTokens → para ver si los headers funcionan.
  *
- * Hallazgo adicional del logcat:
- *   - Series como Doupo Cangqiong tienen URLs directas en el RSC
- *     (https://geo.dailymotion.com/player.html?video=...) → reproducen OK.
- *   - Series como Martial Master NO tienen URLs directas, solo tokens
- *     encriptados → dependen 100% del API. Por eso fallan.
- *   - El "token" no es JWT, es JSON encriptado AES-CBC:
- *       {"v":1,"iv":"...","data":"...","sig":"..."}
- *
- * v5 (2026-08-13): Cambios previos (siguen vigentes):
- *   - loadMovieLinks / loadSourcesViaApi: NO retornan temprano.
- *   - Headers en ExtractorLink: Origin + User-Agent + Referer.
- *   - URL resolution: si /api/sources devuelve URL relativa, la resuelve.
- *   - Logging anti-chatty con marker único por llamada.
- *   - Fallback ok.ru: scrapeo directo de data-options.
+ * v6: M0/EE/EF/M0b métodos GET con episodeId/movieId + token (siguen vigentes).
+ * v5: No retornar temprano, headers en ExtractorLinks, URL resolution, anti-chatty.
  */
 class DonghuaLifeBetaProvider : MainAPI() {
 
@@ -58,6 +49,32 @@ class DonghuaLifeBetaProvider : MainAPI() {
         TvType.Anime,
         TvType.OVA,
         TvType.AnimeMovie,
+    )
+
+    /**
+     * User-Agent de navegador real (Chrome desktop).
+     * El server /api/sources y el RSC de episodios requieren un UA de navegador
+     * completo para devolver tokens y URLs reales. Con UA por defecto de CS3,
+     * el server devuelve RSC reducido (sin activeEpisodeId) y respuestas mock
+     * con URLs "example".
+     */
+    private val browserUA =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+
+    /** Headers completos de navegador para todas las peticiones a beta.donghualife.com. */
+    private val browserHeaders = mapOf(
+        "User-Agent" to browserUA,
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9," +
+                    "image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language" to "es-ES,es;q=0.9,en;q=0.8",
+        "Accept-Encoding" to "gzip, deflate, br",
+        "Connection" to "keep-alive",
+        "Upgrade-Insecure-Requests" to "1",
+        "Sec-Fetch-Dest" to "document",
+        "Sec-Fetch-Mode" to "navigate",
+        "Sec-Fetch-Site" to "none",
+        "Sec-Fetch-User" to "?1",
     )
 
     override val mainPage = mainPageOf(
@@ -714,9 +731,14 @@ class DonghuaLifeBetaProvider : MainAPI() {
             data to ""
         }
 
-        val response = app.get(cleanUrl, timeout = 60)
+        val response = app.get(cleanUrl, headers = browserHeaders, timeout = 60)
         val html = response.text
         val rscPayload = extractRscPayload(html)
+        // Log diagnóstico del tamaño del RSC y presencia de marcadores clave
+        Log.i(TAG, "loadLinks url=$cleanUrl htmlLen=${html.length} rscLen=${rscPayload.length} " +
+            "hasActiveEpId=${rscPayload.contains("\"activeEpisodeId\":")} " +
+            "hasSources=${rscPayload.contains("\"sources\":[")} " +
+            "hasTokens=${rscPayload.contains("\"token\":")}")
 
         val isMovie = cleanUrl.contains("/peliculas/")
 
@@ -927,7 +949,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
         // Headers para CDNs (R2, hcdn, etc.) que requieren Origin + UA
         val cdnHeaders = mapOf(
             "Origin" to mainUrl,
-            "User-Agent" to USER_AGENT,
+            "User-Agent" to browserUA,
         )
         for ((serverName, serverUrl) in servers) {
             val name = serverName.trim().ifBlank { "Server" }
@@ -1124,13 +1146,19 @@ class DonghuaLifeBetaProvider : MainAPI() {
         Log.i(TAG, "$logKey sources=[${sources.joinToString(",") { "${it.label}/${it.type}/${it.provider}" }}]")
         if (movieId.isBlank() && sources.isEmpty()) return false
 
+        // Headers tipo AJAX de navegador real (Next.js / API routes los valida).
+        // Sin Sec-Fetch-* y Accept correcto, el server puede devolver respuestas mock.
         val headers = mapOf(
-            "Accept" to "application/json",
+            "Accept" to "application/json, text/plain, */*",
+            "Accept-Language" to "es-ES,es;q=0.9,en;q=0.8",
             "Content-Type" to "application/json",
-            "Origin" to mainUrl,  // Next.js requiere Origin para POSTs a /api/*
+            "Origin" to mainUrl,
             "Referer" to url,
-            "User-Agent" to USER_AGENT,
-            "X-Requested-With" to "XMLHttpRequest",  // Some APIs require this for AJAX
+            "User-Agent" to browserUA,
+            "X-Requested-With" to "XMLHttpRequest",
+            "Sec-Fetch-Dest" to "empty",
+            "Sec-Fetch-Mode" to "cors",
+            "Sec-Fetch-Site" to "same-origin",
         )
 
         var anyEmitted = false
@@ -1356,13 +1384,18 @@ class DonghuaLifeBetaProvider : MainAPI() {
     ): Boolean {
         if (sources.isEmpty()) return false
 
+        // Headers tipo AJAX de navegador real (mismo que loadMovieLinks).
         val headers = mapOf(
-            "Accept" to "application/json",
+            "Accept" to "application/json, text/plain, */*",
+            "Accept-Language" to "es-ES,es;q=0.9,en;q=0.8",
             "Content-Type" to "application/json",
             "Origin" to mainUrl,
             "Referer" to referer,
-            "User-Agent" to USER_AGENT,
+            "User-Agent" to browserUA,
             "X-Requested-With" to "XMLHttpRequest",
+            "Sec-Fetch-Dest" to "empty",
+            "Sec-Fetch-Mode" to "cors",
+            "Sec-Fetch-Site" to "same-origin",
         )
 
         var anyEmitted = false
@@ -1557,7 +1590,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
         // Helper: headers para ExtractorLink (Origin + UA para CDNs)
         val cdnHeaders = mapOf(
             "Origin" to mainUrl,
-            "User-Agent" to USER_AGENT,
+            "User-Agent" to browserUA,
         )
 
         // Intentar parsear como JSON estructurado
@@ -1821,7 +1854,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
             val apiUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
             val jsonText = app.get(apiUrl,
                 referer = "https://www.dailymotion.com/embed/video/$videoId",
-                headers = mapOf("User-Agent" to USER_AGENT, "Accept" to "application/json"),
+                headers = mapOf("User-Agent" to browserUA, "Accept" to "application/json"),
                 timeout = 15L).text
 
             for (match in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(jsonText)) {
