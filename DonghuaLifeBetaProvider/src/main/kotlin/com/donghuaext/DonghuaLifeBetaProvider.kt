@@ -2238,16 +2238,48 @@ class DonghuaLifeBetaProvider : MainAPI() {
         return try {
             Log.i(TAG, "$logKey v14 WEBVIEW: launching manual WebView for $url")
 
-            // Obtener Context vía com.lagradost.api.getContext() (API oficial del library module).
-            // MainAPI no tiene context propio; CloudStreamApp lo setea en el library vía setContext().
-            // getContext() retorna Any? (cross-platform), hay que castear a android.content.Context.
+            // Obtener Context para crear el WebView.
+            // Estrategia multi-vía porque las APIs varían entre versiones de CS3:
+            //   1. com.lagradost.api.getContext() — library API oficial (falla en algunas versiones)
+            //   2. Reflection sobre android.app.ActivityThread.currentApplication() — hidden API
+            //      de Android, estable, devuelve la Application.
+            //   3. com.lagradost.cloudstream3.AcraApplication.context — si existe en esta versión.
             val ctx: Context? = try {
-                com.lagradost.api.getContext() as? Context
-            } catch (_: Exception) { null }
+                var c: Context? = null
+                // Intento 1: com.lagradost.api.getContext()
+                try {
+                    val m = Class.forName("com.lagradost.api.ContextHelper_jvmKt")
+                        .declaredMethods.firstOrNull { it.name == "getContext" }
+                    if (m != null) {
+                        @Suppress("UNCHECKED_CAST")
+                        c = m.invoke(null) as? Context
+                    }
+                } catch (_: Throwable) {}
+                // Intento 2: AcraApplication.context (campo estático)
+                if (c == null) {
+                    try {
+                        val cls = Class.forName("com.lagradost.cloudstream3.AcraApplication")
+                        val field = cls.getDeclaredField("context")
+                        field.isAccessible = true
+                        c = field.get(null) as? Context
+                    } catch (_: Throwable) {}
+                }
+                // Intento 3: ActivityThread.currentApplication() vía reflection
+                if (c == null) {
+                    try {
+                        val atCls = Class.forName("android.app.ActivityThread")
+                        val m = atCls.getDeclaredMethod("currentApplication")
+                        m.isAccessible = true
+                        c = m.invoke(null) as? Context
+                    } catch (_: Throwable) {}
+                }
+                c
+            } catch (_: Throwable) { null }
             if (ctx == null) {
-                Log.i(TAG, "$logKey v14 WEBVIEW: no Context available via getContext(), cannot use WebView")
+                Log.i(TAG, "$logKey v14 WEBVIEW: no Context available (all 3 strategies failed), cannot use WebView")
                 return null
             }
+            Log.i(TAG, "$logKey v14 WEBVIEW: Context acquired class=${ctx.javaClass.simpleName}")
 
             // Script JS que se inyecta DESPUÉS de que la página carga.
             // Usa setTimeout para esperar a que React hidrate y haga fetches client-side.
@@ -2492,8 +2524,8 @@ class DonghuaLifeBetaProvider : MainAPI() {
             }
 
             Pair(renderedHtml, capturedJson)
-        } catch (e: Exception) {
-            Log.i(TAG, "$logKey v14 WEBVIEW exception: ${e.message}")
+        } catch (e: Throwable) {
+            Log.i(TAG, "$logKey v14 WEBVIEW exception: ${e.javaClass.simpleName}: ${e.message}")
             null
         }
     }
@@ -2535,15 +2567,21 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 .distinct()
                 .toList()
             Log.i(TAG, "$logKey JS_ANALYZE found ${jsUrls.size} JS chunks in HTML")
-            // Solo loguear URLs que puedan ser relevantes (watch, peliculas, page, layout, sources)
+            // Two-tier scan:
+            //   - "Relevant" = chunks with page/layout/watch/api/source/video/embed in name
+            //   - "Framework" = ALL other chunks (big ones like 8500-*.js, 3701-*.js where
+            //     the API client + encryption logic usually lives)
+            // Scan relevant first, then framework up to a total of 8 chunks.
             val relevant = jsUrls.filter { url ->
                 url.contains("page") || url.contains("layout") ||
                 url.contains("watch") || url.contains("peliculas") ||
                 url.contains("source") || url.contains("video") ||
                 url.contains("api") || url.contains("embed")
             }
-            Log.i(TAG, "$logKey JS_ANALYZE relevant chunks: ${relevant.size} " +
-                "urls=${relevant.joinToString(",") { it.takeLast(60) }}")
+            val framework = jsUrls.filter { it !in relevant }
+            Log.i(TAG, "$logKey JS_ANALYZE relevant=${relevant.size} framework=${framework.size} " +
+                "relevant=${relevant.joinToString(",") { it.takeLast(40) }}")
+            val toScan = (relevant + framework).take(8)
 
             // Descargar los primeros 3 chunks relevantes y buscar strings
             val headers = mapOf(
@@ -2560,13 +2598,17 @@ class DonghuaLifeBetaProvider : MainAPI() {
             // Palabras clave a buscar en el JS
             val searchTerms = listOf(
                 "api/sources", "/api/embed", "/api/source", "/api/play",
+                "api/stream", "/api/video", "/api/v1/sources",
                 "AES", "decrypt", "CryptoJS", "crypto.subtle",
                 "SECRET_KEY", "secretKey", "ENCRYPTION_KEY", "encryptionKey",
                 "signature", "verify", "hmac", "HMAC",
                 "token", "resolveToken", "decodeToken",
+                "isBot", "isCrawler", "botDetected", "userAgent",
+                "mockData", "mockUrl", "example.com", "cdn.example",
+                "verifyBrowser", "fingerprint", "tlsFingerprint",
             )
 
-            for (chunkUrl in relevant.take(5)) {
+            for (chunkUrl in toScan) {
                 try {
                     val fullUrl = if (chunkUrl.startsWith("http")) chunkUrl else "$mainUrl$chunkUrl"
                     val js = app.get(fullUrl, headers = headers, timeout = 20L).text
