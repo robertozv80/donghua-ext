@@ -1288,15 +1288,32 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 when {
                     // Rumble
                     serverUrlFixed.contains("rumble.com") -> {
-                        extractRumble(serverUrlFixed, referer, name, trackingCallback)
+                        val emittedHere = extractRumble(serverUrlFixed, referer, name, trackingCallback)
+                        // v15 FIX: si extractRumble no emitió nada, probar loadExtractor
+                        // (CS3 tiene un RumbleExtractor built-in que maneja /embed/<id> URLs)
+                        if (!emittedHere && !anyEmitted) {
+                            Log.i(TAG, "$logKey v15 Rumble: custom extractRumble failed, trying loadExtractor fallback")
+                            try { loadExtractor(serverUrlFixed, referer, subtitleCallback, trackingCallback) } catch (e: Exception) {
+                                Log.w(TAG, "$logKey v15 Rumble: loadExtractor also failed: ${e.message}")
+                            }
+                        }
                     }
                     // Dailymotion (incluye geo.dailymotion.com)
                     serverUrlFixed.contains("dailymotion.com") || serverUrlFixed.contains("geo.dailymotion.com") -> {
-                        extractDailymotion(serverUrlFixed, referer, name, trackingCallback)
+                        val emittedHere = extractDailymotion(serverUrlFixed, referer, name, trackingCallback)
+                        if (!emittedHere && !anyEmitted) {
+                            Log.i(TAG, "$logKey v15 Dailymotion: custom extractDailymotion failed, trying loadExtractor fallback")
+                            try { loadExtractor(serverUrlFixed, referer, subtitleCallback, trackingCallback) } catch (e: Exception) {
+                                Log.w(TAG, "$logKey v15 Dailymotion: loadExtractor also failed: ${e.message}")
+                            }
+                        }
                     }
                     // Stremeable = streamable.com
                     serverUrlFixed.contains("streamable.com") -> {
                         extractStreamable(serverUrlFixed, referer, name, subtitleCallback, trackingCallback)
+                        if (!anyEmitted) {
+                            try { loadExtractor(serverUrlFixed, referer, subtitleCallback, trackingCallback) } catch (_: Exception) {}
+                        }
                     }
                     // Ok.ru (CS3 tiene extractor nativo; usar URL normalizada con www.)
                     serverUrlFixed.contains("ok.ru") -> {
@@ -2974,12 +2991,19 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 try {
                     when {
                         cleanUrl.contains("rumble.com") -> {
-                            extractRumble(cleanUrl, referer, "$defaultLabel ${idx + 1}", callback)
-                            anyEmitted = true
+                            val emitted = extractRumble(cleanUrl, referer, "$defaultLabel ${idx + 1}", callback)
+                            if (emitted) anyEmitted = true
+                            else {
+                                // Fallback a loadExtractor (CS3 built-in RumbleExtractor)
+                                try { loadExtractor(cleanUrl, referer, subtitleCallback = {}, callback); anyEmitted = true } catch (_: Exception) {}
+                            }
                         }
                         cleanUrl.contains("dailymotion.com") -> {
-                            extractDailymotion(cleanUrl, referer, "$defaultLabel ${idx + 1}", callback)
-                            anyEmitted = true
+                            val emitted = extractDailymotion(cleanUrl, referer, "$defaultLabel ${idx + 1}", callback)
+                            if (emitted) anyEmitted = true
+                            else {
+                                try { loadExtractor(cleanUrl, referer, subtitleCallback = {}, callback); anyEmitted = true } catch (_: Exception) {}
+                            }
                         }
                         cleanUrl.endsWith(".m3u8") || cleanUrl.contains(".m3u8") -> {
                             try {
@@ -3025,9 +3049,28 @@ class DonghuaLifeBetaProvider : MainAPI() {
         referer: String,
         serverName: String,
         callback: (ExtractorLink) -> Unit
-    ) {
+    ): Boolean {
+        var emitted = false
+        val trackingCb: (ExtractorLink) -> Unit = { link ->
+            emitted = true
+            callback(link)
+        }
         try {
-            val html = app.get(embedUrl, referer = referer, timeout = 30L).text
+            // v15 FIX: Rumble bloquea requests sin User-Agent y headers de browser.
+            // Sin estos headers, app.get devuelve 403/empty y todos los patrones fallan.
+            val rumbleHeaders = mapOf(
+                "User-Agent" to browserUA,
+                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language" to "en-US,en;q=0.9,es;q=0.8",
+                "Accept-Encoding" to "gzip, deflate, br",
+                "Sec-Fetch-Dest" to "iframe",
+                "Sec-Fetch-Mode" to "navigate",
+                "Sec-Fetch-Site" to "cross-site",
+                "Upgrade-Insecure-Requests" to "1",
+            )
+            val resp = app.get(embedUrl, referer = referer, headers = rumbleHeaders, timeout = 30L)
+            val html = resp.text
+            Log.i(TAG, "extractRumble: url=$embedUrl httpCode=${resp.code} htmlLen=${html.length}")
 
             // Método 1: HLS master playlist "hls":{"auto":{"url":"..."}}
             val hlsAutoPatterns = listOf(
@@ -3040,9 +3083,11 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 if (m != null) {
                     val u = m.destructured.component1().replace("\\/", "/").replace("\\u0026", "&")
                     try {
-                        generateM3u8(serverName, u, referer).forEach(callback)
-                        return
-                    } catch (_: Exception) {}
+                        generateM3u8(serverName, u, referer).forEach(trackingCb)
+                        if (emitted) return true
+                    } catch (e: Exception) {
+                        Log.w(TAG, "extractRumble: hls method failed: ${e.message}")
+                    }
                 }
             }
 
@@ -3063,7 +3108,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
                         "360" -> Qualities.P360.value
                         else -> Qualities.Unknown.value
                     }
-                    callback(
+                    trackingCb(
                         newExtractorLink(source = serverName, name = "$serverName ${qLabel}p", url = u, type = ExtractorLinkType.M3U8) {
                             this.referer = referer
                             this.quality = quality
@@ -3071,7 +3116,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
                     )
                     foundAny = true
                 }
-                if (foundAny) return
+                if (foundAny) return true
             }
 
             // Método 3: URLs CDN rmbl.ws
@@ -3091,14 +3136,14 @@ class DonghuaLifeBetaProvider : MainAPI() {
                             u.contains("360") -> Qualities.P360.value
                             else -> Qualities.Unknown.value
                         }
-                        callback(
+                        trackingCb(
                             newExtractorLink(source = serverName, name = "$serverName ${quality / 1000}p", url = u, type = ExtractorLinkType.VIDEO) {
                                 this.referer = referer
                                 this.quality = quality
                             }
                         )
                     }
-                    return
+                    if (emitted) return true
                 }
             }
 
@@ -3111,12 +3156,43 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 if (match != null) {
                     val u = match.destructured.component1()
                     try {
-                        generateM3u8(serverName, u, referer).forEach(callback)
-                        return
-                    } catch (_: Exception) {}
+                        generateM3u8(serverName, u, referer).forEach(trackingCb)
+                        if (emitted) return true
+                    } catch (e: Exception) {
+                        Log.w(TAG, "extractRumble: m3u8 method failed: ${e.message}")
+                    }
                 }
             }
-        } catch (_: Exception) {}
+
+            // Método 5 (NUEVO v15): patrones adicionales para Rumble reestructurado
+            // Rumble a veces usa "stream":"<url>" o "embedUrl":"<url>" en JSON
+            val extraPatterns = listOf(
+                Regex(""""stream"\s*:\s*"(https?://[^"]+\.(?:m3u8|mp4)[^"]*)""""),
+                Regex(""""embedUrl"\s*:\s*"(https?://[^"]+\.(?:m3u8|mp4)[^"]*)""""),
+                Regex("""(https?://[a-z0-9-]+\.rumble\.cloud[^"\s]+\.(?:m3u8|mp4)[^"\s]*)"""),
+                Regex("""(https?://[a-z0-9-]+\.akamaized\.net[^"\s]+/rumble[^"\s]+\.(?:m3u8|mp4)[^"\s]*)"""),
+            )
+            for (pattern in extraPatterns) {
+                val match = pattern.find(html)
+                if (match != null) {
+                    val u = match.destructured.component1().replace("\\/", "/").replace("\\u0026", "&")
+                    val isM3u8 = u.contains(".m3u8")
+                    trackingCb(
+                        newExtractorLink(source = serverName, name = serverName, url = u,
+                            type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+                            this.referer = referer
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                    return true
+                }
+            }
+
+            Log.w(TAG, "extractRumble: no patterns matched in ${html.length} chars, htmlHead=${html.take(300)}")
+        } catch (e: Exception) {
+            Log.w(TAG, "extractRumble: fetch failed for $embedUrl: ${e.message}")
+        }
+        return emitted
     }
 
     private suspend fun extractDailymotion(
@@ -3124,23 +3200,37 @@ class DonghuaLifeBetaProvider : MainAPI() {
         referer: String,
         serverName: String,
         callback: (ExtractorLink) -> Unit
-    ) {
+    ): Boolean {
+        var emitted = false
+        val trackingCb: (ExtractorLink) -> Unit = { link ->
+            emitted = true
+            callback(link)
+        }
         val videoId = Regex("video=([A-Za-z0-9]+)").find(embedUrl)?.destructured?.component1()
             ?: Regex("/video/([A-Za-z0-9]+)").find(embedUrl)?.destructured?.component1()
-            ?: return
+            ?: Regex("/embed/video/([A-Za-z0-9]+)").find(embedUrl)?.destructured?.component1()
+            ?: return false
 
         try {
             val apiUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
             val jsonText = app.get(apiUrl,
                 referer = "https://www.dailymotion.com/embed/video/$videoId",
-                headers = mapOf("User-Agent" to browserUA, "Accept" to "application/json"),
+                headers = mapOf(
+                    "User-Agent" to browserUA,
+                    "Accept" to "application/json",
+                    "Accept-Language" to "en-US,en;q=0.9",
+                    "Origin" to "https://www.dailymotion.com",
+                ),
                 timeout = 15L).text
+            Log.i(TAG, "extractDailymotion: videoId=$videoId jsonLen=${jsonText.length}")
 
             for (match in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(jsonText)) {
                 try {
-                    generateM3u8(serverName, match.value, "https://www.dailymotion.com").forEach(callback)
-                    return
-                } catch (_: Exception) {}
+                    generateM3u8(serverName, match.value, "https://www.dailymotion.com").forEach(trackingCb)
+                    if (emitted) return true
+                } catch (e: Exception) {
+                    Log.w(TAG, "extractDailymotion: m3u8 method failed: ${e.message}")
+                }
             }
             val mp4Urls = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(jsonText).map { it.value }.distinct().toList()
             for (u in mp4Urls) {
@@ -3150,16 +3240,23 @@ class DonghuaLifeBetaProvider : MainAPI() {
                     u.contains("480") -> Qualities.P480.value
                     else -> Qualities.Unknown.value
                 }
-                callback(newExtractorLink(source = serverName, name = "$serverName ${q/1000}p", url = u) {
+                trackingCb(newExtractorLink(source = serverName, name = "$serverName ${q/1000}p", url = u) {
                     this.referer = "https://www.dailymotion.com"
                     this.quality = q
                 })
             }
-        } catch (_: Exception) {}
+            if (emitted) return true
+        } catch (e: Exception) {
+            Log.w(TAG, "extractDailymotion: metadata fetch failed for videoId=$videoId: ${e.message}")
+        }
 
+        // Fallback: probar loadExtractor con la URL de embed
         try {
-            loadExtractor("https://www.dailymotion.com/embed/video/$videoId", referer, subtitleCallback = {}, callback)
-        } catch (_: Exception) {}
+            loadExtractor("https://www.dailymotion.com/embed/video/$videoId", referer, subtitleCallback = {}, trackingCb)
+        } catch (e: Exception) {
+            Log.w(TAG, "extractDailymotion: loadExtractor fallback failed: ${e.message}")
+        }
+        return emitted
     }
 
     private suspend fun extractStreamable(
