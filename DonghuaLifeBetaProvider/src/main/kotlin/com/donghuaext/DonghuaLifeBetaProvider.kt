@@ -2666,6 +2666,25 @@ class DonghuaLifeBetaProvider : MainAPI() {
     )
 
     /**
+     * v23: Data class para parsear el JSON capturado por extractRumbleViaWebView.
+     * Mismo mecanismo que CapturedWebViewData (parseJson<T>, sin Gson).
+     */
+    private data class CapturedRumbleData(
+        val videoSrcs: List<String>? = null,
+        val sourceSrcs: List<String>? = null,
+        val iframeSrcs: List<String>? = null,
+        val htmlSnapshot: String? = null,
+        val fetchUrls: List<RumbleFetchData>? = null
+    )
+
+    private data class RumbleFetchData(
+        val type: String? = null,
+        val url: String? = null,
+        val status: Int? = null,
+        val body: String? = null
+    )
+
+    /**
      * v11: Descarga el JS chunk principal del watch/peliculas page y busca strings
      * relevantes (api/sources, AES, decrypt, key, secret, signature) para intentar
      * encontrar la lógica de decodificación del token client-side.
@@ -3283,8 +3302,390 @@ class DonghuaLifeBetaProvider : MainAPI() {
             Log.w(TAG, "extractRumble: embedPage fetch failed: ${e.message}")
         }
 
+        // ===================== MÉTODO 3: WebView-based extraction (bypassa Cloudflare) =====================
+        // v23 FIX: Rumble agregó Cloudflare bot detection al /embed/<vkey>:
+        //   - HTTP directo → 410 con HTML "Video not found" (1390 bytes)
+        //   - /api/Media?vkey= → 301 redirect a homepage (407KB HTML)
+        //   - El video SÍ existe (la página donghualife lo embebe exitosamente)
+        // Solución: cargar el embed URL en WebView real. El WebView ejecuta JS,
+        // resuelve el challenge de Cloudflare (setea cookie __cf_bm), y carga el
+        // player real de Rumble. Después inyectamos JS para extraer las URLs.
+        if (!emitted) {
+            try {
+                val wvResult = extractRumbleViaWebView(embedUrl, vkey)
+                if (wvResult != null) {
+                    val (hlsUrl, mp4Urls) = wvResult
+                    Log.i(TAG, "extractRumble: WEBVIEW captured hls=${hlsUrl?.take(80)} mp4Count=${mp4Urls.size}")
+
+                    // 1) HLS m3u8 principal
+                    if (!hlsUrl.isNullOrEmpty() && hlsUrl.contains(".m3u8")) {
+                        try {
+                            generateM3u8(serverName, hlsUrl, "https://rumble.com").forEach(trackingCb)
+                            Log.i(TAG, "extractRumble: WEBVIEW hls emitted: ${hlsUrl.take(80)}")
+                            if (emitted) return true
+                        } catch (e: Exception) {
+                            Log.w(TAG, "extractRumble: WEBVIEW hls generateM3u8 failed: ${e.message}")
+                        }
+                    }
+
+                    // 2) MP4 qualities (ua.tar.* — vienen como lista de Pair<url, qualityLabel>)
+                    for ((u, qLabel) in mp4Urls) {
+                        val quality = when (qLabel) {
+                            "2160", "1440" -> Qualities.P2160.value
+                            "1080" -> Qualities.P1080.value
+                            "720" -> Qualities.P720.value
+                            "480" -> Qualities.P480.value
+                            "360" -> Qualities.P360.value
+                            else -> Qualities.Unknown.value
+                        }
+                        val isM3u8 = u.contains(".m3u8")
+                        try {
+                            trackingCb(
+                                newExtractorLink(
+                                    source = serverName,
+                                    name = "$serverName ${qLabel}p",
+                                    url = u,
+                                    type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                                ) {
+                                    this.referer = "https://rumble.com"
+                                    this.quality = quality
+                                }
+                            )
+                        } catch (_: Throwable) {}
+                    }
+                    if (emitted) {
+                        Log.i(TAG, "extractRumble: WEBVIEW mp4 emitted ${mp4Urls.size} qualities")
+                        return true
+                    }
+                } else {
+                    Log.w(TAG, "extractRumble: WEBVIEW returned null for $embedUrl")
+                }
+            } catch (e: Throwable) {
+                Log.w(TAG, "extractRumble: WEBVIEW method failed: ${e.message}")
+            }
+        }
+
         Log.w(TAG, "extractRumble: all methods failed for $embedUrl (vkey=$vkey)")
         return emitted
+    }
+
+    /**
+     * v23: Carga la página embed de Rumble en un WebView real para bypassar
+     * Cloudflare bot detection. Después de que la página carga, inyecta JS que:
+     *   1. Intercepta fetch/XHR para capturar playlist .m3u8 y segmentos .mp4
+     *   2. Lee el <video> tag (currentSrc) que el player setea al cargar
+     *   3. Scrapea el HTML del player buscando URLs .m3u8 y .mp4
+     *
+     * @param embedUrl URL completa del embed (https://rumble.com/embed/<vkey>/?pub=...)
+     * @param vkey vkey extraído del embedUrl (para logging)
+     * @return Pair(hlsUrl, mp4Urls) donde mp4Urls es List<Pair<url, qualityLabel>>
+     *         o null si falla
+     */
+    private suspend fun extractRumbleViaWebView(
+        embedUrl: String,
+        vkey: String?
+    ): Pair<String?, List<Pair<String, String>>>? {
+        // Adquirir Context (mismo strategy que tryWebViewResolver)
+        val ctx: Context? = try {
+            var c: Context? = null
+            try {
+                val m = Class.forName("com.lagradost.api.ContextHelper_jvmKt")
+                    .declaredMethods.firstOrNull { it.name == "getContext" }
+                if (m != null) {
+                    @Suppress("UNCHECKED_CAST")
+                    c = m.invoke(null) as? Context
+                }
+            } catch (_: Throwable) {}
+            if (c == null) {
+                try {
+                    val cls = Class.forName("com.lagradost.cloudstream3.AcraApplication")
+                    val field = cls.getDeclaredField("context")
+                    field.isAccessible = true
+                    c = field.get(null) as? Context
+                } catch (_: Throwable) {}
+            }
+            if (c == null) {
+                try {
+                    val atCls = Class.forName("android.app.ActivityThread")
+                    val m = atCls.getDeclaredMethod("currentApplication")
+                    m.isAccessible = true
+                    c = m.invoke(null) as? Context
+                } catch (_: Throwable) {}
+            }
+            c
+        } catch (_: Throwable) { null }
+        if (ctx == null) {
+            Log.w(TAG, "extractRumble WEBVIEW: no Context available")
+            return null
+        }
+
+        // Script JS que captura URLs del player de Rumble
+        val script = """
+            (function() {
+                try {
+                    // 1. Intercept fetch para capturar playlists m3u8 y mp4
+                    if (!window.__cs3RumbleIntercepted) {
+                        window.__cs3RumbleIntercepted = true;
+                        window.__cs3RumbleUrls = [];
+                        var origFetch = window.fetch;
+                        window.fetch = function() {
+                            var args = arguments;
+                            var fetchUrl = (typeof args[0] === 'string') ? args[0] :
+                                           (args[0] && args[0].url) ? args[0].url : '';
+                            return origFetch.apply(this, args).then(function(resp) {
+                                try {
+                                    if (fetchUrl && (fetchUrl.indexOf('.m3u8') >= 0 ||
+                                        fetchUrl.indexOf('.mp4') >= 0 ||
+                                        fetchUrl.indexOf('rmbl.ws') >= 0 ||
+                                        fetchUrl.indexOf('playlist') >= 0 ||
+                                        fetchUrl.indexOf('/embedjs/') >= 0)) {
+                                        window.__cs3RumbleUrls.push({
+                                            type: 'fetch',
+                                            url: fetchUrl,
+                                            status: resp.status
+                                        });
+                                        // Si es embedjs, capturar el body (tiene URLs de video)
+                                        if (fetchUrl.indexOf('/embedjs/') >= 0 || fetchUrl.indexOf('.m3u8') >= 0) {
+                                            try {
+                                                var clone = resp.clone();
+                                                clone.text().then(function(txt) {
+                                                    window.__cs3RumbleUrls.push({
+                                                        type: 'body',
+                                                        url: fetchUrl,
+                                                        body: txt.substring(0, 200000)
+                                                    });
+                                                }).catch(function(){});
+                                            } catch(e) {}
+                                        }
+                                    }
+                                } catch(e) {}
+                                return resp;
+                            });
+                        };
+                        // También interceptar XMLHttpRequest (algunos players lo usan)
+                        var origOpen = XMLHttpRequest.prototype.open;
+                        XMLHttpRequest.prototype.open = function(method, url) {
+                            try {
+                                if (url && (String(url).indexOf('.m3u8') >= 0 ||
+                                    String(url).indexOf('.mp4') >= 0 ||
+                                    String(url).indexOf('rmbl.ws') >= 0 ||
+                                    String(url).indexOf('/embedjs/') >= 0)) {
+                                    window.__cs3RumbleUrls.push({
+                                        type: 'xhr',
+                                        url: String(url),
+                                        status: 0
+                                    });
+                                }
+                            } catch(e) {}
+                            return origOpen.apply(this, arguments);
+                        };
+                    }
+
+                    // 2. Disparar captura tras 10s (dar tiempo a Cloudflare + player load)
+                    setTimeout(function() {
+                        if (window.__cs3RumbleCaptured) return;
+                        window.__cs3RumbleCaptured = true;
+                        try {
+                            var captured = {
+                                videoSrcs: [],
+                                sourceSrcs: [],
+                                iframeSrcs: [],
+                                htmlSnapshot: '',
+                                fetchUrls: window.__cs3RumbleUrls || []
+                            };
+
+                            // Capturar <video> src / currentSrc
+                            try {
+                                document.querySelectorAll('video').forEach(function(v) {
+                                    if (v.src) captured.videoSrcs.push(v.src);
+                                    if (v.currentSrc && v.currentSrc !== v.src) captured.videoSrcs.push(v.currentSrc);
+                                });
+                            } catch(e) {}
+
+                            // Capturar <source> src
+                            try {
+                                document.querySelectorAll('source').forEach(function(s) {
+                                    if (s.src) captured.sourceSrcs.push(s.src);
+                                });
+                            } catch(e) {}
+
+                            // Capturar <iframe> src (por si hay player anidado)
+                            try {
+                                document.querySelectorAll('iframe').forEach(function(i) {
+                                    if (i.src) captured.iframeSrcs.push(i.src);
+                                });
+                            } catch(e) {}
+
+                            // Snapshot del HTML del player (para buscar URLs m3u8/mp4 embebidas)
+                            try {
+                                captured.htmlSnapshot = document.documentElement.outerHTML.substring(0, 800000);
+                            } catch(e) {}
+
+                            Android.onRumbleCaptured(JSON.stringify(captured));
+                        } catch(e) {
+                            try { Android.onRumbleCaptured('{"error":"' + e.toString() + '"}'); } catch(ee) {}
+                        }
+                    }, 10000);
+                } catch(e) {
+                    try { Android.onRumbleCaptured('{"error":"' + e.toString() + '"}'); } catch(ee) {}
+                }
+            })();
+        """.trimIndent()
+
+        var webView: WebView? = null
+        val capturedJson = withTimeoutOrNull(25000L) {
+            suspendCoroutine<String?> { cont ->
+                Handler(Looper.getMainLooper()).post {
+                    try {
+                        val wv = WebView(ctx)
+                        webView = wv
+                        wv.settings.javaScriptEnabled = true
+                        wv.settings.domStorageEnabled = true
+                        wv.settings.mediaPlaybackRequiresUserGesture = false
+                        wv.settings.blockNetworkImage = true
+                        // UA default de Chrome — NO customizar
+
+                        var finished = false
+
+                        wv.addJavascriptInterface(object {
+                            @JavascriptInterface
+                            fun onRumbleCaptured(json: String) {
+                                Log.i(TAG, "extractRumble WEBVIEW: onRumbleCaptured len=${json.length}")
+                                if (!finished) {
+                                    finished = true
+                                    cont.resume(json)
+                                }
+                            }
+                        }, "Android")
+
+                        wv.webViewClient = object : WebViewClient() {
+                            override fun onPageFinished(view: WebView?, url: String?) {
+                                super.onPageFinished(view, url)
+                                Log.i(TAG, "extractRumble WEBVIEW: onPageFinished url=$url, injecting script")
+                                view?.evaluateJavascript(script) { _ ->
+                                    Log.i(TAG, "extractRumble WEBVIEW: script injected, waiting 10s...")
+                                }
+                            }
+
+                            override fun onReceivedError(
+                                view: WebView?,
+                                request: WebResourceRequest?,
+                                error: WebResourceError?
+                            ) {
+                                super.onReceivedError(view, request, error)
+                                Log.i(TAG, "extractRumble WEBVIEW error: ${error?.description} url=${request?.url}")
+                            }
+                        }
+
+                        val headers = mapOf(
+                            "Accept-Language" to "en-US,en;q=0.9",
+                            "Sec-Fetch-Dest" to "iframe",
+                            "Sec-Fetch-Mode" to "navigate",
+                            "Sec-Fetch-Site" to "cross-site"
+                        )
+                        wv.loadUrl(embedUrl, headers)
+                    } catch (e: Exception) {
+                        Log.i(TAG, "extractRumble WEBVIEW: WebView creation error: ${e.message}")
+                        cont.resume(null)
+                    }
+                }
+            }
+        }
+
+        // Limpiar WebView SIEMPRE
+        Handler(Looper.getMainLooper()).post {
+            try {
+                webView?.stopLoading()
+                webView?.removeJavascriptInterface("Android")
+                webView?.destroy()
+            } catch (_: Exception) {}
+        }
+        webView = null
+
+        if (capturedJson.isNullOrEmpty()) {
+            Log.w(TAG, "extractRumble WEBVIEW: no data captured (timeout)")
+            return null
+        }
+
+        // Parsear el JSON capturado (sin Gson — regex + parseJson<CapturedRumbleData>)
+        try {
+            val parsed = parseJson<CapturedRumbleData>(capturedJson)
+            val allUrls = mutableListOf<Pair<String, String>>()
+            var hlsUrl: String? = null
+
+            // 1) De <video> / <source> / <iframe>
+            parsed.videoSrcs?.forEach { src ->
+                if (src.contains(".m3u8") && hlsUrl == null) hlsUrl = src
+                else if (src.contains(".mp4")) allUrls.add(src to guessQuality(src))
+            }
+            parsed.sourceSrcs?.forEach { src ->
+                if (src.contains(".m3u8") && hlsUrl == null) hlsUrl = src
+                else if (src.contains(".mp4")) allUrls.add(src to guessQuality(src))
+            }
+            parsed.iframeSrcs?.forEach { src ->
+                if (src.contains(".m3u8") && hlsUrl == null) hlsUrl = src
+                else if (src.contains(".mp4")) allUrls.add(src to guessQuality(src))
+            }
+
+            // 2) De fetch responses (buscar URLs .m3u8 y .mp4)
+            parsed.fetchUrls?.forEach { fu ->
+                val u = fu.url ?: return@forEach
+                if (u.contains(".m3u8") && hlsUrl == null) {
+                    hlsUrl = u.replace("\\/", "/").replace("\\u0026", "&")
+                } else if (u.contains(".mp4")) {
+                    allUrls.add(u.replace("\\/", "/").replace("\\u0026", "&") to guessQuality(u))
+                }
+                // Si es un body de embedjs, escanearlo por URLs
+                val body = fu.body
+                if (!body.isNullOrEmpty()) {
+                    Regex("""(https?://[^"\\]+\.(?:m3u8|mp4)[^"\\]*)""").findAll(body).forEach { m ->
+                        val url = m.groupValues[1].replace("\\/", "/").replace("\\u0026", "&")
+                        if (url.contains(".m3u8") && hlsUrl == null) {
+                            hlsUrl = url
+                        } else if (url.contains(".mp4")) {
+                            allUrls.add(url to guessQuality(url))
+                        }
+                    }
+                    // Buscar bloque "ua":{"tar":{...}} con calidades
+                    val tarBlock = Regex(""""tar"\s*:\s*(\{[^}]+\})""").find(body)?.groupValues?.get(1)
+                    if (tarBlock != null) {
+                        Regex(""""(\d{3,4})"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+)"""").findAll(tarBlock).forEach { mm ->
+                            val q = mm.groupValues[1]
+                            val u2 = mm.groupValues[2].replace("\\/", "/").replace("\\u0026", "&")
+                            allUrls.add(u2 to q)
+                        }
+                    }
+                }
+            }
+
+            // 3) Del HTML snapshot (si todo lo demás falló)
+            if (hlsUrl == null && allUrls.isEmpty()) {
+                val html = parsed.htmlSnapshot ?: ""
+                Regex("""(https?://[^"'\s\\]+\.(?:m3u8|mp4)[^"'\s\\]*)""").findAll(html).forEach { m ->
+                    val u = m.groupValues[1].replace("\\/", "/").replace("\\u0026", "&")
+                    if (u.contains(".m3u8") && hlsUrl == null) hlsUrl = u
+                    else if (u.contains(".mp4")) allUrls.add(u to guessQuality(u))
+                }
+            }
+
+            Log.i(TAG, "extractRumble WEBVIEW: parsed hls=${hlsUrl?.take(60)} mp4=${allUrls.size} videoSrcs=${parsed.videoSrcs?.size ?: 0} fetchUrls=${parsed.fetchUrls?.size ?: 0}")
+            return hlsUrl to allUrls.distinctBy { it.first }
+        } catch (e: Exception) {
+            Log.w(TAG, "extractRumble WEBVIEW: parse error: ${e.message}")
+            return null
+        }
+    }
+
+    /** Heurística para inferir calidad de una URL mp4 basándose en patrones comunes */
+    private fun guessQuality(url: String): String {
+        return when {
+            url.contains("2160") || url.contains("1440") -> "2160"
+            url.contains("1080") -> "1080"
+            url.contains("720") -> "720"
+            url.contains("480") -> "480"
+            url.contains("360") -> "360"
+            else -> "720"  // default razonable para Rumble
+        }
     }
 
     private suspend fun extractDailymotion(
