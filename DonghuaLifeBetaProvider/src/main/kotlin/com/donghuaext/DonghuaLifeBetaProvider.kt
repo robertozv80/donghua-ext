@@ -7,6 +7,8 @@ import android.util.Log
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
@@ -2674,7 +2676,14 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val sourceSrcs: List<String>? = null,
         val iframeSrcs: List<String>? = null,
         val htmlSnapshot: String? = null,
-        val fetchUrls: List<RumbleFetchData>? = null
+        val fetchUrls: List<RumbleFetchData>? = null,
+        // v24 diagnostic fields
+        val htmlLength: Int? = null,
+        val htmlHead: String? = null,
+        val docTitle: String? = null,
+        val cookieLen: Int? = null,
+        val cookieNames: String? = null,
+        val error: String? = null
     )
 
     private data class RumbleFetchData(
@@ -3521,11 +3530,20 @@ class DonghuaLifeBetaProvider : MainAPI() {
                                 captured.htmlSnapshot = document.documentElement.outerHTML.substring(0, 800000);
                             } catch(e) {}
 
+                            // v24 DIAGNOSTIC: capturar metadata adicional para logs
+                            try {
+                                captured.htmlLength = document.documentElement.outerHTML.length;
+                                captured.htmlHead = document.documentElement.outerHTML.substring(0, 500);
+                                captured.docTitle = document.title || '';
+                                captured.cookieLen = (document.cookie || '').length;
+                                captured.cookieNames = (document.cookie || '').split(';').map(function(c){return c.split('=')[0].trim();}).filter(Boolean).join(',');
+                            } catch(e) {}
+
                             Android.onRumbleCaptured(JSON.stringify(captured));
                         } catch(e) {
                             try { Android.onRumbleCaptured('{"error":"' + e.toString() + '"}'); } catch(ee) {}
                         }
-                    }, 10000);
+                    }, 18000);
                 } catch(e) {
                     try { Android.onRumbleCaptured('{"error":"' + e.toString() + '"}'); } catch(ee) {}
                 }
@@ -3533,7 +3551,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
         """.trimIndent()
 
         var webView: WebView? = null
-        val capturedJson = withTimeoutOrNull(25000L) {
+        val capturedJson = withTimeoutOrNull(45000L) {
             suspendCoroutine<String?> { cont ->
                 Handler(Looper.getMainLooper()).post {
                     try {
@@ -3543,9 +3561,17 @@ class DonghuaLifeBetaProvider : MainAPI() {
                         wv.settings.domStorageEnabled = true
                         wv.settings.mediaPlaybackRequiresUserGesture = false
                         wv.settings.blockNetworkImage = true
+                        // v24: habilitar cookies para que __cf_bm persista entre pre-warm y embed
+                        try {
+                            wv.settings.javaScriptCanOpenWindowsAutomatically = true
+                            CookieManager.getInstance().setAcceptCookie(true)
+                            CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+                        } catch (_: Throwable) {}
                         // UA default de Chrome — NO customizar
 
                         var finished = false
+                        var prewarmDone = false
+                        var embedLoadStarted = false
 
                         wv.addJavascriptInterface(object {
                             @JavascriptInterface
@@ -3561,9 +3587,41 @@ class DonghuaLifeBetaProvider : MainAPI() {
                         wv.webViewClient = object : WebViewClient() {
                             override fun onPageFinished(view: WebView?, url: String?) {
                                 super.onPageFinished(view, url)
-                                Log.i(TAG, "extractRumble WEBVIEW: onPageFinished url=$url, injecting script")
+                                Log.i(TAG, "extractRumble WEBVIEW: onPageFinished url=$url")
+
+                                // v24 PRE-WARM: primero visitamos rumble.com homepage para que
+                                // Cloudflare setee cookie __cf_bm. Después cargamos el embed URL.
+                                if (url != null && url.contains("rumble.com/") &&
+                                    !url.contains("/embed/") && !prewarmDone) {
+                                    prewarmDone = true
+                                    Log.i(TAG, "extractRumble WEBVIEW: prewarm done, flushing cookies")
+                                    try {
+                                        CookieManager.getInstance().flush()
+                                    } catch (_: Throwable) {}
+                                    // Pequeña pausa para que el cookie se asiente, luego cargar embed
+                                    Handler(Looper.getMainLooper()).postDelayed({
+                                        if (!finished) {
+                                            embedLoadStarted = true
+                                            Log.i(TAG, "extractRumble WEBVIEW: loading embed URL after prewarm")
+                                            val headers2 = mapOf(
+                                                "Accept-Language" to "en-US,en;q=0.9",
+                                                "Sec-Fetch-Dest" to "iframe",
+                                                "Sec-Fetch-Mode" to "navigate",
+                                                "Sec-Fetch-Site" to "same-origin"
+                                            )
+                                            view?.loadUrl(embedUrl, headers2)
+                                        }
+                                    }, 2000L)
+                                    return
+                                }
+
+                                // Embed page cargada (o primer load si prewarm falló)
+                                if (!embedLoadStarted) {
+                                    embedLoadStarted = true
+                                }
+                                Log.i(TAG, "extractRumble WEBVIEW: injecting script (waiting 18s)")
                                 view?.evaluateJavascript(script) { _ ->
-                                    Log.i(TAG, "extractRumble WEBVIEW: script injected, waiting 10s...")
+                                    Log.i(TAG, "extractRumble WEBVIEW: script injected, waiting 18s for capture...")
                                 }
                             }
 
@@ -3575,15 +3633,29 @@ class DonghuaLifeBetaProvider : MainAPI() {
                                 super.onReceivedError(view, request, error)
                                 Log.i(TAG, "extractRumble WEBVIEW error: ${error?.description} url=${request?.url}")
                             }
+
+                            override fun onReceivedHttpError(
+                                view: WebView?,
+                                request: WebResourceRequest?,
+                                errorResponse: WebResourceResponse?
+                            ) {
+                                super.onReceivedHttpError(view, request, errorResponse)
+                                Log.i(TAG, "extractRumble WEBVIEW httpError: code=${errorResponse?.statusCode} reason=${errorResponse?.reasonPhrase} url=${request?.url}")
+                            }
                         }
 
-                        val headers = mapOf(
+                        // v24 PRE-WARM: primero cargar homepage de rumble.com para obtener __cf_bm cookie
+                        // Después el onPageFinished detecta que estamos en homepage y carga el embed URL
+                        val prewarmHeaders = mapOf(
                             "Accept-Language" to "en-US,en;q=0.9",
-                            "Sec-Fetch-Dest" to "iframe",
+                            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            "Sec-Fetch-Dest" to "document",
                             "Sec-Fetch-Mode" to "navigate",
-                            "Sec-Fetch-Site" to "cross-site"
+                            "Sec-Fetch-Site" to "none",
+                            "Upgrade-Insecure-Requests" to "1"
                         )
-                        wv.loadUrl(embedUrl, headers)
+                        Log.i(TAG, "extractRumble WEBVIEW: prewarming rumble.com homepage for cf cookies")
+                        wv.loadUrl("https://rumble.com/", prewarmHeaders)
                     } catch (e: Exception) {
                         Log.i(TAG, "extractRumble WEBVIEW: WebView creation error: ${e.message}")
                         cont.resume(null)
@@ -3612,6 +3684,23 @@ class DonghuaLifeBetaProvider : MainAPI() {
             val parsed = parseJson<CapturedRumbleData>(capturedJson)
             val allUrls = mutableListOf<Pair<String, String>>()
             var hlsUrl: String? = null
+
+            // v24 DIAGNOSTIC: log diagnostic fields para entender qué vio el WebView
+            Log.i(TAG, "extractRumble WEBVIEW DIAG: docTitle='${parsed.docTitle}' " +
+                "htmlLength=${parsed.htmlLength ?: "null"} " +
+                "htmlSnapshotLen=${parsed.htmlSnapshot?.length ?: 0} " +
+                "cookieLen=${parsed.cookieLen ?: 0} " +
+                "cookieNames='${parsed.cookieNames ?: ""}' " +
+                "videoSrcs=${parsed.videoSrcs?.size ?: 0} " +
+                "sourceSrcs=${parsed.sourceSrcs?.size ?: 0} " +
+                "iframeSrcs=${parsed.iframeSrcs?.size ?: 0} " +
+                "fetchUrls=${parsed.fetchUrls?.size ?: 0}")
+            if (!parsed.htmlHead.isNullOrEmpty()) {
+                Log.i(TAG, "extractRumble WEBVIEW DIAG: htmlHead=${parsed.htmlHead.take(300)}")
+            }
+            if (!parsed.error.isNullOrEmpty()) {
+                Log.w(TAG, "extractRumble WEBVIEW DIAG: JS error: ${parsed.error}")
+            }
 
             // 1) De <video> / <source> / <iframe>
             parsed.videoSrcs?.forEach { src ->
