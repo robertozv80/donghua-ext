@@ -3229,21 +3229,24 @@ class DonghuaLifeBetaProvider : MainAPI() {
         }
 
         // ===================== MÉTODO 2: fallback al scrape del embed page (caso 200) =====================
-        // Algunos videos (poco frecuentes) sí devuelven 200 con HTML scrolleable.
+        // v25 FIX CRÍTICO: Referer debe ser donghualife (el sitio que embebe), NO rumble.com.
+        // Rumble valida Referer para detectar hotlinking/bots. Sin Referer=cross-site → fake 410.
         try {
             val embedHeaders = mapOf(
-                "User-Agent" to browserUA,
-                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Accept-Language" to "en-US,en;q=0.9",
-                "Referer" to "https://rumble.com/",
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language" to "en-US,en;q=0.9,es;q=0.8",
+                "Referer" to "https://beta.donghualife.com/",
+                "Origin" to "https://beta.donghualife.com",
                 "Sec-Fetch-Dest" to "iframe",
                 "Sec-Fetch-Mode" to "navigate",
-                "Sec-Fetch-Site" to "same-origin",
+                "Sec-Fetch-Site" to "cross-site",
+                "Sec-Fetch-User" to "?1",
                 "Upgrade-Insecure-Requests" to "1",
             )
-            val resp = app.get(embedUrl, referer = "https://rumble.com/", headers = embedHeaders, timeout = 30L)
+            val resp = app.get(embedUrl, referer = "https://beta.donghualife.com/", headers = embedHeaders, timeout = 30L)
             val html = resp.text
-            Log.i(TAG, "extractRumble: embedPage httpCode=${resp.code} htmlLen=${html.length}")
+            Log.i(TAG, "extractRumble: embedPage httpCode=${resp.code} htmlLen=${html.length} (with donghualife Referer)")
 
             if (resp.code == 200 && html.length > 5000) {
                 // HLS auto
@@ -3551,6 +3554,8 @@ class DonghuaLifeBetaProvider : MainAPI() {
         """.trimIndent()
 
         var webView: WebView? = null
+        // v25: declarar FUERA del withTimeoutOrNull para que el parser pueda acceder.
+        val capturedNetworkUrls = java.util.concurrent.ConcurrentLinkedQueue<String>()
         val capturedJson = withTimeoutOrNull(45000L) {
             suspendCoroutine<String?> { cont ->
                 Handler(Looper.getMainLooper()).post {
@@ -3561,17 +3566,22 @@ class DonghuaLifeBetaProvider : MainAPI() {
                         wv.settings.domStorageEnabled = true
                         wv.settings.mediaPlaybackRequiresUserGesture = false
                         wv.settings.blockNetworkImage = true
-                        // v24: habilitar cookies para que __cf_bm persista entre pre-warm y embed
+                        // v25: habilitar cookies por si Rumble setea alguna tras resolver Referer
                         try {
                             wv.settings.javaScriptCanOpenWindowsAutomatically = true
                             CookieManager.getInstance().setAcceptCookie(true)
                             CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
                         } catch (_: Throwable) {}
-                        // UA default de Chrome — NO customizar
+                        // v25 FIX CRÍTICO: Override UA a desktop Chrome.
+                        // El UA default de WebView incluye "; wv)" que Rumble detecta como bot.
+                        try {
+                            wv.settings.userAgentValue =
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                        } catch (_: Throwable) {}
 
                         var finished = false
-                        var prewarmDone = false
-                        var embedLoadStarted = false
+                        var http410Count = false
 
                         wv.addJavascriptInterface(object {
                             @JavascriptInterface
@@ -3585,40 +3595,30 @@ class DonghuaLifeBetaProvider : MainAPI() {
                         }, "Android")
 
                         wv.webViewClient = object : WebViewClient() {
+                            override fun shouldInterceptRequest(
+                                view: WebView?,
+                                request: WebResourceRequest?
+                            ): WebResourceResponse? {
+                                // v25: capturar URLs de video de TODOS los requests (incluye iframe cross-origin)
+                                try {
+                                    val u = request?.url?.toString() ?: ""
+                                    if (u.isNotEmpty() && (
+                                        u.contains(".m3u8") || u.contains(".mp4") ||
+                                        u.contains("rmbl.ws") || u.contains("/embedjs/") ||
+                                        u.contains("playlist") || u.contains("master"))) {
+                                        capturedNetworkUrls.add(u)
+                                        Log.i(TAG, "extractRumble WEBVIEW intercepted: $u")
+                                    }
+                                } catch (_: Throwable) {}
+                                return null  // no interceptar, solo observar
+                            }
+
                             override fun onPageFinished(view: WebView?, url: String?) {
                                 super.onPageFinished(view, url)
                                 Log.i(TAG, "extractRumble WEBVIEW: onPageFinished url=$url")
 
-                                // v24 PRE-WARM: primero visitamos rumble.com homepage para que
-                                // Cloudflare setee cookie __cf_bm. Después cargamos el embed URL.
-                                if (url != null && url.contains("rumble.com/") &&
-                                    !url.contains("/embed/") && !prewarmDone) {
-                                    prewarmDone = true
-                                    Log.i(TAG, "extractRumble WEBVIEW: prewarm done, flushing cookies")
-                                    try {
-                                        CookieManager.getInstance().flush()
-                                    } catch (_: Throwable) {}
-                                    // Pequeña pausa para que el cookie se asiente, luego cargar embed
-                                    Handler(Looper.getMainLooper()).postDelayed({
-                                        if (!finished) {
-                                            embedLoadStarted = true
-                                            Log.i(TAG, "extractRumble WEBVIEW: loading embed URL after prewarm")
-                                            val headers2 = mapOf(
-                                                "Accept-Language" to "en-US,en;q=0.9",
-                                                "Sec-Fetch-Dest" to "iframe",
-                                                "Sec-Fetch-Mode" to "navigate",
-                                                "Sec-Fetch-Site" to "same-origin"
-                                            )
-                                            view?.loadUrl(embedUrl, headers2)
-                                        }
-                                    }, 2000L)
-                                    return
-                                }
-
-                                // Embed page cargada (o primer load si prewarm falló)
-                                if (!embedLoadStarted) {
-                                    embedLoadStarted = true
-                                }
+                                // v25: inyectar script de captura en cada page load.
+                                // (Se re-inyecta tras navegar a donghualife en el fallback.)
                                 Log.i(TAG, "extractRumble WEBVIEW: injecting script (waiting 18s)")
                                 view?.evaluateJavascript(script) { _ ->
                                     Log.i(TAG, "extractRumble WEBVIEW: script injected, waiting 18s for capture...")
@@ -3640,22 +3640,66 @@ class DonghuaLifeBetaProvider : MainAPI() {
                                 errorResponse: WebResourceResponse?
                             ) {
                                 super.onReceivedHttpError(view, request, errorResponse)
-                                Log.i(TAG, "extractRumble WEBVIEW httpError: code=${errorResponse?.statusCode} reason=${errorResponse?.reasonPhrase} url=${request?.url}")
+                                val code = errorResponse?.statusCode
+                                val url = request?.url?.toString() ?: ""
+                                Log.i(TAG, "extractRumble WEBVIEW httpError: code=$code reason=${errorResponse?.reasonPhrase} url=$url")
+
+                                // v25 FALLBACK: si embed URL recibe 410 a pesar del Referer header,
+                                // navegar el WebView a beta.donghualife.com primero, y luego inyectar
+                                // un <iframe> apuntando al embed URL. El iframe heredará Referer=donghualife.
+                                if (code == 410 && url.contains("/embed/") && !http410Count) {
+                                    http410Count = true
+                                    Log.i(TAG, "extractRumble WEBVIEW: 410 recibido, fallback: navegar a donghualife + iframe injection")
+                                    val dhHeaders = mapOf(
+                                        "Accept-Language" to "en-US,en;q=0.9",
+                                        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                                        "Sec-Fetch-Dest" to "document",
+                                        "Sec-Fetch-Mode" to "navigate",
+                                        "Sec-Fetch-Site" to "none",
+                                        "Upgrade-Insecure-Requests" to "1"
+                                    )
+                                    view?.loadUrl("https://beta.donghualife.com/", dhHeaders)
+                                    // Tras 3s, inyectar iframe apuntando al embed URL (Referer=donghualife)
+                                    Handler(Looper.getMainLooper()).postDelayed({
+                                        if (!finished) {
+                                            Log.i(TAG, "extractRumble WEBVIEW: inyectando iframe tras donghualife load")
+                                            val iframeScript = """
+                                                (function() {
+                                                    try {
+                                                        var ifr = document.createElement('iframe');
+                                                        ifr.style.width = '640px';
+                                                        ifr.style.height = '360px';
+                                                        ifr.style.position = 'fixed';
+                                                        ifr.style.top = '0';
+                                                        ifr.style.left = '0';
+                                                        ifr.style.zIndex = '9999';
+                                                        ifr.src = '$embedUrl';
+                                                        document.body.appendChild(ifr);
+                                                    } catch(e) {}
+                                                })();
+                                            """.trimIndent()
+                                            view?.evaluateJavascript(iframeScript) {}
+                                        }
+                                    }, 3000L)
+                                }
                             }
                         }
 
-                        // v24 PRE-WARM: primero cargar homepage de rumble.com para obtener __cf_bm cookie
-                        // Después el onPageFinished detecta que estamos en homepage y carga el embed URL
-                        val prewarmHeaders = mapOf(
-                            "Accept-Language" to "en-US,en;q=0.9",
-                            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                            "Sec-Fetch-Dest" to "document",
+                        // v25 FIX CRÍTICO: cargar embed URL DIRECTO con Referer = donghualife.
+                        // Rumble verifica Referer — sin él devuelve fake 410 "Video not found".
+                        val embedHeaders = mapOf(
+                            "Referer" to "https://beta.donghualife.com/",
+                            "Origin" to "https://beta.donghualife.com",
+                            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                            "Accept-Language" to "en-US,en;q=0.9,es;q=0.8",
+                            "Sec-Fetch-Dest" to "iframe",
                             "Sec-Fetch-Mode" to "navigate",
-                            "Sec-Fetch-Site" to "none",
+                            "Sec-Fetch-Site" to "cross-site",
+                            "Sec-Fetch-User" to "?1",
                             "Upgrade-Insecure-Requests" to "1"
                         )
-                        Log.i(TAG, "extractRumble WEBVIEW: prewarming rumble.com homepage for cf cookies")
-                        wv.loadUrl("https://rumble.com/", prewarmHeaders)
+                        Log.i(TAG, "extractRumble WEBVIEW: loading embed URL with Referer=beta.donghualife.com")
+                        wv.loadUrl(embedUrl, embedHeaders)
                     } catch (e: Exception) {
                         Log.i(TAG, "extractRumble WEBVIEW: WebView creation error: ${e.message}")
                         cont.resume(null)
@@ -3675,7 +3719,25 @@ class DonghuaLifeBetaProvider : MainAPI() {
         webView = null
 
         if (capturedJson.isNullOrEmpty()) {
-            Log.w(TAG, "extractRumble WEBVIEW: no data captured (timeout)")
+            // v25: aún si el JS no respondió, podemos tener URLs capturadas via shouldInterceptRequest
+            if (capturedNetworkUrls.isNotEmpty()) {
+                Log.i(TAG, "extractRumble WEBVIEW: JS timeout pero ${capturedNetworkUrls.size} URLs interceptadas — usando esas")
+                var hlsUrl: String? = null
+                val allUrls = mutableListOf<Pair<String, String>>()
+                capturedNetworkUrls.forEach { u ->
+                    val clean = u.replace("\\/", "/").replace("\\u0026", "&")
+                    if (clean.contains(".m3u8") && hlsUrl == null) {
+                        hlsUrl = clean
+                    } else if (clean.contains(".mp4") || clean.contains("rmbl.ws")) {
+                        allUrls.add(clean to guessQuality(clean))
+                    }
+                }
+                if (hlsUrl != null || allUrls.isNotEmpty()) {
+                    Log.i(TAG, "extractRumble WEBVIEW: returning from intercept-only hls=${hlsUrl?.take(60)} mp4=${allUrls.size}")
+                    return hlsUrl to allUrls.distinctBy { it.first }
+                }
+            }
+            Log.w(TAG, "extractRumble WEBVIEW: no data captured (timeout) and no intercepted URLs")
             return null
         }
 
@@ -3757,7 +3819,25 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 }
             }
 
-            Log.i(TAG, "extractRumble WEBVIEW: parsed hls=${hlsUrl?.take(60)} mp4=${allUrls.size} videoSrcs=${parsed.videoSrcs?.size ?: 0} fetchUrls=${parsed.fetchUrls?.size ?: 0}")
+            // 4) v25 FALLBACK CRÍTICO: URLs capturadas via shouldInterceptRequest.
+            // Estas son URLs de requests de red hechos por el WebView (incluye iframe cross-origin).
+            // Es la ÚLTIMA fuente confiable cuando el iframe carga el player de Rumble y el JS top
+            // no puede ver dentro del iframe (mismo-origin policy).
+            if (capturedNetworkUrls.isNotEmpty()) {
+                Log.i(TAG, "extractRumble WEBVIEW: checking ${capturedNetworkUrls.size} intercepted URLs")
+                capturedNetworkUrls.forEach { u ->
+                    val clean = u.replace("\\/", "/").replace("\\u0026", "&")
+                    if (clean.contains(".m3u8") && hlsUrl == null) {
+                        hlsUrl = clean
+                        Log.i(TAG, "extractRumble WEBVIEW: hls from intercept: ${clean.take(80)}")
+                    } else if (clean.contains(".mp4") || clean.contains("rmbl.ws")) {
+                        allUrls.add(clean to guessQuality(clean))
+                        Log.i(TAG, "extractRumble WEBVIEW: mp4 from intercept: ${clean.take(80)}")
+                    }
+                }
+            }
+
+            Log.i(TAG, "extractRumble WEBVIEW: parsed hls=${hlsUrl?.take(60)} mp4=${allUrls.size} videoSrcs=${parsed.videoSrcs?.size ?: 0} fetchUrls=${parsed.fetchUrls?.size ?: 0} intercepted=${capturedNetworkUrls.size}")
             return hlsUrl to allUrls.distinctBy { it.first }
         } catch (e: Exception) {
             Log.w(TAG, "extractRumble WEBVIEW: parse error: ${e.message}")
