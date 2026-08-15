@@ -3575,7 +3575,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
                         // v25 FIX CRÍTICO: Override UA a desktop Chrome.
                         // El UA default de WebView incluye "; wv)" que Rumble detecta como bot.
                         try {
-                            wv.settings.userAgentValue =
+                            wv.settings.userAgentString =
                                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
                         } catch (_: Throwable) {}
