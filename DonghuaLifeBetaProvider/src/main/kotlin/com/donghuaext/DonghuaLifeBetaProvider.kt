@@ -3150,7 +3150,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
                         // hls.auto.{ld,sd,hd}.url (quality variants)
                         if (!emitted) {
                             var qualityEmitted = 0
-                            for (qMatch in Regex(""""(ld|sd|hd)"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+\.m3u8[^"]*)"""".findAll(embeddedJson))) {
+                            for (qMatch in Regex(""""...pattern..."""").findAll(embeddedJson)) {
                                 val qLabel = qMatch.groupValues[1]
                                 val u = qMatch.groupValues[2]
                                     .replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&")
