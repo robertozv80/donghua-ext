@@ -1,6 +1,7 @@
 package com.donghuaworld
 
 import android.util.Base64
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -16,6 +17,7 @@ class DonghuaWorldProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime)
 
     companion object {
+        private const val TAG = "DonghuaWorld"
         private const val PLAYER_BASE = "https://player.donghuaplanet.com"
 
         /** Regex to match episode numbers or ranges like "Episode 263" or "Episode 254-255" */
@@ -468,7 +470,9 @@ class DonghuaWorldProvider : MainAPI() {
                 when {
                     serverName.contains("Dark", ignoreCase = true) -> darkServerUrl = iframeSrc
                     serverName.contains("Eng-Sub", ignoreCase = true) ||
-                        serverName.contains("Dailymotion", ignoreCase = true) -> engSubUrl = iframeSrc
+                        serverName.contains("Dailymotion", ignoreCase = true) ||
+                        serverName.contains("DM Player", ignoreCase = true) ||
+                        serverName.contains("DM", ignoreCase = true) -> engSubUrl = iframeSrc
                 }
             } catch (_: Exception) {
                 // Skip invalid base64
@@ -497,7 +501,9 @@ class DonghuaWorldProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ) {
         try {
+            Log.d(TAG, "extractDarkServer: fetching $playerUrl")
             val playerHtml = app.get(playerUrl, referer = "$mainUrl/").text
+            Log.d(TAG, "extractDarkServer: got ${playerHtml.length} chars")
 
             // === Extract Subtitle Tracks ===
             extractAndParseTracks(playerHtml, subtitleCallback)
@@ -505,8 +511,8 @@ class DonghuaWorldProvider : MainAPI() {
             // === Extract Video Sources ===
             extractAndParseSources(playerHtml, callback)
 
-        } catch (_: Exception) {
-            // Dark Server extraction failed
+        } catch (e: Exception) {
+            Log.w(TAG, "extractDarkServer failed for $playerUrl: ${e.message}")
         }
     }
 
@@ -543,16 +549,20 @@ class DonghuaWorldProvider : MainAPI() {
     /**
      * Extract and parse video sources from the player HTML.
      * FIX 2026-07-28: Marcar como M3U8/HLS los archivos .tar?r_file=chunklist.m3u8.
-     * Antes se etiquetaban como MP4 (isM3u8=false en el lambda anterior ya fue removido),
-     * pero el reproductor intentaba parsearlos como contenedor MP4 y mostraba
-     * "Error_code_parsing_container_unsupported(3003)". Aunque la app ya no usa
-     * isM3u8 explícitamente, debemos pasar estos como type=M3U8 usando ExtractorLinkType
-     * para que el reproductor sepa que son HLS envueltos en .tar.
+     * FIX 2026-08-21: El player ahora usa JavaScript (const sources = [...]) en vez de
+     * formato JSON (sources: [...]). Ademas, tracks se declara ANTES que sources.
+     * Nuevo regex acepta tanto : como = y no depende del orden con tracks.
      */
     private suspend fun extractAndParseSources(html: String, callback: (ExtractorLink) -> Unit) {
-        // Buscar el bloque "sources":[...] (termina antes de "tracks")
-        val sourcesMatch = Regex("""sources\s*:\s*(\[[\s\S]*?\])\s*,\s*tracks""").find(html)
-            ?: return
+        // FIX: El player usa "const sources = [...]" (JavaScript) no "sources: [...]" (JSON).
+        // Ademas, tracks puede declararse antes o despues de sources.
+        val sourcesMatch = Regex("""sources\s*[:=]\s*(\[[\s\S]*?\])\s*[;,]""").find(html)
+        if (sourcesMatch != null) {
+            Log.d(TAG, "extractAndParseSources: found sources block")
+        } else {
+            Log.w(TAG, "extractAndParseSources: NO sources block found")
+            return
+        }
 
         val sourcesStr = sourcesMatch.groupValues[1]
 
