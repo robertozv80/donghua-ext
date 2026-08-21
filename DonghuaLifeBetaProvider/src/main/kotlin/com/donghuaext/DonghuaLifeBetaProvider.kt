@@ -3401,7 +3401,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
 
                     if (resp.code == 200 && (jsonText.startsWith("{") || jsonText.startsWith("["))) {
                         // Real JSON response — parse like MÉTODO 1
-                        val hlsAutoMatch = Regex(""""hls"\s*:\s*\{[^{}]*"auto"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+\.m3u8[^"]*)"""".find(jsonText)
+                        val hlsAutoMatch = Regex(""""hls"\s*:\s*\{[^{}]*"auto"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+\.m3u8[^"]*)"""").find(jsonText)
                         if (hlsAutoMatch != null) {
                             val u = hlsAutoMatch.groupValues[1].replace("\\/", "/").replace("\\u0026", "&")
                             try {
@@ -3486,7 +3486,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
                     var jsEmitted = 0
 
                     // hls.auto.url
-                    val hlsAutoMatch = Regex(""""hls"\s*:\s*\{[^{}]*"auto"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+\.m3u8[^"]*)"""".find(jsText)
+                    val hlsAutoMatch = Regex(""""hls"\s*:\s*\{[^{}]*"auto"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+\.m3u8[^"]*)"""").find(jsText)
                     if (hlsAutoMatch != null) {
                         val u = hlsAutoMatch.groupValues[1].replace("\\/", "/").replace("\\u0026", "&")
                         try {
@@ -3609,7 +3609,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
                     if (resp.code == 200 && html.length > 5000) {
                         // Buscar patrones de video URLs en el HTML de la página pública
                         // Rumble incluye <meta property="og:video" content="...mp4"> o un JSON con URLs
-                        val hlsAutoMatch = Regex(""""hls"\s*:\s*\{[^{}]*"auto"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+\.m3u8[^"]*)"""".find(html)
+                        val hlsAutoMatch = Regex(""""hls"\s*:\s*\{[^{}]*"auto"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+\.m3u8[^"]*)"""").find(html)
                         if (hlsAutoMatch != null) {
                             val u = hlsAutoMatch.groupValues[1].replace("\\/", "/").replace("\\u0026", "&")
                             try {
