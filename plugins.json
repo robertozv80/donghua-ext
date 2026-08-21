@@ -68,10 +68,10 @@
     "authors": [
       "robertozv80"
     ],
-    "fileSize": 28021,
+    "fileSize": 28474,
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
     "apiVersion": 1,
-    "fileHash": "sha256-dbcd966ab2ed33a49019e8d5554bba3dfd6257a57b190ed233f3f988c7d8c437"
+    "fileHash": "sha256-63794fe3cb049d295f53081d7fcd1e357a1a6b0b4070b4d51b9f3fce7df2499e"
   },
   {
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/MundoDonghuaProvider.cs3",
