@@ -25,6 +25,12 @@ class DonghuaWorldProvider : MainAPI() {
 
         /** Languages to include as subtitles (Spanish primary, English fallback) */
         private val SUBTITLE_LANGUAGES = setOf("Spanish", "English")
+
+        /** Keywords that identify Spanish subtitle tracks (case-insensitive matching) */
+        private val SPANISH_KEYWORDS = listOf("spanish", "español", "espanol", "espa\u00f1ol", "es-es", "es-419", "latino", "latam")
+
+        /** Keywords that identify English subtitle tracks (case-insensitive matching) */
+        private val ENGLISH_KEYWORDS = listOf("english", "eng", "en-us", "en-gb")
     }
 
     // ==================== MAIN PAGE ====================
@@ -508,6 +514,9 @@ class DonghuaWorldProvider : MainAPI() {
             // === Extract Subtitle Tracks ===
             extractAndParseTracks(playerHtml, subtitleCallback)
 
+            // Log if no subtitles were found for debugging
+            // (subtitleCallback invocations are counted inside extractAndParseTracks)
+
             // === Extract Video Sources ===
             extractAndParseSources(playerHtml, callback)
 
@@ -518,32 +527,236 @@ class DonghuaWorldProvider : MainAPI() {
 
     /**
      * Extract and parse subtitle tracks from the player HTML.
+     * FIX 2026-08-22: Rewritten for robustness.
+     *   - Multiple regex patterns to find the tracks array (not just const/var/let tracks =)
+     *   - Flexible track object parsing (any property order, extra properties allowed)
+     *   - Expanded language matching ("Español", "es", "Spanish", "English", etc.)
+     *   - Extensive logging for debugging
      */
     private fun extractAndParseTracks(html: String, subtitleCallback: (SubtitleFile) -> Unit) {
-        val tracksMatch = Regex("""(?:const|var|let)\s+tracks\s*=\s*(\[[\s\S]*?\])\s*;""").find(html)
-            ?: return
+        var emittedCount = 0
 
-        val tracksStr = tracksMatch.groupValues[1]
+        // --- Step 1: Find the tracks array using multiple patterns ---
+        val tracksStr = findTracksArray(html)
+        if (tracksStr == null) {
+            Log.w(TAG, "extractAndParseTracks: NO tracks array found, trying fallback methods")
+            // Fallback: look for <track> HTML5 tags
+            emittedCount += extractHtml5Tracks(html, subtitleCallback)
+            // Fallback: look for .vtt URLs directly
+            emittedCount += extractVttUrls(html, subtitleCallback)
+            if (emittedCount == 0) {
+                // Log context around 'tracks' keyword for debugging
+                val idx = html.indexOf("tracks")
+                if (idx != -1) {
+                    Log.d(TAG, "extractAndParseTracks: 'tracks' keyword found at pos $idx: " +
+                        html.substring(maxOf(0, idx - 60), minOf(html.length, idx + 200)).replace("\n", " "))
+                } else {
+                    Log.d(TAG, "extractAndParseTracks: 'tracks' keyword NOT found in HTML at all")
+                }
+            }
+            return
+        }
 
-        val trackPattern = Regex("""\{\s*"file"\s*:\s*"([^"]+)"\s*,\s*"label"\s*:\s*"([^"]+)"\s*\}""")
-        val tracks = trackPattern.findAll(tracksStr).mapNotNull { match ->
-            val file = match.groupValues[1]
+        Log.d(TAG, "extractAndParseTracks: found tracks array, length=${tracksStr.length}")
+
+        // --- Step 2: Parse individual track objects (flexible) ---
+        // Match each {...} object in the array
+        val trackObjRegex = Regex("""\{[^{}]*\}""")
+        for (objMatch in trackObjRegex.findAll(tracksStr)) {
+            val obj = objMatch.value
+
+            // Extract file/src/url property
+            val fileMatch = Regex(""""(?:file|src|url)"\s*:\s*"([^"]+)""").find(obj)
+            // Extract label/language/lang property
+            val labelMatch = Regex(""""(?:label|language|lang|name)"\s*:\s*"([^"]+)""").find(obj)
+
+            if (fileMatch == null || labelMatch == null) {
+                Log.d(TAG, "extractAndParseTracks: track object missing file or label: ${obj.take(100)}")
+                continue
+            }
+
+            val file = fileMatch.groupValues[1]
                 .replace("\\/", "/")
                 .replace("\\u0026", "&")
-            val label = match.groupValues[2]
-            Pair(file, label)
-        }.toList()
+            val label = labelMatch.groupValues[1]
 
-        for ((file, label) in tracks) {
-            if (label in SUBTITLE_LANGUAGES) {
+            Log.d(TAG, "extractAndParseTracks: found track label=\"$label\" url=\"$file\"")
+
+            // --- Step 3: Check if label matches Spanish or English ---
+            val normalizedLang = normalizeSubtitleLanguage(label)
+            if (normalizedLang != null) {
+                Log.d(TAG, "extractAndParseTracks: EMITTING subtitle lang=$normalizedLang url=$file")
                 subtitleCallback.invoke(
                     SubtitleFile(
-                        lang = label,
+                        lang = normalizedLang,
                         url = file
                     )
                 )
+                emittedCount++
+            } else {
+                Log.d(TAG, "extractAndParseTracks: skipping track label=\"$label\" (not Spanish/English)")
             }
         }
+
+        Log.d(TAG, "extractAndParseTracks: total subtitles emitted: $emittedCount")
+    }
+
+    /**
+     * Try multiple patterns to find the tracks array in player HTML.
+     */
+    private fun findTracksArray(html: String): String? {
+        // Pattern 1: const/var/let tracks = [...];  (original JavaScript format)
+        Regex("""(?:const|var|let)\s+tracks\s*=\s*(\[[\s\S]*?\])\s*;""").find(html)?.let {
+            Log.d(TAG, "findTracksArray: matched Pattern 1 (const/var/let tracks = [...])")
+            return it.groupValues[1]
+        }
+
+        // Pattern 2: tracks = [...];  (without const/var/let keyword)
+        Regex("""(?:^|[;\n\s])tracks\s*=\s*(\[[\s\S]*?\])\s*;""").find(html)?.let {
+            Log.d(TAG, "findTracksArray: matched Pattern 2 (tracks = [...])")
+            return it.groupValues[1]
+        }
+
+        // Pattern 3: "tracks": [...]  (JSON property format)
+        Regex(""""tracks"\s*:\s*(\[[\s\S]*?\])""").find(html)?.let {
+            Log.d(TAG, "findTracksArray: matched Pattern 3 (\"tracks\": [...])")
+            return it.groupValues[1]
+        }
+
+        // Pattern 4: subtitleTracks / captions / textTracks (alternative variable names)
+        for (varName in listOf("subtitleTracks", "captions", "textTracks", "subtitles")) {
+            Regex("""(?:const|var|let)\s+${varName}\s*=\s*(\[[\s\S]*?\])\s*;""").find(html)?.let {
+                Log.d(TAG, "findTracksArray: matched Pattern 4 ($varName = [...])")
+                return it.groupValues[1]
+            }
+        }
+
+        return null
+    }
+
+    /**
+     * Fallback: extract subtitles from HTML5 <track> tags.
+     */
+    private fun extractHtml5Tracks(html: String, subtitleCallback: (SubtitleFile) -> Unit): Int {
+        var count = 0
+        val trackTagRegex = Regex(
+            """<track[^>]+src=["']([^"']+)["'][^>]*>""",
+            RegexOption.IGNORE_CASE
+        )
+        // Also try reversed attribute order: label before src
+        val trackTagRegex2 = Regex(
+            """<track[^>]+label=["']([^"']+)["'][^>]+src=["']([^"']+)["'][^>]*>""",
+            RegexOption.IGNORE_CASE
+        )
+
+        // Try label-then-src order
+        for (match in trackTagRegex2.findAll(html)) {
+            val label = match.groupValues[1]
+            val src = match.groupValues[2].replace("&amp;", "&")
+            val lang = normalizeSubtitleLanguage(label)
+            if (lang != null) {
+                Log.d(TAG, "extractHtml5Tracks: EMITTING from <track> tag lang=$lang url=$src")
+                subtitleCallback.invoke(SubtitleFile(lang = lang, url = src))
+                count++
+            }
+        }
+
+        // Try src-then-label order (only if no tracks found with the other pattern)
+        if (count == 0) {
+            for (match in trackTagRegex.findAll(html)) {
+                val src = match.groupValues[1].replace("&amp;", "&")
+                // Extract label from the same tag
+                val labelMatch = Regex("""label=["']([^"']+)['"]""", RegexOption.IGNORE_CASE).find(match.value)
+                val label = labelMatch?.groupValues?.get(1) ?: continue
+                val lang = normalizeSubtitleLanguage(label)
+                if (lang != null) {
+                    Log.d(TAG, "extractHtml5Tracks: EMITTING from <track> tag (src-first) lang=$lang url=$src")
+                    subtitleCallback.invoke(SubtitleFile(lang = lang, url = src))
+                    count++
+                }
+            }
+        }
+
+        if (count > 0) Log.d(TAG, "extractHtml5Tracks: found $count subtitle tracks from <track> tags")
+        return count
+    }
+
+    /**
+     * Fallback: find .vtt subtitle URLs directly in the HTML.
+     */
+    private fun extractVttUrls(html: String, subtitleCallback: (SubtitleFile) -> Unit): Int {
+        var count = 0
+        val vttRegex = Regex("""["'](https?://[^"']*\.(?:vtt|srt)[^"']*)["']""")
+        for (match in vttRegex.findAll(html)) {
+            val url = match.groupValues[1].replace("\\/", "/").replace("\\u0026", "&")
+            // Try to guess language from URL path (e.g., /es/ or /spanish/ or ?lang=es)
+            val lang = guessLanguageFromUrl(url)
+            Log.d(TAG, "extractVttUrls: found VTT/SRT url=$url guessedLang=$lang")
+            if (lang != null) {
+                subtitleCallback.invoke(SubtitleFile(lang = lang, url = url))
+                count++
+            } else {
+                // If we can't guess the language, include it as Spanish (primary)
+                // since this is a Spanish-subtitle focused extension
+                Log.d(TAG, "extractVttUrls: including unknown-language VTT as Spanish: $url")
+                subtitleCallback.invoke(SubtitleFile(lang = "Spanish", url = url))
+                count++
+            }
+        }
+        if (count > 0) Log.d(TAG, "extractVttUrls: found $count VTT/SRT subtitle URLs")
+        return count
+    }
+
+    /**
+     * Normalize a subtitle label to a standard language name.
+     * Returns null if the label doesn't match Spanish or English.
+     */
+    private fun normalizeSubtitleLanguage(label: String): String? {
+        val lower = label.lowercase().trim()
+
+        // Check Spanish
+        if (lower in SPANISH_KEYWORDS ||
+            SPANISH_KEYWORDS.any { lower.contains(it) } ||
+            lower == "es" || lower.startsWith("es-")
+        ) {
+            return "Spanish"
+        }
+
+        // Check English
+        if (lower in ENGLISH_KEYWORDS ||
+            ENGLISH_KEYWORDS.any { lower.contains(it) } ||
+            lower == "en" || lower.startsWith("en-")
+        ) {
+            return "English"
+        }
+
+        // Exact match with original set (backward compat)
+        if (label in SUBTITLE_LANGUAGES) return label
+
+        return null
+    }
+
+    /**
+     * Try to guess the language from a subtitle URL path/query.
+     */
+    private fun guessLanguageFromUrl(url: String): String? {
+        val lower = url.lowercase()
+        // Check path segments
+        val spanishPath = listOf("/es/", "/esp/", "/spanish/", "/espanol/", "/espa\u00f1ol/", "/latino/", "/latam/")
+        val englishPath = listOf("/en/", "/eng/", "/english/")
+
+        for (seg in spanishPath) { if (seg in lower) return "Spanish" }
+        for (seg in englishPath) { if (seg in lower) return "English" }
+
+        // Check query parameters
+        val langMatch = Regex("""[?&](?:lang|language|l)\s*=\s*([^&\s]+)""").find(url)
+        if (langMatch != null) {
+            val langVal = langMatch.groupValues[1].lowercase()
+            if (langVal.startsWith("es") || langVal.contains("spanish")) return "Spanish"
+            if (langVal.startsWith("en") || langVal.contains("english")) return "English"
+        }
+
+        return null
     }
 
     /**
