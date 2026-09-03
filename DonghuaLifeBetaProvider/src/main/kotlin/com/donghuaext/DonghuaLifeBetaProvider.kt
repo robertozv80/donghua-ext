@@ -1366,6 +1366,11 @@ class DonghuaLifeBetaProvider : MainAPI() {
                     serverUrlFixed.contains("filemoon") || serverUrlFixed.contains("moonplayer") -> {
                         loadExtractor(serverUrlFixed, referer, subtitleCallback, trackingCallback)
                     }
+                    // Vidhide (vidhide.pro, vidhide.com, etc.)
+                    serverUrlFixed.contains("vidhide") || serverUrlFixed.contains("videovard") || 
+                    serverUrlFixed.contains("javodvideo") || serverUrlFixed.contains("maxstream") -> {
+                        loadExtractor(serverUrlFixed, referer, subtitleCallback, trackingCallback)
+                    }
                     // Otros: loadExtractor genérico
                     else -> {
                         loadExtractor(serverUrlFixed, referer, subtitleCallback, trackingCallback)
@@ -3006,6 +3011,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 u.contains("ok.ru") || u.contains("vk.com") || u.contains("vk.ru") ||
                 u.contains("streamable.com") || u.contains("voe.sx") ||
                 u.contains("filemoon") || u.contains("moonplayer") ||
+                u.contains("vidhide") || u.contains("videovard") ||
                 u.contains("r2.cloudflarestorage") || u.contains("hcdn.dev") ||
                 u.contains("cloudflarestorage") ||
                 u.endsWith(".mp4") || u.contains(".mp4") ||
@@ -3032,6 +3038,19 @@ class DonghuaLifeBetaProvider : MainAPI() {
                             else {
                                 try { loadExtractor(cleanUrl, referer, subtitleCallback = {}, callback); anyEmitted = true } catch (_: Exception) {}
                             }
+                        }
+                        cleanUrl.contains("ok.ru") -> {
+                            val normalizedOkUrl = if (cleanUrl.contains("ok.ru/videoembed/")) {
+                                cleanUrl.replace("ok.ru/videoembed/", "www.ok.ru/video/")
+                            } else if (!cleanUrl.contains("www.ok.ru")) {
+                                cleanUrl.replace("ok.ru", "www.ok.ru")
+                            } else {
+                                cleanUrl
+                            }
+                            try { loadExtractor(normalizedOkUrl, referer, subtitleCallback, callback); anyEmitted = true } catch (_: Exception) {}
+                        }
+                        cleanUrl.contains("vidhide") || cleanUrl.contains("videovard") -> {
+                            try { loadExtractor(cleanUrl, referer, subtitleCallback, callback); anyEmitted = true } catch (_: Exception) {}
                         }
                         cleanUrl.endsWith(".m3u8") || cleanUrl.contains(".m3u8") -> {
                             try {
