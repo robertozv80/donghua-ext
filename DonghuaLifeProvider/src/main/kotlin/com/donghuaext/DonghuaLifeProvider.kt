@@ -369,6 +369,10 @@ class DonghuaLifeProvider : MainAPI() {
                             val okUrl = videoUrl.replace("https://ok.ru", "http://ok.ru")
                             try { loadExtractor(okUrl, data, subtitleCallback, callback) } catch (_: Exception) {}
                         }
+                        // Vidhide (vidhide.pro, vidhide.com, etc.)
+                        videoUrl.contains("vidhide") || videoUrl.contains("videovard") -> {
+                            try { loadExtractor(videoUrl, data, subtitleCallback, callback) } catch (_: Exception) {}
+                        }
                         // Otros servidores: intentar con loadExtractor
                         else -> {
                             try { loadExtractor(videoUrl, data, subtitleCallback, callback) } catch (_: Exception) {}
@@ -402,10 +406,24 @@ class DonghuaLifeProvider : MainAPI() {
                         fullSrc.contains("ok.ru") -> {
                             try { loadExtractor(fullSrc.replace("https://ok.ru", "http://ok.ru"), data, subtitleCallback, callback) } catch (_: Exception) {}
                         }
+                        fullSrc.contains("vidhide") || fullSrc.contains("videovard") -> {
+                            try { loadExtractor(fullSrc, data, subtitleCallback, callback) } catch (_: Exception) {}
+                        }
                         else -> {
                             try { loadExtractor(fullSrc, data, subtitleCallback, callback) } catch (_: Exception) {}
                         }
                     }
+                } catch (_: Exception) {}
+            }
+        }
+
+        // Método adicional: buscar cualquier enlace que contenga OK.ru aunque no esté en data-video o iframe
+        // Algunos sitios usan selectores diferentes como data-ok, href, o atributos personalizados
+        doc.select("[href*='ok.ru'], [data-src*='ok.ru'], [data-url*='ok.ru']").forEach { element ->
+            val okUrl = element.attr("href").ifEmpty { element.attr("data-src") }.ifEmpty { element.attr("data-url") }
+            if (okUrl.isNotEmpty() && okUrl.contains("ok.ru")) {
+                try {
+                    loadExtractor(okUrl.replace("https://ok.ru", "http://ok.ru"), data, subtitleCallback, callback)
                 } catch (_: Exception) {}
             }
         }
