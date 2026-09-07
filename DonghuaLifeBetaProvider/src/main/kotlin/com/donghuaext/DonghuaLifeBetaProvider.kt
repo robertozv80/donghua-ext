@@ -332,55 +332,34 @@ class DonghuaLifeBetaProvider : MainAPI() {
      * las primeras páginas de /series y /peliculas y filtramos client-side.
      */
     override suspend fun search(query: String): List<SearchResponse> {
-        val results = ArrayList<SearchResponse>()
-        val queryLower = query.lowercase().trim()
-        if (queryLower.isBlank()) return results
+    val results = ArrayList<SearchResponse>()
+    val queryLower = query.lowercase().trim()
+    if (queryLower.isBlank()) return results
 
-        // Pool compartido para evitar duplicados por slug
-        val seenSlugs = mutableSetOf<String>()
+    val url = "$mainUrl/?s=${java.net.URLEncoder.encode(query, "UTF-8")}"
+    val doc = app.get(url, timeout = 30).document
 
-        // Helper: extraer y filtrar cards desde un org.jsoup.nodes.Document
-        fun extractCardsFromJsoup(doc: org.jsoup.nodes.Document, pageType: String) {
-            val selector = if (pageType == "series") {
-                "a.poster-card[href^='/series/']"
-            } else {
-                "a.poster-card[href^='/peliculas/']"
+    doc.select("a.poster-card[href^='/series/'], a.poster-card[href^='/peliculas/']").forEach { a ->
+        val href = a.attr("href")
+        val title = a.selectFirst("img")?.attr("alt")?.trim()
+            ?: a.selectFirst("p.font-black")?.text()?.trim()
+            ?: return@forEach
+        val poster = a.selectFirst("img")?.attr("src")?.let { resolveUrl(extractNextImagePath(it)) }
+        val tvType = if (href.contains("/peliculas/")) TvType.AnimeMovie else TvType.Anime
+        val epsText = a.select("p.tracking-widest").lastOrNull()?.text()?.trim() ?: ""
+        val lastEpMatch = Regex("""Ep\s*(\d+)""", RegexOption.IGNORE_CASE).find(epsText)
+        val lastEp = lastEpMatch?.groupValues?.get(1)?.toIntOrNull()
+
+        results.add(
+            newAnimeSearchResponse(title, resolveUrl(href), tvType) {
+                this.posterUrl = poster
+                if (lastEp != null) addDubStatus(DubStatus.Subbed, lastEp)
+                else addDubStatus(DubStatus.Subbed)
             }
-            doc.select(selector).forEach { a ->
-                val href = a.attr("href")
-                if (href.isBlank()) return@forEach
-                val slug = href.substringAfterLast("/")
-                if (slug in seenSlugs) return@forEach
-
-                val title = a.selectFirst("img")?.attr("alt")?.trim()
-                    ?: a.selectFirst("p.font-black")?.text()?.trim()
-                    ?: return@forEach
-
-                // Filtro client-side: el título debe contener el query
-                if (!title.lowercase().contains(queryLower) &&
-                    !slug.lowercase().contains(queryLower)) {
-                    return@forEach
-                }
-
-                seenSlugs.add(slug)
-                val poster = a.selectFirst("img")?.attr("src")?.let { resolveUrl(extractNextImagePath(it)) }
-                val tvType = if (pageType == "peliculas") TvType.AnimeMovie else TvType.Anime
-
-                // Datos extra para mostrar
-                val epsText = a.select("p.tracking-widest").lastOrNull()?.text()?.trim() ?: ""
-                val lastEpMatch = Regex("""Ep\s*(\d+)""", RegexOption.IGNORE_CASE).find(epsText)
-                val lastEp = lastEpMatch?.groupValues?.get(1)?.toIntOrNull()
-
-                results.add(
-                    newAnimeSearchResponse(title, resolveUrl(href), tvType) {
-                        this.posterUrl = poster
-                        if (lastEp != null) addDubStatus(DubStatus.Subbed, lastEp)
-                        else addDubStatus(DubStatus.Subbed)
-                    }
-                )
-            }
-        }
-
+        )
+    }
+    return results
+}
         // Scrapear /series (páginas 1-5 = 125 series)
         try {
             for (p in 1..5) {
@@ -1260,7 +1239,6 @@ private suspend fun extractOkRu(
 ): Boolean {
     try {
         val html = app.get(videoUrl, referer = referer, headers = mapOf("User-Agent" to browserUA), timeout = 15L).text
-        // data-options
         val dataMatch = Regex("""data-options="([^"]+)"""").find(html)
         if (dataMatch != null) {
             val optionsJson = dataMatch.destructured.component1().replace("&quot;", "\"").replace("&amp;", "&")
@@ -1268,23 +1246,24 @@ private suspend fun extractOkRu(
                 callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
                     this.referer = videoUrl
                     this.quality = Qualities.Unknown.value
+                    this.headers = mapOf("User-Agent" to browserUA)  // 👈 NUEVO
                 })
                 return true
             }
         }
-        // og:video
         Regex("""<meta\s+property=["']og:video(?::url)?["']\s+content=["']([^"']+)["']""").find(html)?.let { m ->
             callback(newExtractorLink(source = serverName, name = serverName, url = m.destructured.component1()) {
                 this.referer = videoUrl
                 this.quality = Qualities.Unknown.value
+                this.headers = mapOf("User-Agent" to browserUA)  // 👈 NUEVO
             })
             return true
         }
-        // cualquier mp4/m3u8
         for (match in Regex("""(https?://[^"'\s<>]+\.(?:mp4|m3u8)[^"'\s<>]*)""").findAll(html)) {
             callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
                 this.referer = videoUrl
                 this.quality = Qualities.Unknown.value
+                this.headers = mapOf("User-Agent" to browserUA)  // 👈 NUEVO
             })
             return true
         }
