@@ -263,34 +263,73 @@ class DonghuaLifeBetaProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val results = ArrayList<SearchResponse>()
-        val queryLower = query.lowercase().trim()
-        if (queryLower.isBlank()) return results
+    val results = ArrayList<SearchResponse>()
+    val queryLower = query.lowercase().trim()
+    if (queryLower.isBlank()) return results
 
-        val url = "$mainUrl/?s=${java.net.URLEncoder.encode(query, "UTF-8")}"
-        val doc = app.get(url, timeout = 30).document
+    // Pool para evitar duplicados
+    val seenSlugs = mutableSetOf<String>()
 
-        doc.select("a.poster-card[href^='/series/'], a.poster-card[href^='/peliculas/']").forEach { a ->
-            val href = a.attr("href")
-            val title = a.selectFirst("img")?.attr("alt")?.trim()
-                ?: a.selectFirst("p.font-black")?.text()?.trim()
-                ?: return@forEach
-            val poster = a.selectFirst("img")?.attr("src")?.let { resolveUrl(extractNextImagePath(it)) }
-            val tvType = if (href.contains("/peliculas/")) TvType.AnimeMovie else TvType.Anime
-            val epsText = a.select("p.tracking-widest").lastOrNull()?.text()?.trim() ?: ""
-            val lastEpMatch = Regex("""Ep\s*(\d+)""", RegexOption.IGNORE_CASE).find(epsText)
-            val lastEp = lastEpMatch?.groupValues?.get(1)?.toIntOrNull()
+    // Helper: extraer y filtrar cards desde un documento
+    suspend fun extractCardsFromPage(pageUrl: String, pageType: String) {
+        try {
+            val doc = app.get(pageUrl, timeout = 30).document
+            val selector = if (pageType == "series") {
+                "a.poster-card[href^='/series/']"
+            } else {
+                "a.poster-card[href^='/peliculas/']"
+            }
+            doc.select(selector).forEach { a ->
+                val href = a.attr("href")
+                if (href.isBlank()) return@forEach
+                val slug = href.substringAfterLast("/")
+                if (slug in seenSlugs) return@forEach
 
-            results.add(
-                newAnimeSearchResponse(title, resolveUrl(href), tvType) {
-                    this.posterUrl = poster
-                    if (lastEp != null) addDubStatus(DubStatus.Subbed, lastEp)
-                    else addDubStatus(DubStatus.Subbed)
+                val title = a.selectFirst("img")?.attr("alt")?.trim()
+                    ?: a.selectFirst("p.font-black")?.text()?.trim()
+                    ?: return@forEach
+
+                // FILTRO CLIENT-SIDE: solo agregar si el título o slug contiene el query
+                if (!title.lowercase().contains(queryLower) &&
+                    !slug.lowercase().contains(queryLower)) {
+                    return@forEach
                 }
-            )
-        }
-        return results
+
+                seenSlugs.add(slug)
+                val poster = a.selectFirst("img")?.attr("src")?.let { resolveUrl(extractNextImagePath(it)) }
+                val tvType = if (pageType == "peliculas") TvType.AnimeMovie else TvType.Anime
+
+                val epsText = a.select("p.tracking-widest").lastOrNull()?.text()?.trim() ?: ""
+                val lastEpMatch = Regex("""Ep\s*(\d+)""", RegexOption.IGNORE_CASE).find(epsText)
+                val lastEp = lastEpMatch?.groupValues?.get(1)?.toIntOrNull()
+
+                results.add(
+                    newAnimeSearchResponse(title, resolveUrl(href), tvType) {
+                        this.posterUrl = poster
+                        if (lastEp != null) addDubStatus(DubStatus.Subbed, lastEp)
+                        else addDubStatus(DubStatus.Subbed)
+                    }
+                )
+            }
+        } catch (_: Exception) {}
     }
+
+    // Escanear /series (páginas 1-5 = 125 series)
+    for (p in 1..5) {
+        val url = if (p == 1) "$mainUrl/series?sort=latest" else "$mainUrl/series?page=$p&sort=latest"
+        extractCardsFromPage(url, "series")
+        if (results.size >= 30) break
+    }
+
+    // Escanear /peliculas (páginas 1-3 = 75 películas)
+    for (p in 1..3) {
+        val url = if (p == 1) "$mainUrl/peliculas?sort=newest" else "$mainUrl/peliculas?page=$p&sort=newest"
+        extractCardsFromPage(url, "peliculas")
+        if (results.size >= 50) break
+    }
+
+    return results
+}
 
     override suspend fun load(url: String): LoadResponse {
         val isMovie = url.contains("/peliculas/")
