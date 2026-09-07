@@ -362,14 +362,13 @@ class DonghuaLifeProvider : MainAPI() {
 
     // ========== EXTRACTOR MANUAL PARA OK.RU ==========
     private suspend fun extractOkRu(
-        videoUrl: String,
-        referer: String,
-        serverName: String,
-        callback: (ExtractorLink) -> Unit
+    videoUrl: String,
+    referer: String,
+    serverName: String,
+    callback: (ExtractorLink) -> Unit
     ): Boolean {
         try {
             val html = app.get(videoUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
-            // Método 1: data-options
             val dataMatch = Regex("""data-options="([^"]+)"""").find(html)
             if (dataMatch != null) {
                 val optionsJson = dataMatch.destructured.component1().replace("&quot;", "\"").replace("&amp;", "&")
@@ -377,30 +376,30 @@ class DonghuaLifeProvider : MainAPI() {
                     callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
                         this.referer = videoUrl
                         this.quality = Qualities.Unknown.value
+                        this.headers = mapOf("User-Agent" to USER_AGENT)  // 👈 NUEVO
                     })
                     return true
                 }
             }
-            // Método 2: og:video
             Regex("""<meta\s+property=["']og:video(?::url)?["']\s+content=["']([^"']+)["']""").find(html)?.let { m ->
                 callback(newExtractorLink(source = serverName, name = serverName, url = m.destructured.component1()) {
                     this.referer = videoUrl
                     this.quality = Qualities.Unknown.value
+                    this.headers = mapOf("User-Agent" to USER_AGENT)  // 👈 NUEVO
                 })
                 return true
             }
-            // Método 3: cualquier mp4/m3u8 en el HTML
             for (match in Regex("""(https?://[^"'\s<>]+\.(?:mp4|m3u8)[^"'\s<>]*)""").findAll(html)) {
                 callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
                     this.referer = videoUrl
                     this.quality = Qualities.Unknown.value
+                    this.headers = mapOf("User-Agent" to USER_AGENT)  // 👈 NUEVO
                 })
                 return true
             }
         } catch (_: Exception) {}
         return false
     }
-
     // ========== EXTRACTOR DAILYMOTION API ==========
     private suspend fun extractDailymotionApi(
         videoId: String,
