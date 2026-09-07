@@ -359,7 +359,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
         )
     }
     return results
-}
+    }
         // Scrapear /series (páginas 1-5 = 125 series)
         try {
             for (p in 1..5) {
@@ -1246,7 +1246,7 @@ private suspend fun extractOkRu(
                 callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
                     this.referer = videoUrl
                     this.quality = Qualities.Unknown.value
-                    this.headers = mapOf("User-Agent" to browserUA)  // 👈 NUEVO
+                    this.headers = mapOf("User-Agent" to browserUA)
                 })
                 return true
             }
@@ -1255,7 +1255,7 @@ private suspend fun extractOkRu(
             callback(newExtractorLink(source = serverName, name = serverName, url = m.destructured.component1()) {
                 this.referer = videoUrl
                 this.quality = Qualities.Unknown.value
-                this.headers = mapOf("User-Agent" to browserUA)  // 👈 NUEVO
+                this.headers = mapOf("User-Agent" to browserUA)
             })
             return true
         }
@@ -1263,7 +1263,7 @@ private suspend fun extractOkRu(
             callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
                 this.referer = videoUrl
                 this.quality = Qualities.Unknown.value
-                this.headers = mapOf("User-Agent" to browserUA)  // 👈 NUEVO
+                this.headers = mapOf("User-Agent" to browserUA)
             })
             return true
         }
