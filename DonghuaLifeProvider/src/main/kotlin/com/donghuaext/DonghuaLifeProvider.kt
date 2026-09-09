@@ -385,11 +385,11 @@ class DonghuaLifeProvider : MainAPI() {
             val dataMatch = Regex("""data-options="([^"]+)"""").find(html)
             if (dataMatch != null) {
                 val optionsJson = dataMatch.destructured.component1().replace("&quot;", "\"").replace("&amp;", "&")
-                // v2 FIX: des-escapar \\u0026 y \\/ — las URLs de okcdn vienen escapadas y
-                // tal cual devolvían 400. Con des-escape, la m3u8 responde 200 sin cookies.
+                // v3 FIX CRÍTICO: el payload contiene UNA barra invertida antes de u0026,
+                // pero "\\\\u0026" (doble barra) nunca matcheaba => URLs rotas (HTTP 400).
                 val unescaped = optionsJson
-                    .replace("\\\\u0026", "&")
-                    .replace("\\\\/", "/")
+                    .replace(Regex("\\\\+u0026"), "&")
+                    .replace(Regex("\\\\+/"), "/")
                 var emittedAny = false
                 // HLS: emitir cada variante como pista m3u8 (quality individual)
                 for (match in Regex("""(https?://[^"]+\.m3u8[^"]*)""").findAll(unescaped)) {
@@ -497,89 +497,80 @@ class DonghuaLifeProvider : MainAPI() {
             callback(link)
         }
 
-        // v2 MÉTODO 1: embedJS/u3|u4/*.json — funciona donde /api/Media y /embedJS/ clásicos
-        // devuelven 403 de Cloudflare. Probado: responde 200 con hls.auto y ua.tar.
+        // v3: embedJS/u3|u4 AHORA DEVUELVE DATA DECOY (otro vkey, verificado 2026-09).
+        // Se elimina y se usa directamente el método del embed page.
         val vkey = Regex("""/embed/([A-Za-z0-9_]+)""").find(embedUrl)?.groupValues?.get(1)
             ?: Regex("""vkey=([A-Za-z0-9_]+)""").find(embedUrl)?.groupValues?.get(1)
-        if (vkey != null) {
-            val pubParam = Regex("""\?pub=([A-Za-z0-9]+)""").find(embedUrl)?.groupValues?.get(1) ?: ""
-            for (variant in listOf("u3", "u4")) {
-                try {
-                    val apiUrl = "https://rumble.com/embedJS/$variant/$vkey.json" +
-                        (if (pubParam.isNotBlank()) "?pub=$pubParam" else "")
-                    val resp = app.get(apiUrl, headers = mapOf(
-                        "User-Agent" to USER_AGENT,
-                        "Accept" to "application/json, text/plain, */*",
-                        "Referer" to "https://rumble.com/",
-                    ), timeout = 20L)
-                    val jsonText = resp.text
-                    if (resp.code != 200 || !jsonText.trimStart().startsWith("{")) continue
-
-                    val autoMatch = Regex(""""auto"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+)"""").find(jsonText)
-                    if (autoMatch != null) {
-                        val u = autoMatch.groupValues[1]
-                            .replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&")
-                        try {
-                            generateM3u8(serverName, u, "https://rumble.com").forEach(trackingCb)
-                        } catch (_: Exception) {}
-                    }
-
-                    if (!emitted) {
-                        val tarBlockMatch = Regex(""""ua"\s*:\s*\{[^{}]*"tar"\s*:\s*(\{[^}]+\})""").find(jsonText)
-                        if (tarBlockMatch != null) {
-                            val tarBlock = tarBlockMatch.groupValues[1]
-                            Regex(""""(\d{3,4})"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+)"""").findAll(tarBlock).forEach { match ->
-                                val qLabel = match.groupValues[1]
-                                val u = match.groupValues[2]
-                                    .replace("\\/", "/").replace("\\u0026", "&")
-                                if (u.isBlank()) return@forEach
-                                val quality = when (qLabel) {
-                                    "2160", "1440" -> Qualities.P2160.value
-                                    "1080" -> Qualities.P1080.value
-                                    "720" -> Qualities.P720.value
-                                    "480" -> Qualities.P480.value
-                                    "360" -> Qualities.P360.value
-                                    else -> Qualities.Unknown.value
-                                }
-                                try {
-                                    trackingCb(
-                                        newExtractorLink(
-                                            source = serverName,
-                                            name = "$serverName ${qLabel}p",
-                                            url = u,
-                                            type = if (u.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                                        ) {
-                                            this.referer = "https://rumble.com"
-                                            this.quality = quality
-                                        }
-                                    )
-                                } catch (_: Throwable) {}
-                            }
-                        }
-                    }
-
-                    if (!emitted) {
-                        for (m in Regex("""(https?://[^"\s\\]+\.(?:m3u8|mp4)[^"\s\\]*)""").findAll(jsonText)) {
-                            val u = m.groupValues[1].replace("\\/", "/").replace("\\u0026", "&")
-                            if (u.contains("rumble.com/embed") || u.contains("rumble.com/v")) continue
-                            try {
-                                trackingCb(
-                                    newExtractorLink(
-                                        source = serverName, name = serverName, url = u,
-                                        type = if (u.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                                    ) { this.referer = "https://rumble.com" }
-                                )
-                            } catch (_: Throwable) {}
-                        }
-                    }
-
-                    if (emitted) return true
-                } catch (_: Exception) {}
-            }
+        if (vkey != null && !emitted) {
+            emitted = tryExtractRumbleFromEmbedHtml(embedUrl, vkey, serverName, trackingCb)
+            if (emitted) return true
         }
 
         // Fallback: método HTML del embed page
         extractRumbleLegacy(embedUrl, referer, serverName, trackingCb)
+        return emitted
+    }
+
+    /** v3: Extrae el bloque real m.f["<vkey>"]={...} del HTML de la página embed de Rumble.
+     *  embedJS/u3|u4 ahora sirve data decoy; la página embed sigue devolviendo 200 con el data real. */
+    private suspend fun tryExtractRumbleFromEmbedHtml(
+        embedUrl: String,
+        vkey: String,
+        serverName: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        var emitted = false
+        try {
+            val resp = app.get(embedUrl, headers = mapOf("User-Agent" to USER_AGENT), timeout = 20L)
+            val html = resp.text
+            if (resp.code != 200) return false
+            if (!html.contains("m.f[\"$vkey\"]")) return false
+
+            val start = html.indexOf("m.f[\"$vkey\"]")
+            val nextMf = html.indexOf("m.f[\"", start + 10)
+            val nextScript = html.indexOf("</script>", start)
+            val end = listOf(nextMf, nextScript).filter { it > start }.minOrNull() ?: html.length
+            val data = html.substring(start, minOf(end, html.length))
+                .replace("\\\\/", "/")
+                .replace(Regex("\\\\+u0026"), "&")
+
+            val hlsMaster = Regex(""""hls"\s*:\s*\{\s*"url"\s*:\s*"(https://rumble\.com/(?:hls-vod|live-hls-dvr)/[^"]+\.m3u8)"""").find(data)
+                ?: Regex("""(https://rumble\.com/(?:hls-vod|live-hls-dvr)/[^"]+\.m3u8)""").find(data)
+            if (hlsMaster != null) {
+                try {
+                    generateM3u8(serverName, hlsMaster.groupValues[1], "https://rumble.com").forEach(callback)
+                    emitted = true
+                } catch (_: Exception) {}
+            }
+
+            val tarUrls = LinkedHashMap<String, String>()
+            for (m in Regex(""""(\d{3,4})"\s*:\s*\{\s*"url"\s*:\s*"(https://hugh\.cdn\.rumble\.cloud/[^"]+?\.tar[^"]*?)"""").findAll(data)) {
+                val q = m.groupValues[1]
+                if (!tarUrls.containsKey(q)) tarUrls[q] = m.groupValues[2]
+            }
+            for ((q, u) in tarUrls) {
+                val quality = when (q) {
+                    "2160" -> Qualities.P2160.value; "1440" -> Qualities.P1440.value
+                    "1080" -> Qualities.P1080.value; "720" -> Qualities.P720.value
+                    "480" -> Qualities.P480.value; "360" -> Qualities.P360.value
+                    else -> Qualities.Unknown.value
+                }
+                try {
+                    callback(
+                        newExtractorLink(
+                            source = serverName,
+                            name = "$serverName ${q}p",
+                            url = u,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = "https://rumble.com"
+                            this.quality = quality
+                        }
+                    )
+                    emitted = true
+                } catch (_: Throwable) {}
+            }
+        } catch (_: Exception) {}
         return emitted
     }
 
@@ -802,7 +793,7 @@ class DonghuaLifeProvider : MainAPI() {
             var found = false
             for (m in Regex("""(https?://[^"'\s\\]+\.m3u8[^"'\s\\]*)""").findAll(unpacked)) {
                 val u = m.groupValues[1]
-                    .replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&")
+                    .replace("\\/", "/").replace(Regex("\\\\+u0026"), "&").replace("&amp;", "&")
                 if (u.contains(".mp4")) continue
                 try {
                     generateM3u8(serverName, u, embedUrl).forEach(trackingCb)

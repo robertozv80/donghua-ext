@@ -308,18 +308,28 @@ class DonghuaLifeBetaProvider : MainAPI() {
         } catch (_: Exception) {}
     }
 
-    // Escanear /series (páginas 1-5 = 125 series)
-    for (p in 1..5) {
-        val url = if (p == 1) "$mainUrl/series?sort=latest" else "$mainUrl/series?page=$p&sort=latest"
-        extractCardsFromPage(url, "series")
-        if (results.size >= 30) break
-    }
+    // v18 FIX BÚSQUEDA: el sitio soporta búsqueda server-side con ?q= (verificado:
+    // /series?q=eternal+god devuelve exactamente "Eternal God Emperor"). Antes se
+    // escaneaban solo 5 páginas (125 series de ~1000+) y EGE quedaba fuera.
+    val encodedQuery = java.net.URLEncoder.encode(query.trim(), "UTF-8")
 
-    // Escanear /peliculas (páginas 1-3 = 75 películas)
-    for (p in 1..3) {
-        val url = if (p == 1) "$mainUrl/peliculas?sort=newest" else "$mainUrl/peliculas?page=$p&sort=newest"
-        extractCardsFromPage(url, "peliculas")
-        if (results.size >= 50) break
+    // Búsqueda server-side en series y películas
+    extractCardsFromPage("$mainUrl/series?q=$encodedQuery", "series")
+    extractCardsFromPage("$mainUrl/peliculas?q=$encodedQuery", "peliculas")
+
+    // Si la búsqueda server-side no dio nada (p. ej. el server ignoró q=),
+    // hacer fallback a un escaneo amplio de las primeras páginas con filtro client-side
+    if (results.isEmpty()) {
+        for (p in 1..8) {
+            val url = if (p == 1) "$mainUrl/series?sort=latest" else "$mainUrl/series?page=$p&sort=latest"
+            extractCardsFromPage(url, "series")
+            if (results.size >= 30) break
+        }
+        for (p in 1..3) {
+            val url = if (p == 1) "$mainUrl/peliculas?sort=newest" else "$mainUrl/peliculas?page=$p&sort=newest"
+            extractCardsFromPage(url, "peliculas")
+            if (results.size >= 50) break
+        }
     }
 
     return results
@@ -1842,6 +1852,102 @@ class DonghuaLifeBetaProvider : MainAPI() {
 
     // ========== EXTRACTORS ==========
 
+    /** v18: Extrae el bloque real m.f["<vkey>"]={...} del HTML de la página embed de Rumble.
+     *  La página embed (https://rumble.com/embed/<vkey>/) devuelve 200 con el data JSON embebido
+     *  (verificado 2026-09), a diferencia de embedJS/u3|u4 que ahora sirven data decoy.
+     *  Emite: master m3u8 (hls-vod o live-hls-dvr) via generateM3u8 + pistas tar por calidad. */
+    private suspend fun tryExtractRumbleFromEmbedHtml(
+        embedUrl: String,
+        vkey: String,
+        serverName: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        var emitted = false
+        try {
+            val resp = app.get(embedUrl, headers = mapOf("User-Agent" to browserUA), timeout = 20L)
+            val html = resp.text
+            Log.i(TAG, "extractRumble v18: embedPage vkey=$vkey httpCode=${resp.code} len=${html.length}")
+            if (resp.code != 200) return false
+
+            val block = Regex("""m\.f\[""" + vkey + """"\]=""", RegexOption.IGNORE_CASE).find(html)
+                ?: return false.also { Log.i(TAG, "extractRumble v18: no m.f[\"$vkey\"] block in embed page") }
+
+            // Delimitar el bloque JSON: desde el match hasta el final; cortar en el próximo m.f[ o </script>
+            val start = block.range.first
+            val nextMf = html.indexOf("m.f[\"", start + 10)
+            val nextScript = html.indexOf("</script>", start)
+            val end = listOf(nextMf, nextScript).filter { it > start }.minOrNull() ?: html.length
+            val data = html.substring(start, minOf(end, html.length))
+                .replace("\\\\/", "/")   // des-escapar \\/ (una barra invertida)
+                .replace(Regex("\\\\+u0026"), "&")
+
+            // 1) Master HLS (hls-vod o live-hls-dvr) — jugable directamente (verificado 200)
+            val hlsMaster = Regex(""""hls"\s*:\s*\{\s*"url"\s*:\s*"(https://rumble\.com/(?:hls-vod|live-hls-dvr)/[^"]+\.m3u8)"""").find(data)
+                ?: Regex("""(https://rumble\.com/(?:hls-vod|live-hls-dvr)/[^"]+\.m3u8)""").find(data)
+            if (hlsMaster != null) {
+                val u = hlsMaster.groupValues[1]
+                try {
+                    generateM3u8(serverName, u, "https://rumble.com").forEach(callback)
+                    emitted = true
+                    Log.i(TAG, "extractRumble v18: master HLS emitted: ${u.take(80)}")
+                } catch (e: Exception) {
+                    Log.w(TAG, "extractRumble v18: master HLS generateM3u8 failed: ${e.message}")
+                }
+            }
+
+            // 2) Pistas tar por calidad (ua.tar.360/480/720/1080) — chunklist virtual jugable
+            val tarUrls = LinkedHashMap<String, String>()
+            for (m in Regex(""""(\d{3,4})"\s*:\s*\{\s*"url"\s*:\s*"(https://hugh\.cdn\.rumble\.cloud/[^"]+?\.tar[^"]*?)"""").findAll(data)) {
+                val q = m.groupValues[1]
+                val u = m.groupValues[2]
+                if (!tarUrls.containsKey(q)) tarUrls[q] = u
+            }
+            for ((q, u) in tarUrls) {
+                val quality = when (q) {
+                    "2160" -> Qualities.P2160.value; "1440" -> Qualities.P1440.value
+                    "1080" -> Qualities.P1080.value; "720" -> Qualities.P720.value
+                    "480" -> Qualities.P480.value; "360" -> Qualities.P360.value
+                    else -> Qualities.Unknown.value
+                }
+                try {
+                    callback(
+                        newExtractorLink(
+                            source = serverName,
+                            name = "$serverName ${q}p",
+                            url = u,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = "https://rumble.com"
+                            this.quality = quality
+                        }
+                    )
+                    emitted = true
+                } catch (_: Throwable) {}
+            }
+            if (tarUrls.isNotEmpty()) Log.i(TAG, "extractRumble v18: ${tarUrls.size} tar quality tracks emitted (${tarUrls.keys.joinToString(",")})")
+
+            // 3) Fallback: cualquier mp4/tar directo
+            if (!emitted) {
+                for (m in Regex("""(https?://[^"]+?\.(?:mp4|tar)[^"]*)""").findAll(data)) {
+                    val u = m.groupValues[1]
+                    if (u.contains("r_range=")) continue // tar sin r_file no jugable como m3u8
+                    try {
+                        callback(
+                            newExtractorLink(
+                                source = serverName, name = serverName, url = u,
+                                type = if (u.contains(".mp4")) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
+                            ) { this.referer = "https://rumble.com" }
+                        )
+                        emitted = true
+                    } catch (_: Throwable) {}
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "tryExtractRumbleFromEmbedHtml failed: ${e.message}")
+        }
+        return emitted
+    }
+
     private suspend fun extractRumble(
         embedUrl: String,
         referer: String,
@@ -1865,89 +1971,16 @@ class DonghuaLifeBetaProvider : MainAPI() {
             "Origin" to "https://rumble.com",
         )
 
-        // v16 MÉTODO 0: embedJS/u3|u4/*.json — funciona donde /api/Media y /embedJS/
-        // devuelven 403 de Cloudflare. Probado: responde 200 con hls.auto y ua.tar.
+        // v18 MÉTODO 0 (VERIFICADO): el HTML de la página embed contiene el bloque real de datos
+        // m.f["<vkey>"]={...} con el master hls (hls-vod/... o live-hls-dvr/...) y las pistas ua.tar
+        // por calidad (360/480/720/1080). Las tar son "chunklist virtual": la master playlist completa
+        // (sin r_range) sirve los segmentos TS reales (verificado: bytes 0x47 MPEG-TS).
+        // embedJS/u3|u4 AHORA DEVUELVE DATA DECOY (otro vkey) — se eliminó.
         if (vkey != null && !emitted) {
-            val pubParam = Regex("""\?pub=([A-Za-z0-9]+)""").find(embedUrl)?.groupValues?.get(1) ?: ""
-            for (variant in listOf("u3", "u4")) {
-                try {
-                    val apiUrl = "https://rumble.com/embedJS/$variant/$vkey.json" +
-                        (if (pubParam.isNotBlank()) "?pub=$pubParam" else "")
-                    val resp = app.get(apiUrl, headers = rumbleHeaders, timeout = 20L)
-                    val jsonText = resp.text
-                    Log.i(TAG, "extractRumble v16: embedJS/$variant vkey=$vkey httpCode=${resp.code} len=${jsonText.length}")
-                    if (resp.code != 200 || !jsonText.trimStart().startsWith("{")) continue
-
-                    val autoMatch = Regex(""""auto"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+)"""").find(jsonText)
-                    if (autoMatch != null) {
-                        val u = autoMatch.groupValues[1]
-                            .replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&")
-                        try {
-                            generateM3u8(serverName, u, "https://rumble.com").forEach(trackingCb)
-                            Log.i(TAG, "extractRumble v16: $variant hls.auto emitted: ${u.take(80)}")
-                        } catch (e: Exception) {
-                            Log.w(TAG, "extractRumble v16: $variant hls.auto generateM3u8 failed: ${e.message}")
-                        }
-                    }
-
-                    if (!emitted) {
-                        val tarBlockMatch = Regex(""""ua"\s*:\s*\{[^{}]*"tar"\s*:\s*(\{[^}]+\})""").find(jsonText)
-                        if (tarBlockMatch != null) {
-                            val tarBlock = tarBlockMatch.groupValues[1]
-                            Regex(""""(\d{3,4})"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+)"""").findAll(tarBlock).forEach { match ->
-                                val qLabel = match.groupValues[1]
-                                val u = match.groupValues[2]
-                                    .replace("\\/", "/").replace("\\u0026", "&")
-                                if (u.isBlank()) return@forEach
-                                val quality = when (qLabel) {
-                                    "2160", "1440" -> Qualities.P2160.value
-                                    "1080" -> Qualities.P1080.value
-                                    "720" -> Qualities.P720.value
-                                    "480" -> Qualities.P480.value
-                                    "360" -> Qualities.P360.value
-                                    else -> Qualities.Unknown.value
-                                }
-                                try {
-                                    trackingCb(
-                                        newExtractorLink(
-                                            source = serverName,
-                                            name = "$serverName ${qLabel}p",
-                                            url = u,
-                                            type = if (u.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                                        ) {
-                                            this.referer = "https://rumble.com"
-                                            this.quality = quality
-                                        }
-                                    )
-                                } catch (_: Throwable) {}
-                            }
-                        }
-                    }
-
-                    if (!emitted) {
-                        var fbCount = 0
-                        for (m in Regex("""(https?://[^"\s\\]+\.(?:m3u8|mp4)[^"\s\\]*)""").findAll(jsonText)) {
-                            val u = m.groupValues[1].replace("\\/", "/").replace("\\u0026", "&")
-                            if (u.contains("rumble.com/embed") || u.contains("rumble.com/v")) continue
-                            try {
-                                trackingCb(
-                                    newExtractorLink(
-                                        source = serverName, name = serverName, url = u,
-                                        type = if (u.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                                    ) { this.referer = "https://rumble.com" }
-                                )
-                                fbCount++
-                            } catch (_: Throwable) {}
-                        }
-                    }
-
-                    if (emitted) {
-                        Log.i(TAG, "extractRumble v16: $variant SUCCESS for $vkey")
-                        return true
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "extractRumble v16: $variant failed: ${e.message}")
-                }
+            emitted = tryExtractRumbleFromEmbedHtml(embedUrl, vkey, serverName, trackingCb)
+            if (emitted) {
+                Log.i(TAG, "extractRumble v18: SUCCESS via embed-page m.f[] for $vkey")
+                return true
             }
         }
 
@@ -3119,11 +3152,13 @@ class DonghuaLifeBetaProvider : MainAPI() {
             val dataMatch = Regex("""data-options="([^"]+)"""").find(html)
             if (dataMatch != null) {
                 val optionsJson = dataMatch.destructured.component1().replace("&quot;", "\"").replace("&amp;", "&")
-                // v16 FIX: des-escapar \\u0026 y \\/ — las URLs de okcdn vienen escapadas y
-                // tal cual devolvían 400. Con des-escape, la m3u8 responde 200 sin cookies.
+                // v18 FIX CRÍTICO: el payload contiene UNA barra invertida antes de u0026 (\u0026),
+                // pero el replace anterior usaba "\\\\u0026" (doble barra) y nunca matcheaba =>
+                // el player recibía URLs con \u0026 y devolvía 400. Se usa Regex para des-escapar
+                // tanto \\u0026 como \\/ y también las formas con doble barra invertida.
                 val unescaped = optionsJson
-                    .replace("\\\\u0026", "&")
-                    .replace("\\\\/", "/")
+                    .replace(Regex("\\\\+u0026"), "&")
+                    .replace(Regex("\\\\+/"), "/")
                 var emittedAny = false
                 // HLS: emitir cada variante como pista m3u8 (quality individual)
                 for (match in Regex("""(https?://[^"]+\.m3u8[^"]*)""").findAll(unescaped)) {
@@ -3153,24 +3188,88 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 }
                 if (emittedAny) return true
             }
-            Regex("""<meta\s+property=["']og:video(?::url)?["']\s+content=["']([^"']+)["']""").find(html)?.let { m ->
-                callback(newExtractorLink(source = serverName, name = serverName, url = m.destructured.component1()) {
-                    this.referer = videoUrl
-                    this.quality = Qualities.Unknown.value
-                    this.headers = mapOf("User-Agent" to browserUA)
-                })
-                return true
-            }
-            for (match in Regex("""(https?://[^"'\s<>]+\.(?:mp4|m3u8)[^"'\s<>]*)""").findAll(html)) {
-                callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
-                    this.referer = videoUrl
-                    this.quality = Qualities.Unknown.value
-                    this.headers = mapOf("User-Agent" to browserUA)
-                })
-                return true
+            // v18 FIX: fallback vía la API de metadatos de OK.ru (POST /dk?cmd=videoPlayerMetadata)
+            // que devuelve el array "videos" con MP4 progresivos por calidad (mobile..full).
+            if (!extractOkRuViaMetadata(videoUrl, serverName, callback)) {
+                Regex("""<meta\s+property=["']og:video(?::url)?["']\s+content=["']([^"']+)["']""").find(html)?.let { m ->
+                    callback(newExtractorLink(source = serverName, name = serverName, url = m.destructured.component1()) {
+                        this.referer = videoUrl
+                        this.quality = Qualities.Unknown.value
+                        this.headers = mapOf("User-Agent" to browserUA)
+                    })
+                    return true
+                }
+                for (match in Regex("""(https?://[^"'\s<>]+\.(?:mp4|m3u8)[^"'\s<>]*)""").findAll(html)) {
+                    callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
+                        this.referer = videoUrl
+                        this.quality = Qualities.Unknown.value
+                        this.headers = mapOf("User-Agent" to browserUA)
+                    })
+                    return true
+                }
             }
         } catch (_: Exception) {}
         return false
+    }
+
+    /** v18: Fallback OK.ru vía API de metadatos (POST /dk?cmd=videoPlayerMetadata&mid=<id>).
+     *  Devuelve "videos" con MP4 progresivos (mobile/lowest/low/sd/hd/full) — verificado 200. */
+    private suspend fun extractOkRuViaMetadata(
+        videoUrl: String,
+        serverName: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        return try {
+            val mid = Regex("""video(?:embed)?/(") + "(\d+)"""").find(videoUrl)?.groupValues?.get(1)
+                ?: return false
+            val resp = app.post(
+                "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$mid",
+                headers = mapOf(
+                    "User-Agent" to browserUA,
+                    "Referer" to videoUrl,
+                    "Accept" to "*/*",
+                    "Content-Type" to "application/x-www-form-urlencoded",
+                ),
+                timeout = 20L
+            )
+            if (!resp.isSuccessful) return false
+            val body = resp.text
+            if (!body.trimStart().startsWith("{")) return false
+            var emitted = false
+            // videos[]: name=mobile|lowest|low|sd|hd|full con url tipo https://vdNNN.okcdn.ru/?...
+            val qualityMap = listOf("full" to Qualities.P1080.value, "hd" to Qualities.P720.value,
+                "sd" to Qualities.P480.value, "low" to Qualities.P360.value,
+                "lowest" to Qualities.P240.value, "mobile" to Qualities.P240.value)
+            val videosBlock = Regex(""""videos"\s*:\s*(\[.*?\])""", RegexOption.DOT_MATCHES_ALL).find(body)?.groupValues?.get(1)
+            val urlRegex = Regex(""""name"\s*:\s*"([a-z]+)"\s*,\s*"url"\s*:\s*"([^"]+)"""")
+            val text = videosBlock ?: body
+            for (m in urlRegex.findAll(text)) {
+                val qName = m.groupValues[1]
+                val u = m.groupValues[2].replace("\\\\/", "/").replace(Regex("\\\\+u0026"), "&")
+                if (!u.startsWith("http")) continue
+                val quality = qualityMap.firstOrNull { it.first == qName }?.second ?: Qualities.Unknown.value
+                try {
+                    callback(
+                        newExtractorLink(
+                            source = serverName,
+                            name = "$serverName ${qName}",
+                            url = u,
+                            type = ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = videoUrl
+                            this.quality = quality
+                            this.headers = mapOf("User-Agent" to browserUA)
+                        }
+                    )
+                    emitted = true
+                } catch (_: Throwable) {}
+            }
+            if (emitted) Log.i(TAG, "extractOkRuViaMetadata: emitidos URLs desde API metadata para $mid")
+            emitted
+        } catch (e: Exception) {
+            Log.w(TAG, "extractOkRuViaMetadata failed: ${e.message}")
+            false
+        }
     }
 
     private suspend fun extractOkRuDirect(
@@ -3187,9 +3286,9 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 val decoded = dataOptionsMatch.groupValues[1]
                     .replace("&quot;", "\"")
                     .replace("&amp;", "&")
-                    // v16 FIX: des-escapar para URLs okcdn jugables
-                    .replace("\\\\u0026", "&")
-                    .replace("\\\\/", "/")
+                    // v18 FIX: mismo bug de doble barra invertida — usar Regex
+                    .replace(Regex("\\\\+u0026"), "&")
+                    .replace(Regex("\\\\+/"), "/")
                 val hlsPattern = Regex(""""url"\s*:\s*"(https?://[^"\s]+\.m3u8[^"\s]*)"""")
                 val mp4Pattern = Regex(""""url"\s*:\s*"(https?://[^"\s]+\.mp4[^"\s]*)"""")
 
@@ -3281,21 +3380,32 @@ class DonghuaLifeBetaProvider : MainAPI() {
             val base = packedMatch.groupValues[2].toIntOrNull() ?: 0
             val words = packedMatch.groupValues[4].split('|')
 
-            fun unpackWord(word: String): String? {
-                return try {
-                    val idx = Integer.parseInt(word, base)
-                    if (idx in words.indices) words[idx].ifEmpty { null } else null
-                } catch (_: Exception) { null }
+            // v18 FIX: base custom (36..62+) — Integer.parseInt solo llega a base 36 y
+            // el regex anterior usaba "\b" en string normal (= carácter backspace), nunca matcheaba.
+            val baseChars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            fun decodeWord(word: String): Int? {
+                if (base !in 2..baseChars.length) {
+                    return try { Integer.parseInt(word, base) } catch (_: Exception) { null }
+                }
+                var n = 0
+                for (c in word) {
+                    val d = baseChars.indexOf(c)
+                    if (d < 0 || d >= base) return null
+                    n = n * base + d
+                }
+                return n
             }
 
-            val unpacked = Regex("[0-9a-zA-Z]+\b").replace(p) { m ->
-                unpackWord(m.value) ?: m.value
+            val unpacked = Regex("[0-9a-zA-Z]+").replace(p) { m ->
+                val idx = decodeWord(m.value)
+                if (idx != null && idx in words.indices) words[idx].ifEmpty { m.value } else m.value
             }
+            Log.i(TAG, "extractVidhide v18: unpacked len=${unpacked.length} (base=$base, words=${words.size})")
 
             val hlsUrls = LinkedHashMap<String, Int>()
             for (m in Regex("""(https?://[^"'\s\\]+\.m3u8[^"'\s\\]*)""").findAll(unpacked)) {
                 val u = m.groupValues[1]
-                    .replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&")
+                    .replace("\\/", "/").replace(Regex("\\\\+u0026"), "&").replace("&amp;", "&")
                 if (u.contains(".mp4")) continue
                 val q = when {
                     u.contains("1080") -> Qualities.P1080.value
@@ -3305,6 +3415,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 }
                 if (!hlsUrls.containsKey(u)) hlsUrls[u] = q
             }
+            Log.i(TAG, "extractVidhide v18: ${hlsUrls.size} m3u8 únicos encontrados")
             for ((u, q) in hlsUrls) {
                 try {
                     generateM3u8(serverName, u, embedUrl).forEach(trackingCb)
