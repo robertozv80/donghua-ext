@@ -22,14 +22,14 @@
   {
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/DonghuaLifeBetaProvider.cs3",
     "status": 1,
-    "version": 5,
+    "version": 6,
     "name": "DonghuaLifeBetaProvider",
     "internalName": "DonghuaLifeBetaProvider",
     "authors": [
       "robertozv80"
     ],
     "description": "DonghuaLifeBETA - Donghuas en espa\u00f1ol con subt\u00edtulos",
-    "fileSize": 159292,
+    "fileSize": 161892,
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
     "language": "es",
     "tvTypes": [
@@ -37,19 +37,19 @@
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=donghualife.com&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-45a4ea7923f371526044221a4ccdefe91ed398fa86f7e03938ec4428a5dc7206"
+    "fileHash": "sha256-2c73718dbb909183e811e167a62228b77275172279dff5db30dc31cba4a7c8c9"
   },
   {
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/DonghuaLifeProvider.cs3",
     "status": 1,
-    "version": 4,
+    "version": 5,
     "name": "DonghuaLifeProvider",
     "internalName": "DonghuaLifeProvider",
     "authors": [
       "robertozv80"
     ],
     "description": "DonghuaLife - Donghuas en espa\u00f1ol con subt\u00edtulos",
-    "fileSize": 70893,
+    "fileSize": 73417,
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
     "language": "es",
     "tvTypes": [
@@ -57,7 +57,7 @@
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=donghualife.com&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-a5333b7111a6fb5b1d78fd033865e8e4ce90104a0ffa2be6b04357fa111976fe"
+    "fileHash": "sha256-7a65aa905c01c1bc694230fe87ae76a427121c0c9a77fd3df448cc1feabaffa8"
   },
   {
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/DonghuaWorldProvider.cs3",
