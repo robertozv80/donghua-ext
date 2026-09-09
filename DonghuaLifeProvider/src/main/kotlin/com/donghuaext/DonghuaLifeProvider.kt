@@ -724,7 +724,7 @@ class DonghuaLifeProvider : MainAPI() {
         val nextScript = html.indexOf("</script>", start)
         val end = listOf(nextMf, nextScript).filter { it > start }.minOrNull() ?: html.length
         val data = html.substring(start, minOf(end, html.length))
-            .replace("\\\\/", "/")
+            .replace(Regex("\\\\+/"), "/")
             .replace(Regex("\\\\+u0026"), "&")
 
         var emitted = false
@@ -809,7 +809,7 @@ class DonghuaLifeProvider : MainAPI() {
             Regex("""data-options="([^"]+)"""").find(webHtml)?.let { dm ->
                 val optionsJson = dm.groupValues[1].replace("&quot;", "\"").replace("&amp;", "&")
                 val unescaped = optionsJson
-                    .replace(Regex("\\+u0026"), "&")
+                    .replace(Regex("\\\\+u0026"), "&")
                     .replace(Regex("\\+/"), "/")
                 var emitted = false
                 for (match in Regex("""(https?://[^"]+\.m3u8[^"]*)""").findAll(unescaped)) {

@@ -2649,7 +2649,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val nextScript = html.indexOf("</script>", start)
         val end = listOf(nextMf, nextScript).filter { it > start }.minOrNull() ?: html.length
         val data = html.substring(start, minOf(end, html.length))
-            .replace("\\\\/", "/")
+            .replace(Regex("\\\\+/"), "/")
             .replace(Regex("\\\\+u0026"), "&")
 
         var emitted = false
@@ -2944,7 +2944,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
             val text = videosBlock ?: body
             for (m in urlRegex.findAll(text)) {
                 val qName = m.groupValues[1]
-                val u = m.groupValues[2].replace("\\\\/", "/").replace(Regex("\\\\+u0026"), "&")
+                val u = m.groupValues[2].replace(Regex("\\\\+/"), "/").replace(Regex("\\\\+u0026"), "&")
                 if (!u.startsWith("http")) continue
                 val quality = qualityMap.firstOrNull { it.first == qName }?.second ?: Qualities.Unknown.value
                 try {
@@ -2988,7 +2988,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
             Regex("""data-options="([^"]+)"""").find(webHtml)?.let { dm ->
                 val optionsJson = dm.groupValues[1].replace("&quot;", "\"").replace("&amp;", "&")
                 val unescaped = optionsJson
-                    .replace(Regex("\\+u0026"), "&")
+                    .replace(Regex("\\\\+u0026"), "&")
                     .replace(Regex("\\+/"), "/")
                 var emitted = false
                 for (match in Regex("""(https?://[^"]+\.m3u8[^"]*)""").findAll(unescaped)) {
