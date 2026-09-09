@@ -2669,8 +2669,13 @@ class DonghuaLifeBetaProvider : MainAPI() {
             Log.i(TAG, "extractRumble v20: skip $vkey (failed recently)")
             return false
         }
-        val block = Regex("""m\.f\[""" + Regex.escape(vkey) + """"\]=""").find(html)
-            ?: return false
+        val qCh = 34.toChar()   // doble comilla
+        val bsCh = 92.toChar() // barra invertida
+        val block = Regex("m" + bsCh + ".f" + bsCh + "[" + bsCh + qCh + Regex.escape(vkey) + qCh + bsCh + "]=").find(html)
+        if (block == null) {
+            Log.w(TAG, "extractRumble v21: m.f[] block regex no matchio para $vkey (marker presente?)")
+            return false
+        }
 
         val start = block.range.first
         val nextMf = html.indexOf("m.f[\"", start + 10)
