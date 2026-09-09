@@ -9,6 +9,22 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.getAndUnpack
 import com.lagradost.cloudstream3.utils.Qualities
 import kotlin.collections.ArrayList
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
+
+private const val TAG = "DonghuaLife"
 
 class DonghuaLifeProvider : MainAPI() {
 
@@ -381,7 +397,12 @@ class DonghuaLifeProvider : MainAPI() {
     callback: (ExtractorLink) -> Unit
     ): Boolean {
         try {
-            val html = app.get(videoUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
+            val resp = app.get(videoUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L)
+            val html = resp.text
+            Log.i(TAG, "extractOkRu v19: $videoUrl httpCode=${resp.code} len=${html.length}")
+            if (resp.code != 200) {
+                return extractOkRuViaWebView(videoUrl, serverName, callback)
+            }
             val dataMatch = Regex("""data-options="([^"]+)"""").find(html)
             if (dataMatch != null) {
                 val optionsJson = dataMatch.destructured.component1().replace("&quot;", "\"").replace("&amp;", "&")
@@ -435,6 +456,9 @@ class DonghuaLifeProvider : MainAPI() {
                 })
                 return true
             }
+            // v19 Fallback WebView: si okhttp recibió el reto de Cloudflare o nada emitió,
+            // carga el embed en un WebView real y parsea su HTML final.
+            return extractOkRuViaWebView(videoUrl, serverName, callback)
         } catch (_: Exception) {}
         return false
     }
@@ -511,67 +535,322 @@ class DonghuaLifeProvider : MainAPI() {
         return emitted
     }
 
-    /** v3: Extrae el bloque real m.f["<vkey>"]={...} del HTML de la página embed de Rumble.
-     *  embedJS/u3|u4 ahora sirve data decoy; la página embed sigue devolviendo 200 con el data real. */
+    /** v19: Extrae el bloque real m.f["<vkey>"]={...} del HTML de la página embed de Rumble.
+     *  okhttp primero; si Cloudflare bloquea (403) o el bloque no aparece, reintenta con
+     *  WebView real (pasa el reto de Cloudflare). El parsing vive en extractRumbleDataBlock. */
     private suspend fun tryExtractRumbleFromEmbedHtml(
         embedUrl: String,
         vkey: String,
         serverName: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        var emitted = false
+        val marker = "m.f[\"$vkey\"]="
+        // 1) okhttp (rápido, funciona desde IP no bloqueada)
         try {
             val resp = app.get(embedUrl, headers = mapOf("User-Agent" to USER_AGENT), timeout = 20L)
             val html = resp.text
-            if (resp.code != 200) return false
-            if (!html.contains("m.f[\"$vkey\"]")) return false
-
-            val start = html.indexOf("m.f[\"$vkey\"]")
-            val nextMf = html.indexOf("m.f[\"", start + 10)
-            val nextScript = html.indexOf("</script>", start)
-            val end = listOf(nextMf, nextScript).filter { it > start }.minOrNull() ?: html.length
-            val data = html.substring(start, minOf(end, html.length))
-                .replace("\\\\/", "/")
-                .replace(Regex("\\\\+u0026"), "&")
-
-            val hlsMaster = Regex(""""hls"\s*:\s*\{\s*"url"\s*:\s*"(https://rumble\.com/(?:hls-vod|live-hls-dvr)/[^"]+\.m3u8)"""").find(data)
-                ?: Regex("""(https://rumble\.com/(?:hls-vod|live-hls-dvr)/[^"]+\.m3u8)""").find(data)
-            if (hlsMaster != null) {
-                try {
-                    generateM3u8(serverName, hlsMaster.groupValues[1], "https://rumble.com").forEach(callback)
-                    emitted = true
-                } catch (_: Exception) {}
-            }
-
-            val tarUrls = LinkedHashMap<String, String>()
-            for (m in Regex(""""(\d{3,4})"\s*:\s*\{\s*"url"\s*:\s*"(https://hugh\.cdn\.rumble\.cloud/[^"]+?\.tar[^"]*?)"""").findAll(data)) {
-                val q = m.groupValues[1]
-                if (!tarUrls.containsKey(q)) tarUrls[q] = m.groupValues[2]
-            }
-            for ((q, u) in tarUrls) {
-                val quality = when (q) {
-                    "2160" -> Qualities.P2160.value; "1440" -> Qualities.P1440.value
-                    "1080" -> Qualities.P1080.value; "720" -> Qualities.P720.value
-                    "480" -> Qualities.P480.value; "360" -> Qualities.P360.value
-                    else -> Qualities.Unknown.value
+            Log.i(TAG, "extractRumble v19: embedPage(okhttp) vkey=$vkey httpCode=${resp.code} len=${html.length}")
+            if (resp.code == 200 && html.contains(marker)) {
+                if (extractRumbleDataBlock(html, vkey, serverName, callback)) {
+                    Log.i(TAG, "extractRumble v19: SUCCESS via okhttp embed-page m.f[] for $vkey")
+                    return true
                 }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "extractRumble v19: okhttp embedPage failed: ${e.message}")
+        }
+
+        // 2) Fallback WebView: motor real del sistema, pasa el reto de Cloudflare
+        try {
+            Log.i(TAG, "extractRumble v19: trying WebView fallback for embed page (vkey=$vkey)")
+            val webHtml = fetchHtmlViaWebView(embedUrl, referer = null, waitMarker = marker, maxWaitMs = 45000L)
+            if (webHtml != null) {
+                Log.i(TAG, "extractRumble v19: WebView HTML len=${webHtml.length} markerFound=${webHtml.contains(marker)}")
+                if (extractRumbleDataBlock(webHtml, vkey, serverName, callback)) {
+                    Log.i(TAG, "extractRumble v19: SUCCESS via WebView embed-page m.f[] for $vkey")
+                    return true
+                }
+            } else {
+                Log.w(TAG, "extractRumble v19: WebView fallback returned no HTML")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "extractRumble v19: WebView fallback failed: ${e.message}")
+        }
+        return false
+    }
+
+
+    /** v19: WebView genérico que devuelve el HTML final de una URL.
+     *  UA por defecto del WebView (no forzado) + cookies persistentes + espera del reto de
+     *  Cloudflare (hasta 30s) + polling del marker (p.ej. m.f["vkey"]) en el DOM.
+     *  Devuelve null si no hay Context, timeout, o el HTML nunca contiene el marker. */
+    private suspend fun fetchHtmlViaWebView(
+        url: String,
+        referer: String? = null,
+        waitMarker: String? = null,
+        maxWaitMs: Long = 45000L
+    ): String? {
+        val ctx: Context? = try {
+            var c: Context? = null
+            try {
+                val m = Class.forName("com.lagradost.api.ContextHelper_jvmKt")
+                    .declaredMethods.firstOrNull { it.name == "getContext" }
+                if (m != null) {
+                    @Suppress("UNCHECKED_CAST")
+                    c = m.invoke(null) as? Context
+                }
+            } catch (_: Throwable) {}
+            if (c == null) {
+                try {
+                    val cls = Class.forName("com.lagradost.cloudstream3.AcraApplication")
+                    val field = cls.getDeclaredField("context")
+                    field.isAccessible = true
+                    c = field.get(null) as? Context
+                } catch (_: Throwable) {}
+            }
+            if (c == null) {
+                try {
+                    val atCls = Class.forName("android.app.ActivityThread")
+                    val m = atCls.getDeclaredMethod("currentApplication")
+                    m.isAccessible = true
+                    c = m.invoke(null) as? Context
+                } catch (_: Throwable) {}
+            }
+            c
+        } catch (_: Throwable) { null }
+        if (ctx == null) {
+            Log.w(TAG, "fetchHtmlViaWebView: no Context available")
+            return null
+        }
+
+        var webView: WebView? = null
+        val snapshot = java.util.concurrent.atomic.AtomicReference<String?>(null)
+        val html = withTimeoutOrNull(maxWaitMs) {
+            suspendCoroutine<String?> { cont ->
+                val resumed = java.util.concurrent.atomic.AtomicBoolean(false)
+                fun resumeOnce(value: String?) {
+                    if (resumed.compareAndSet(false, true)) cont.resume(value)
+                }
+                Handler(Looper.getMainLooper()).post {
+                    try {
+                        val wv = WebView(ctx)
+                        webView = wv
+                        wv.settings.javaScriptEnabled = true
+                        wv.settings.domStorageEnabled = true
+                        wv.settings.mediaPlaybackRequiresUserGesture = false
+                        wv.settings.blockNetworkImage = true
+                        try {
+                            CookieManager.getInstance().setAcceptCookie(true)
+                            CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+                        } catch (_: Throwable) {}
+                        // v19: NO forzar userAgentString — el UA por defecto del WebView pasa
+                        // la huella de Cloudflare; forzar UA desktop en un motor móvil la falla.
+
+                        wv.webViewClient = object : WebViewClient() {
+                            override fun onPageFinished(view: WebView?, u: String?) {
+                                super.onPageFinished(view, u)
+                                view?.evaluateJavascript(
+                                    "document.documentElement.outerHTML.substring(0, 900000)"
+                                ) { value ->
+                                    val h = value?.trim()
+                                        ?.removePrefix("\"")?.removeSuffix("\"")
+                                        ?.replace("\\\"", "\"")
+                                        ?.replace("\\\\n", "\n")
+                                        ?.replace("\\\\\"", "\"")
+                                    if (!h.isNullOrEmpty() && h.length > 500) {
+                                        snapshot.set(h)
+                                        val markerFound = waitMarker == null || h.contains(waitMarker)
+                                        if (markerFound) {
+                                            Log.i(TAG, "fetchHtmlViaWebView: HTML captured (len=${h.length}, marker=${waitMarker != null})")
+                                            resumeOnce(h)
+                                        }
+                                    }
+                                }
+                            }
+
+                            override fun onReceivedHttpError(
+                                view: WebView?,
+                                request: WebResourceRequest?,
+                                errorResponse: WebResourceResponse?
+                            ) {
+                                super.onReceivedHttpError(view, request, errorResponse)
+                                val u2 = request?.url?.toString() ?: ""
+                                // Solo loguear errores del documento principal, no de subrecursos
+                                if (request?.isForMainFrame == true) {
+                                    Log.i(TAG, "fetchHtmlViaWebView: httpError code=${errorResponse?.statusCode} url=$u2")
+                                }
+                            }
+                        }
+
+                        val headers = if (referer != null) mapOf("Referer" to referer) else emptyMap()
+                        wv.loadUrl(url, headers)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "fetchHtmlViaWebView: WebView error: ${e.message}")
+                        resumeOnce(null)
+                    }
+                }
+            }
+        }
+
+        Handler(Looper.getMainLooper()).post {
+            try {
+                webView?.stopLoading()
+                webView?.removeJavascriptInterface("Android")
+                webView?.destroy()
+            } catch (_: Exception) {}
+        }
+        webView = null
+
+        val result = html ?: snapshot.get()
+        if (result == null) Log.w(TAG, "fetchHtmlViaWebView: timeout/cancel for $url")
+        if (result != null && waitMarker != null && !result.contains(waitMarker)) {
+            Log.w(TAG, "fetchHtmlViaWebView: HTML captured but marker not found after ${maxWaitMs}ms")
+        }
+        return result
+    }
+
+    /** v19: Extrae el bloque m.f["<vkey>"] del HTML (okhttp o WebView) y emite los links. */
+    private suspend fun extractRumbleDataBlock(
+        html: String,
+        vkey: String,
+        serverName: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val block = Regex("""m\.f\[""" + Regex.escape(vkey) + """"\]=""").find(html)
+            ?: return false
+
+        val start = block.range.first
+        val nextMf = html.indexOf("m.f[\"", start + 10)
+        val nextScript = html.indexOf("</script>", start)
+        val end = listOf(nextMf, nextScript).filter { it > start }.minOrNull() ?: html.length
+        val data = html.substring(start, minOf(end, html.length))
+            .replace("\\\\/", "/")
+            .replace(Regex("\\\\+u0026"), "&")
+
+        var emitted = false
+
+        // 1) Master HLS (hls-vod o live-hls-dvr) — jugable directamente (verificado 200)
+        val hlsMaster = Regex(""""hls"\s*:\s*\{\s*"url"\s*:\s*"(https://rumble\.com/(?:hls-vod|live-hls-dvr)/[^"]+\.m3u8)"""").find(data)
+            ?: Regex("""(https://rumble\.com/(?:hls-vod|live-hls-dvr)/[^"]+\.m3u8)""").find(data)
+        if (hlsMaster != null) {
+            val u = hlsMaster.groupValues[1]
+            try {
+                generateM3u8(serverName, u, "https://rumble.com").forEach(callback)
+                emitted = true
+                Log.i(TAG, "extractRumble v19: master HLS emitted: ${u.take(80)}")
+            } catch (e: Exception) {
+                Log.w(TAG, "extractRumble v19: master HLS generateM3u8 failed: ${e.message}")
+            }
+        }
+
+        // 2) Pistas tar por calidad (ua.tar.360/480/720/1080) — chunklist virtual jugable
+        val tarUrls = LinkedHashMap<String, String>()
+        for (m in Regex(""""(\d{3,4})"\s*:\s*\{\s*"url"\s*:\s*"(https://hugh\.cdn\.rumble\.cloud/[^"]+?\.tar[^"]*?)"""").findAll(data)) {
+            val q = m.groupValues[1]
+            val u = m.groupValues[2]
+            if (!tarUrls.containsKey(q)) tarUrls[q] = u
+        }
+        for ((q, u) in tarUrls) {
+            val quality = when (q) {
+                "2160" -> Qualities.P2160.value; "1440" -> Qualities.P1440.value
+                "1080" -> Qualities.P1080.value; "720" -> Qualities.P720.value
+                "480" -> Qualities.P480.value; "360" -> Qualities.P360.value
+                else -> Qualities.Unknown.value
+            }
+            try {
+                callback(
+                    newExtractorLink(
+                        source = serverName,
+                        name = "$serverName ${q}p",
+                        url = u,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = "https://rumble.com"
+                        this.quality = quality
+                    }
+                )
+                emitted = true
+            } catch (_: Throwable) {}
+        }
+        if (tarUrls.isNotEmpty()) Log.i(TAG, "extractRumble v19: ${tarUrls.size} tar tracks (${tarUrls.keys.joinToString(",")})")
+
+        // 3) Fallback: cualquier mp4 directo
+        if (!emitted) {
+            for (m in Regex("""(https?://[^"]+?\.mp4[^"]*)""").findAll(data)) {
+                val u = m.groupValues[1]
                 try {
                     callback(
                         newExtractorLink(
-                            source = serverName,
-                            name = "$serverName ${q}p",
-                            url = u,
-                            type = ExtractorLinkType.M3U8
-                        ) {
-                            this.referer = "https://rumble.com"
-                            this.quality = quality
-                        }
+                            source = serverName, name = serverName, url = u,
+                            type = ExtractorLinkType.VIDEO
+                        ) { this.referer = "https://rumble.com" }
                     )
                     emitted = true
                 } catch (_: Throwable) {}
             }
-        } catch (_: Exception) {}
+        }
         return emitted
+    }
+
+    /** v19: Último recurso OK.ru — carga el embed en un WebView real (pasa Cloudflare)
+     *  y parsea el HTML final con data-options / URLs directas. */
+    private suspend fun extractOkRuViaWebView(
+        videoUrl: String,
+        serverName: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        try {
+            Log.i(TAG, "extractOkRu v19: trying WebView fallback for $videoUrl")
+            val webHtml = fetchHtmlViaWebView(videoUrl, referer = null, waitMarker = null, maxWaitMs = 45000L)
+                ?: return false
+            Log.i(TAG, "extractOkRu v19: WebView HTML len=${webHtml.length}")
+
+            // data-options (HTML-entity escapado) — camino principal
+            Regex("""data-options="([^"]+)"""").find(webHtml)?.let { dm ->
+                val optionsJson = dm.groupValues[1].replace("&quot;", "\"").replace("&amp;", "&")
+                val unescaped = optionsJson
+                    .replace(Regex("\\+u0026"), "&")
+                    .replace(Regex("\\+/"), "/")
+                var emitted = false
+                for (match in Regex("""(https?://[^"]+\.m3u8[^"]*)""").findAll(unescaped)) {
+                    try {
+                        generateM3u8(serverName, match.groupValues[1], videoUrl).forEach(callback)
+                        emitted = true
+                    } catch (_: Exception) {}
+                }
+                if (emitted) return true
+                for (match in Regex("""(https?://[^"]+\.mp4[^"]*)""").findAll(unescaped)) {
+                    callback(newExtractorLink(source = serverName, name = serverName, url = match.groupValues[1], type = ExtractorLinkType.VIDEO) {
+                        this.referer = videoUrl
+                        this.quality = Qualities.Unknown.value
+                        this.headers = mapOf("User-Agent" to USER_AGENT)
+                    })
+                    emitted = true
+                }
+                if (emitted) return true
+            }
+
+            // MP4/m3u8 crudos en el HTML renderizado
+            for (match in Regex("""(https?://[^"'\s<>]+\.(?:mp4|m3u8)[^"'\s<>]*)""").findAll(webHtml)) {
+                val u = match.groupValues[1]
+                if (u.contains(".m3u8")) {
+                    try {
+                        generateM3u8(serverName, u, videoUrl).forEach(callback)
+                        return true
+                    } catch (_: Exception) {}
+                } else {
+                    callback(newExtractorLink(source = serverName, name = serverName, url = u, type = ExtractorLinkType.VIDEO) {
+                        this.referer = videoUrl
+                        this.quality = Qualities.Unknown.value
+                        this.headers = mapOf("User-Agent" to USER_AGENT)
+                    })
+                    return true
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "extractOkRuViaWebView failed: ${e.message}")
+        }
+        return false
     }
 
     private suspend fun extractRumbleLegacy(
