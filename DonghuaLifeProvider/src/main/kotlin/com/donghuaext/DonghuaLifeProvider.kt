@@ -25,6 +25,9 @@ import kotlin.coroutines.suspendCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 
 private const val TAG = "DonghuaLife"
+// v20: cache TTL de vkeys que fallaron - evita repetir el ciclo lento (~60 s) en cada intento
+private val rumbleFailedVkeys = java.util.concurrent.ConcurrentHashMap<String, Long>()
+private val RUMBLE_FAIL_TTL_MS = 10L * 60L * 1000L
 
 class DonghuaLifeProvider : MainAPI() {
 
@@ -525,6 +528,15 @@ class DonghuaLifeProvider : MainAPI() {
         // Se elimina y se usa directamente el método del embed page.
         val vkey = Regex("""/embed/([A-Za-z0-9_]+)""").find(embedUrl)?.groupValues?.get(1)
             ?: Regex("""vkey=([A-Za-z0-9_]+)""").find(embedUrl)?.groupValues?.get(1)
+        // v20: este vkey ya fallo toda la cadena hace poco - no repetir el ciclo lento
+        if (vkey != null) {
+            val failUntil = rumbleFailedVkeys[vkey]
+            if (failUntil != null && System.currentTimeMillis() < failUntil) {
+                Log.i(TAG, "extractRumble v20: fast-skip $vkey (cached failure)")
+                return false
+            }
+        }
+
         if (vkey != null && !emitted) {
             emitted = tryExtractRumbleFromEmbedHtml(embedUrl, vkey, serverName, trackingCb)
             if (emitted) return true
@@ -544,46 +556,44 @@ class DonghuaLifeProvider : MainAPI() {
         serverName: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val marker = "m.f[\"$vkey\"]="
-        // 1) okhttp (rápido, funciona desde IP no bloqueada)
+        val marker = """m.f["$vkey"]="""
+        // 1) okhttp (via rapida; funciona desde IP no bloqueada)
         try {
             val resp = app.get(embedUrl, headers = mapOf("User-Agent" to USER_AGENT), timeout = 20L)
             val html = resp.text
-            Log.i(TAG, "extractRumble v19: embedPage(okhttp) vkey=$vkey httpCode=${resp.code} len=${html.length}")
+            Log.i(TAG, "extractRumble v20: embedPage(okhttp) vkey=$vkey httpCode=${resp.code} len=${html.length}")
             if (resp.code == 200 && html.contains(marker)) {
                 if (extractRumbleDataBlock(html, vkey, serverName, callback)) {
-                    Log.i(TAG, "extractRumble v19: SUCCESS via okhttp embed-page m.f[] for $vkey")
+                    Log.i(TAG, "extractRumble v20: SUCCESS via okhttp embed-page m.f[] for $vkey")
                     return true
                 }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "extractRumble v19: okhttp embedPage failed: ${e.message}")
+            Log.w(TAG, "extractRumble v20: okhttp embedPage failed: ${e.message}")
         }
 
         // 2) Fallback WebView: motor real del sistema, pasa el reto de Cloudflare
         try {
-            Log.i(TAG, "extractRumble v19: trying WebView fallback for embed page (vkey=$vkey)")
+            Log.i(TAG, "extractRumble v20: trying WebView fallback for embed page (vkey=$vkey)")
             val webHtml = fetchHtmlViaWebView(embedUrl, referer = null, waitMarker = marker, maxWaitMs = 45000L)
             if (webHtml != null) {
-                Log.i(TAG, "extractRumble v19: WebView HTML len=${webHtml.length} markerFound=${webHtml.contains(marker)}")
+                Log.i(TAG, "extractRumble v20: WebView HTML len=${webHtml.length} markerFound=${webHtml.contains(marker)}")
                 if (extractRumbleDataBlock(webHtml, vkey, serverName, callback)) {
-                    Log.i(TAG, "extractRumble v19: SUCCESS via WebView embed-page m.f[] for $vkey")
+                    Log.i(TAG, "extractRumble v20: SUCCESS via WebView embed-page m.f[] for $vkey")
                     return true
                 }
+                Log.w(TAG, "extractRumble v20: WebView HTML present but m.f[] data did not parse (vkey=$vkey)")
             } else {
-                Log.w(TAG, "extractRumble v19: WebView fallback returned no HTML")
+                Log.w(TAG, "extractRumble v20: WebView fallback returned no HTML")
             }
         } catch (e: Exception) {
-            Log.w(TAG, "extractRumble v19: WebView fallback failed: ${e.message}")
+            Log.w(TAG, "extractRumble v20: WebView fallback failed: ${e.message}")
         }
+        rumbleFailedVkeys[vkey] = System.currentTimeMillis() + RUMBLE_FAIL_TTL_MS
+        Log.w(TAG, "extractRumble v20: all embed-page methods failed for $vkey (cached)")
         return false
     }
 
-
-    /** v19: WebView genérico que devuelve el HTML final de una URL.
-     *  UA por defecto del WebView (no forzado) + cookies persistentes + espera del reto de
-     *  Cloudflare (hasta 30s) + polling del marker (p.ej. m.f["vkey"]) en el DOM.
-     *  Devuelve null si no hay Context, timeout, o el HTML nunca contiene el marker. */
     private suspend fun fetchHtmlViaWebView(
         url: String,
         referer: String? = null,
@@ -678,6 +688,12 @@ class DonghuaLifeProvider : MainAPI() {
                                 // Solo loguear errores del documento principal, no de subrecursos
                                 if (request?.isForMainFrame == true) {
                                     Log.i(TAG, "fetchHtmlViaWebView: httpError code=${errorResponse?.statusCode} url=$u2")
+                                    // v20: si el documento principal dio error HTTP real, abortar ya
+                                    // en lugar de esperar el challenge/captura todo el timeout
+                                    val sc = errorResponse?.statusCode ?: 0
+                                    if (sc in 400..599 && !u2.contains("challenges.cloudflare.com")) {
+                                        resumeOnce(null)
+                                    }
                                 }
                             }
                         }
@@ -716,18 +732,28 @@ class DonghuaLifeProvider : MainAPI() {
         serverName: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+
+        // v20: si este vkey fallo hace poco, no repetir el analisis completo
+        val failUntil = rumbleFailedVkeys[vkey]
+        if (failUntil != null && System.currentTimeMillis() < failUntil) {
+            Log.i(TAG, "extractRumble v20: skip $vkey (failed recently)")
+            return false
+        }
         val block = Regex("""m\.f\[""" + Regex.escape(vkey) + """"\]=""").find(html)
             ?: return false
 
         val start = block.range.first
         val nextMf = html.indexOf("m.f[\"", start + 10)
-        val nextScript = html.indexOf("</script>", start)
-        val end = listOf(nextMf, nextScript).filter { it > start }.minOrNull() ?: html.length
+        // v20: </script> NO es un borde seguro (configs de ads lo contienen dentro de
+        // strings y truncaban el bloque antes de las URLs); cap de 300 KB por seguridad
+        val end = listOf(nextMf, start + 300000).filter { it > start }.minOrNull() ?: html.length
         val data = html.substring(start, minOf(end, html.length))
             .replace(Regex("\\\\+/"), "/")
             .replace(Regex("\\\\+u0026"), "&")
 
-        var emitted = false
+                Log.i(TAG, "extractRumble v20: block len=" + data.length + " head=" + data.take(140))
+
+var emitted = false
 
         // 1) Master HLS (hls-vod o live-hls-dvr) — jugable directamente (verificado 200)
         val hlsMaster = Regex(""""hls"\s*:\s*\{\s*"url"\s*:\s*"(https://rumble\.com/(?:hls-vod|live-hls-dvr)/[^"]+\.m3u8)"""").find(data)
@@ -737,9 +763,35 @@ class DonghuaLifeProvider : MainAPI() {
             try {
                 generateM3u8(serverName, u, "https://rumble.com").forEach(callback)
                 emitted = true
-                Log.i(TAG, "extractRumble v19: master HLS emitted: ${u.take(80)}")
+                Log.i(TAG, "extractRumble v20: master HLS emitted: ${u.take(80)}")
             } catch (e: Exception) {
-                Log.w(TAG, "extractRumble v19: master HLS generateM3u8 failed: ${e.message}")
+                Log.w(TAG, "extractRumble v20: generateM3u8 failed (${e.message}) - emitiendo link HLS directo")
+                try {
+                    callback(
+                        newExtractorLink(
+                            source = serverName, name = serverName, url = u,
+                            type = ExtractorLinkType.M3U8
+                        ) { this.referer = "https://rumble.com" }
+                    )
+                    emitted = true
+                } catch (_: Throwable) {}
+            }
+        }
+
+        // 1b) v20: si la master no matcheo, cualquier m3u8 del bloque (CDNs alternativos)
+        if (hlsMaster == null) {
+            val anyM3u8 = Regex("""https?://[^\"\s]+?\.m3u8[^\"\s]*""").find(data)
+            if (anyM3u8 != null) {
+                try {
+                    callback(
+                        newExtractorLink(
+                            source = serverName, name = serverName, url = anyM3u8.value,
+                            type = ExtractorLinkType.M3U8
+                        ) { this.referer = "https://rumble.com" }
+                    )
+                    emitted = true
+                    Log.i(TAG, "extractRumble v20: generic m3u8 emitted: " + anyM3u8.value.take(80))
+                } catch (_: Throwable) {}
             }
         }
 
@@ -788,6 +840,10 @@ class DonghuaLifeProvider : MainAPI() {
                     emitted = true
                 } catch (_: Throwable) {}
             }
+        }
+        if (!emitted) {
+            rumbleFailedVkeys[vkey] = System.currentTimeMillis() + RUMBLE_FAIL_TTL_MS
+            Log.w(TAG, "extractRumble v20: bloque presente sin links para el vkey (cacheado 10 min)")
         }
         return emitted
     }
