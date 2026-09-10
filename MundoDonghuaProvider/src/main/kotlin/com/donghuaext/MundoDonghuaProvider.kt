@@ -7,7 +7,19 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.getAndUnpack
 import com.lagradost.cloudstream3.utils.Qualities
+import kotlinx.coroutines.async
 import kotlin.collections.ArrayList
+
+// FIX v22.1: embeds conocidos para el fallback de HTML crudo (por si cambia el empaquetado)
+private val MD_RAW_EMBED_REGEXES = listOf(
+    Regex("https?://[^\\s\"'<>]*vidhidepro\\.com/[ve]/[a-zA-Z0-9]+"),
+    Regex("https?://[^\\s\"'<>]*vgembed\\.com/e/[a-zA-Z0-9]+"),
+    Regex("https?://[^\\s\"'<>]*embedwish\\.com/e/[a-zA-Z0-9]+"),
+    Regex("https?://[^\\s\"'<>]*streamwish\\.to/e/[a-zA-Z0-9]+"),
+    Regex("https?://[^\\s\"'<>]*bysekoze\\.com/e/[a-zA-Z0-9]+"),
+    Regex("https?://[^\\s\"'<>]*filemoon\\.to/e/[a-zA-Z0-9]+"),
+    Regex("https?://voe\\.sx/e/[a-zA-Z0-9]+"),
+)
 
 class MundoDonghuaProvider : MainAPI() {
 
@@ -231,12 +243,19 @@ class MundoDonghuaProvider : MainAPI() {
             else -> TvType.Anime
         }
 
+        // ===== v22 Recomendaciones =====
+        // El sitio no tiene bloque de relacionados en la ficha ni puntuación
+        // numérica; se usa la lista de episodios recientes del home como sección
+        // de recomendaciones, excluyendo la propia serie.
+        val recommendations = fetchMundoRecommendations(donghuaUrl)
+
         // Para películas sin episodios, devolver respuesta de película
         if (episodes.isEmpty() && tvType == TvType.AnimeMovie) {
             return newMovieLoadResponse(title, donghuaUrl, TvType.AnimeMovie, donghuaUrl) {
                 posterUrl = resolvedPoster
                 plot = description
                 tags = genres
+                if (recommendations.isNotEmpty()) this.recommendations = recommendations
             }
         }
 
@@ -263,6 +282,42 @@ class MundoDonghuaProvider : MainAPI() {
             showStatus = status
             plot = description
             tags = genres
+            if (recommendations.isNotEmpty()) this.recommendations = recommendations
+        }
+    }
+
+    /**
+     * v22: recomendaciones desde los "Nuevos Episodios" del home.
+     * El sitio no publica puntuación ni fecha por episodio (no hay campo de
+     * fecha ni en la ficha ni en la página de episodio), así que no se pueden
+     * añadir esos metadatos aquí.
+     */
+    private suspend fun fetchMundoRecommendations(donghuaUrl: String): List<SearchResponse> {
+        return try {
+            val homeDoc = app.get("$mainUrl/", timeout = 120).document
+            val seen = HashSet<String>()
+            val recs = ArrayList<SearchResponse>()
+            val cards = homeDoc.select("div#nuevos-episodios-grid div.md-card").ifEmpty {
+                homeDoc.select("div.md-card")
+            }
+            cards.forEach { card ->
+                val href = card.selectFirst("a")?.attr("href") ?: return@forEach
+                val seriesHref = if (href.contains("/ver/")) {
+                    val slug = Regex("/ver/([^/]+)").find(href)?.destructured?.component1() ?: return@forEach
+                    "$mainUrl/donghua/$slug"
+                } else {
+                    resolveUrl(href)
+                }
+                if (seriesHref == donghuaUrl || !seen.add(seriesHref)) return@forEach
+                val recTitle = card.selectFirst("h3.md-card-title")?.text()?.trim() ?: return@forEach
+                val poster = card.selectFirst("div.md-card-img img")?.let { getBestImgSrc(it) }
+                recs.add(newAnimeSearchResponse(recTitle, seriesHref) {
+                    this.posterUrl = resolveUrl(poster ?: "")
+                })
+            }
+            recs.take(16)
+        } catch (_: Exception) {
+            emptyList()
         }
     }
 
@@ -273,7 +328,11 @@ class MundoDonghuaProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val doc = app.get(data, timeout = 120).document
+        val rawHtml = doc.html()
         val datafix = data.replace("ñ", "%C3%B1")
+        // v22.1: recolectar embeds (dedup) y cargarlos AL FINAL en paralelo; antes
+        // cada extractor corría en serie y el total tardaba mucho.
+        val seenEmbeds = LinkedHashSet<String>()
 
         val reqHEAD = mapOf(
             "User-Agent" to USER_AGENT,
@@ -301,14 +360,21 @@ class MundoDonghuaProvider : MainAPI() {
         val hasSwish = serverTabs.any { it.first == "swish" }
 
         // Extraer videos desde el JavaScript packed (Dean Edwards packing)
+        // FIX v22.1: TODOS los servers van como llamadas eval() separadas dentro
+        // del mismo <script> (vhide, kaga/Vg, swish/Sw, ...). Antes un regex codicioso
+        // las unía en un solo bloque y el unpacker decodificaba todo con la tabla de
+        // símbolos del último eval: solo salía un server y de forma poco fiable.
+        // Ahora se separa por el terminador ",0,{}))" y cada eval se decodifica
+        // con su propia tabla de símbolos.
         for (script in doc.select("script")) {
             val scriptData = script.data()
             if (scriptData.contains("eval(function(p,a,c,k,e")) {
-                val packedRegex = Regex("eval\\(function\\(p,a,c,k,e,.*\\)\\)")
-                val packedList = packedRegex.findAll(scriptData).map { it.value }.toList()
-                for (packed in packedList) {
+                val packedChunks = scriptData.split(",0,{}))")
+                    .filter { it.contains("eval(function(p,a,c,k,e") }
+                for (chunk in packedChunks) {
+                    val packed = Regex("eval\\(function\\(p,a,c,k,e,.*").find(chunk)?.value ?: continue
                     try {
-                        val unpack = getAndUnpack(packed)
+                        val unpack = getAndUnpack(packed) ?: continue
 
                         // ===== Asura (HLS m3u8) - Servidor principal sin anuncios =====
                         if (unpack.contains("asura_player") || unpack.contains("redirector")) {
@@ -421,7 +487,7 @@ class MundoDonghuaProvider : MainAPI() {
                                     "https://bysekoze.com/e/${fmMatch.destructured.component1()}"
                                 }
                                 try {
-                                    loadExtractor(fmUrl, data, subtitleCallback, callback)
+                                    seenEmbeds.add(fmUrl)
                                 } catch (_: Exception) {}
                                 break
                             }
@@ -432,7 +498,7 @@ class MundoDonghuaProvider : MainAPI() {
                         val voeId = voeRegex.find(unpack)?.destructured?.component1()
                         if (!voeId.isNullOrEmpty()) {
                             try {
-                                loadExtractor("https://voe.sx/e/$voeId", data, subtitleCallback, callback)
+                                seenEmbeds.add("https://voe.sx/e/$voeId")
                             } catch (_: Exception) {}
                         }
 
@@ -446,7 +512,7 @@ class MundoDonghuaProvider : MainAPI() {
                             if (!vhId.isNullOrEmpty()) {
                                 try {
                                     val prefix = if (vhPattern.pattern.contains("/v/")) "v" else "e"
-                                    loadExtractor("https://vidhidepro.com/$prefix/$vhId", data, subtitleCallback, callback)
+                                    seenEmbeds.add("https://vidhidepro.com/$prefix/$vhId")
                                 } catch (_: Exception) {}
                                 break
                             }
@@ -461,7 +527,7 @@ class MundoDonghuaProvider : MainAPI() {
                             val kagaId = kagaPattern.find(unpack)?.destructured?.component1()
                             if (!kagaId.isNullOrEmpty()) {
                                 try {
-                                    loadExtractor("https://vgembed.com/e/$kagaId", data, subtitleCallback, callback)
+                                    seenEmbeds.add("https://vgembed.com/e/$kagaId")
                                 } catch (_: Exception) {}
                                 break
                             }
@@ -476,7 +542,7 @@ class MundoDonghuaProvider : MainAPI() {
                             val swId = swPattern.find(unpack)?.destructured?.component1()
                             if (!swId.isNullOrEmpty()) {
                                 try {
-                                    loadExtractor("https://embedwish.com/e/$swId", data, subtitleCallback, callback)
+                                    seenEmbeds.add("https://embedwish.com/e/$swId")
                                 } catch (_: Exception) {}
                                 break
                             }
@@ -511,13 +577,38 @@ class MundoDonghuaProvider : MainAPI() {
                         for (regex in iframeRegexes) {
                             for (match in regex.findAll(unpack)) {
                                 try {
-                                    loadExtractor(match.value, data, subtitleCallback, callback)
+                                    seenEmbeds.add(match.value)
                                 } catch (_: Exception) {}
                             }
                         }
 
                     } catch (_: Exception) {}
                 }
+            }
+        }
+
+        // Fallback v22.1: buscar embeds directos en el HTML crudo (por si el sitio
+        // deja de empaquetar los players). Los ya procesados no se repiten.
+        for (regex in MD_RAW_EMBED_REGEXES) {
+            for (match in regex.findAll(rawHtml)) {
+                val embedUrl = match.value
+                try {
+                    seenEmbeds.add(embedUrl)
+                } catch (_: Exception) {}
+            }
+        }
+
+        // v22.1: cargar TODOS los extractores en paralelo (por eso Vg/Sw aparecen
+        // al mismo tiempo que VH aunque sus CDNs tardan más en responder)
+        if (seenEmbeds.isNotEmpty()) {
+            kotlinx.coroutines.coroutineScope {
+                seenEmbeds.map { embedUrl ->
+                    async {
+                        try {
+                            loadExtractor(embedUrl, data, subtitleCallback, callback)
+                        } catch (_: Exception) {}
+                    }
+                }.forEach { it.await() }
             }
         }
 

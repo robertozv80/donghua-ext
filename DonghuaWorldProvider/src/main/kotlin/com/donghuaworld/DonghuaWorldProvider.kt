@@ -52,9 +52,11 @@ class DonghuaWorldProvider : MainAPI() {
     // Para "Completed" (separada): GET /anime/?status=completed&sub=&order=latest
     //   <div class="listupd">...<article>...</article>...</div>                  ← 20 series articles
     //   Paginacion: ?page=N&status=completed&sub=&order=latest
+    //
+    // v22: se ELIMINA la seccion "Hot Series Update" (solicitado por el usuario);
+    // permanecen Latest Release, Recommendation y Completed.
 
     override val mainPage = mainPageOf(
-        "$mainUrl/" to "Hot Series Update",
         "$mainUrl/##latest" to "Latest Release",
         "$mainUrl/##recommendation" to "Recommendation",
         "$mainUrl/anime/?status=completed&sub=&order=latest" to "Completed"
@@ -85,7 +87,7 @@ class DonghuaWorldProvider : MainAPI() {
             )
         }
 
-        // === Homepage sections (Hot/Latest/Recommendation) ===
+        // === Homepage sections (Latest/Recommendation; "Hot Series Update" eliminada en v22) ===
         // Solo la primera pagina trae el HTML del homepage; a partir de pagina 2
         // cargamos /page/N/ para la seccion Latest Release.
         val document = if (page == 1) {
@@ -99,7 +101,6 @@ class DonghuaWorldProvider : MainAPI() {
         }
 
         val items = when {
-            sectionName == "Hot Series Update" -> document.select(".listupd.popularslider article").mapNotNull { parseArticleCard(it) }
             sectionName == "Latest Release" -> document.select(".listupd.normal article").mapNotNull { parseArticleCard(it) }
             sectionName == "Recommendation" -> document.select(".series-gen article").mapNotNull { parseArticleCard(it) }
             else -> emptyList()
@@ -290,6 +291,27 @@ class DonghuaWorldProvider : MainAPI() {
         val year = document.selectFirst(".spe span:contains(Released)")?.nextElementSibling()?.text()?.trim()
             ?.take(4)?.toIntOrNull()
 
+        // ===== v22 Metadatos adicionales: puntuación, duración, tipo y títulos alternativos =====
+        // Rating: <div class="rating"><strong>Rating 9.2</strong>...<meta itemprop="ratingValue" content="9.2">
+        val scoreText = document.selectFirst(".rating strong")?.text()?.trim()
+            ?.substringAfter("Rating")?.trim()
+            ?: document.selectFirst("meta[itemprop=ratingValue]")?.attr("content")?.trim()
+        val score = scoreText?.toDoubleOrNull()
+
+        // Duration: <b>Duration:</b> 7 min. per. ep
+        val durationRaw = document.selectFirst(".spe span:contains(Duration)")?.text()?.trim()
+        val durationMinutes = durationRaw?.let { parseDwwDuration(it) }
+
+        // Type: <b>Type:</b> Donghua
+        val typeText = document.selectFirst(".spe span:contains(Type)")?.text()?.trim()
+            ?.substringAfter(":")?.trim() ?: ""
+
+        // Títulos alternativos: <span class="alter">斗破苍穹 第二季, 斗破苍穹 第一季</span>
+        val altTitle = document.selectFirst("span.alter")?.text()?.trim() ?: ""
+        val plotPrefix = if (altTitle.isNotBlank()) {
+            "Títulos alternativos: $altTitle\n\n"
+        } else ""
+
         // Extract episodes from the episode list
         val episodes = mutableListOf<Episode>()
         val seenUrls = mutableSetOf<String>()
@@ -372,17 +394,63 @@ class DonghuaWorldProvider : MainAPI() {
             }
         }
 
+        // ===== v22 Recomendaciones: sección "Recommended Series" de la ficha =====
+        val recommendations = extractDwwRecommendations(document, seriesUrl)
+
         // Sort episodes by number (ascending)
         val sortedEpisodes = episodes.sortedBy { it.episode ?: 0 }
 
         return newAnimeLoadResponse(title, seriesUrl, TvType.Anime) {
             this.posterUrl = poster
-            this.plot = description
+            this.plot = plotPrefix + description
             this.tags = genres
             this.showStatus = showStatus
             this.year = year
+            this.score = Score.from10(score)
+            if (durationMinutes != null && durationMinutes > 0) this.duration = durationMinutes
             this.episodes = mutableMapOf(DubStatus.Subbed to sortedEpisodes)
+            if (recommendations.isNotEmpty()) this.recommendations = recommendations
         }
+    }
+
+    /**
+     * v22: convierte "7 min. per. ep", "24 Min. Per Ep." a minutos.
+     * Devuelve null si no es parseable (ej: texto vacío).
+     */
+    private fun parseDwwDuration(text: String): Int? {
+        val t = text.trim()
+        Regex("""(\d+)\s*(?:h|hr|hour)""", RegexOption.IGNORE_CASE).find(t)?.destructured?.component1()?.toIntOrNull()
+            ?.let { hours ->
+                val mins = Regex("""(\d+)\s*min""", RegexOption.IGNORE_CASE).find(t)?.destructured?.component1()?.toIntOrNull() ?: 0
+                return hours * 60 + mins
+            }
+        return Regex("""(\d+)\s*min""", RegexOption.IGNORE_CASE).find(t)?.destructured?.component1()?.toIntOrNull()
+    }
+
+    /**
+     * v22: Extrae la sección "Recommended Series" de la página de detalle.
+     * Las URLs de episodio se pasan tal cual: load() las resuelve vía breadcrumb.
+     */
+    private fun extractDwwRecommendations(document: org.jsoup.nodes.Document, seriesUrl: String): List<SearchResponse> {
+        val results = ArrayList<SearchResponse>()
+        val seen = HashSet<String>()
+        // La sección Recommended Series está tras el heading; buscar todos los
+        // articles que aparezcan después de ese texto dentro del contenedor principal.
+        val recommendedAnchor = document.select("h2, h3, .releases h3").firstOrNull {
+            it.text().contains("Recommended", ignoreCase = true)
+        } ?: return results
+        var container: org.jsoup.nodes.Element? = recommendedAnchor.parent()
+        while (container != null && container.select("article").isEmpty()) {
+            container = container.nextElementSibling()
+        }
+        val articles = container?.select("article") ?: return results
+        for (art in articles) {
+            val parsed = parseArticleCard(art) ?: continue
+            val key = parsed.url
+            if (key == seriesUrl || !seen.add(key)) continue
+            results.add(parsed)
+        }
+        return results.take(16)
     }
 
     /**

@@ -450,22 +450,17 @@ class DonghuaLifeBetaProvider : MainAPI() {
             ?: releaseDateStr.substringAfterLast(" ").trim().toIntOrNull()
             ?: jsonLdDate.takeIf { it.isNotBlank() }?.substring(0, 4)?.toIntOrNull()
 
-        val metaLines = ArrayList<String>()
-        if (showStatus != null) {
-            val statusText = when (showStatus) {
-                ShowStatus.Ongoing -> "En Emisión"
-                ShowStatus.Completed -> "Finalizado"
-            }
-            metaLines.add("Estado: $statusText")
-        }
-        if (releaseDateStr.isNotBlank()) metaLines.add("Fecha: $releaseDateStr")
-        if (durationMinutes > 0) metaLines.add("Duración: ${durationMinutes}m")
-        val ratingScore = extractRatingScore(html, rscPayload)
-        if (ratingScore.isNotBlank()) metaLines.add("Puntuación: $ratingScore")
-        val metaBlock = if (metaLines.isNotEmpty()) {
-            metaLines.joinToString("\n") + "\n\n"
+        // v22 FIX: los metadatos ya NO se escriben dentro de la sinopsis; CloudStream
+        // los muestra nativamente con score/year/duration/showStatus.
+        val score = parseBetaScore(html, rscPayload)
+
+        // v22: Título alternativo (Título original / "También conocido como") en la
+        // primera línea de la descripción.
+        val originalTitle = extractOriginalTitle(html, rscPayload)
+        val plotPrefix = if (originalTitle.isNotBlank() && !originalTitle.equals(title, ignoreCase = true)) {
+            "Títulos alternativos: $originalTitle\n\n"
         } else ""
-        val fullPlot = metaBlock + description
+        val fullPlot = plotPrefix + description
 
         if (isMovie) {
             val movieId = extractContentIdFromPayload(rscPayload, "movieId") ?: ""
@@ -480,17 +475,24 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 tags = genres
                 year = yearInt
                 if (durationMinutes > 0) this.duration = durationMinutes
-                showStatus = showStatus
+                this.score = Score.from10(score)
             }
         }
 
         val episodes = ArrayList<Episode>()
         val seasons = extractSeasonsFromPayload(rscPayload)
 
-        val regularSeasons = seasons.filter { !it.isSpecial }
-        val specialSeasons = seasons.filter { it.isSpecial }
-
-        for ((idx, season) in regularSeasons.withIndex()) {
+        // ===== v22: TEMPORADAS EN ORDEN WEB =====
+        // Antes: regulares re-numeradas (idx+1) y especiales en season=0, lo que
+        // perdía la numeración real cuando hay especiales/OVAs entre temporadas.
+        // Ahora: usar el orden EXACTO de la web (campo "order" del payload),
+        // conservar el número real de temporada/auxiliar y mostrar los nombres
+        // tal cual ("Temporada 1", "Especial", "Especial 2-The Origin", ...).
+        // CloudStream muestra el nombre exacto cuando displaySeason=null.
+        val sortedSeasons = seasons.sortedBy { it.order }
+        val seasonNames = ArrayList<SeasonData>()
+        val specialCounter = HashMap<String, Int>() // slug especial -> ordinal
+        sortedSeasons.forEachIndexed { idx, season ->
             val seasonNum = idx + 1
             val seasonSlug = season.slug
             val episodeCount = season.episodeCount
@@ -501,6 +503,21 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 (0 until episodeCount).map { start + it }
             }
 
+            val displayName = if (season.isSpecial) {
+                // nombre web "Especial" o "Especial N-Título" según venga en el label
+                val label = season.label.trim()
+                val num = specialCounter.size + 1
+                specialCounter[seasonSlug] = num
+                if (label.equals("Especial", ignoreCase = true)) "ESPECIAL $num" else "ESPECIAL ${label}"
+            } else {
+                Regex("""(\d+)""").find(season.label)?.destructured?.component1()?.let { "TEMPORADA $it" }
+                    ?: "TEMPORADA ${seasonNum}"
+            }
+            seasonNames.add(SeasonData(season = seasonNum, name = displayName, displaySeason = null))
+
+            // v22: fechas de emisión por episodio desde "airDate" del payload
+            val airDates = extractAirDatesFromPayload(rscPayload, seasonSlug)
+
             for (epNum in epNumbersToUse) {
                 val epUrl = "$mainUrl/watch/$seasonSlug-$epNum"
                 episodes.add(
@@ -508,27 +525,9 @@ class DonghuaLifeBetaProvider : MainAPI() {
                         this.season = seasonNum
                         this.episode = epNum
                         this.name = "Episodio $epNum"
-                    }
-                )
-            }
-        }
-
-        for (season in specialSeasons) {
-            val seasonSlug = season.slug
-            val episodeCount = season.episodeCount
-            val epNumbersToUse = if (season.episodeNumbers.isNotEmpty()) {
-                season.episodeNumbers
-            } else {
-                val start = season.firstEpNumber.takeIf { it > 0 } ?: 1
-                (0 until episodeCount).map { start + it }
-            }
-            for (epNum in epNumbersToUse) {
-                val epUrl = "$mainUrl/watch/$seasonSlug-$epNum"
-                episodes.add(
-                    newEpisode(epUrl) {
-                        this.season = 0
-                        this.episode = epNum
-                        this.name = "Especial $epNum"
+                        // v22.1: parsear "10 Mayo, 2025" sin depender del locale
+                        // (SimpleDateFormat con "MMMM" falla si el device no está en español)
+                        airDates[epNum]?.let { addDate(parseSpanishDate(it)) }
                     }
                 )
             }
@@ -558,12 +557,102 @@ class DonghuaLifeBetaProvider : MainAPI() {
         return newAnimeLoadResponse(title, seriesUrl, TvType.Anime) {
             posterUrl = poster
             addEpisodes(DubStatus.Subbed, episodes.sortedWith(compareBy({ it.season }, { it.episode })))
+            if (seasonNames.isNotEmpty()) addSeasonNames(seasonNames)
             showStatus = showStatus
             plot = fullPlot
             tags = genres
             year = yearInt
             if (durationMinutes > 0) this.duration = durationMinutes
+            this.score = Score.from10(score)
         }
+    }
+
+    /**
+     * v22: Extrae fechas de emisión ("airDate") por número de episodio para una
+     * temporada concreta. El payload RSC guarda episodios con:
+     *   "seasonSlug":"<slug>","title":"...","number":N,..."airDate":"10 Mayo, 2025"
+     * Formato de fecha en la web: "10 Mayo, 2025" (d MMMM, yyyy, mes en español).
+     */
+    private fun extractAirDatesFromPayload(payload: String, seasonSlug: String): Map<Int, String> {
+        val result = HashMap<Int, String>()
+        val pat = Regex(
+            "\"seasonSlug\":\"" + Regex.escape(seasonSlug) + "\"[^}]*?\"number\":(\\d+),[^}]*?\"airDate\":\"([^\"]+)\""
+        )
+        for (m in pat.findAll(payload)) {
+            val num = m.groupValues[1].toIntOrNull() ?: continue
+            if (!result.containsKey(num)) result[num] = m.groupValues[2]
+        }
+        return result
+    }
+
+    /**
+     * v22.1: parsea fechas en español del payload ("10 Mayo, 2025", "3 Enero, 2026")
+     * sin depender del locale del dispositivo. Devuelve null si no puede parsear.
+     */
+    private fun parseSpanishDate(raw: String): java.util.Date? {
+        val m = Regex("(\\d{1,2})\\s+([A-Za-zñÑáéíóúÁÉÍÓÚ]+),?\\s+(\\d{4})").find(raw.trim()) ?: return null
+        val day = m.groupValues[1].toIntOrNull() ?: return null
+        val year = m.groupValues[3].toIntOrNull() ?: return null
+        val month = when (m.groupValues[2].lowercase(java.util.Locale.ROOT).removeSuffix(".")) {
+            "enero", "ene" -> 1; "febrero", "feb" -> 2; "marzo", "mar" -> 3
+            "abril", "abr" -> 4; "mayo", "may" -> 5; "junio", "jun" -> 6
+            "julio", "jul" -> 7; "agosto", "ago" -> 8; "septiembre", "setiembre", "sep", "set" -> 9
+            "octubre", "oct" -> 10; "noviembre", "nov" -> 11; "diciembre", "dic" -> 12
+            else -> return null
+        }
+        return try {
+            java.util.Calendar.getInstance().apply {
+                clear()
+                set(year, month - 1, day, 12, 0, 0)
+            }.time
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * v22: Extrae "Título original:" o "También conocido como:" del payload/HTML
+     * para mostrarlo como título alternativo en la descripción.
+     */
+    private fun extractOriginalTitle(html: String, rscPayload: String): String {
+        val patterns = listOf(
+            Regex("""Título original:\s*</strong>[^<]*<[^>]*>([^<]+)"""),
+            Regex("""También conocido como:\s*([^<\n]+)"""),
+            Regex(""""originalTitle"\s*:\s*"([^"]+)"""),
+            Regex(""""romaji"\s*:\s*"([^"]+)"""),
+            Regex(""""native"\s*:\s*"([^"]+)"""),
+        )
+        for (src in listOf(rscPayload, html)) {
+            for (p in patterns) {
+                val m = p.find(src)
+                if (m != null) {
+                    val v = m.groupValues[1].trim()
+                    if (v.isNotBlank()) return v
+                }
+            }
+        }
+        return ""
+    }
+
+    /** v22: puntuación de la web (0-10) → Score; sin texto dentro del plot. */
+    private fun parseBetaScore(html: String, rscPayload: String): Double? {
+        val patterns = listOf(
+            Regex(""""rating"\s*:\s*(\d+\.?\d*)"""),
+            Regex(""""score"\s*:\s*(\d+\.?\d*)"""),
+            Regex(""""averageRating"\s*:\s*(\d+\.?\d*)"""),
+            Regex(""""ratingValue"\s*:\s*"?(\d+\.?\d*)"""),
+            Regex(""""puntuacion"\s*:\s*(\d+\.?\d*)"""),
+        )
+        for (src in listOf(rscPayload, html)) {
+            for (p in patterns) {
+                val m = p.find(src)
+                if (m != null) {
+                    val asDouble = m.groupValues[1].toDoubleOrNull() ?: continue
+                    if (asDouble in 0.0..10.0) return asDouble
+                }
+            }
+        }
+        return null
     }
 
     private fun extractRatingScore(html: String, rscPayload: String): String {
@@ -604,15 +693,23 @@ class DonghuaLifeBetaProvider : MainAPI() {
         }
         val seasonsArrayStr = payload.substring(start, i)
 
+        // v22: el payload usa "label" (series page) o "name" (watch page).
+        // Además la watch page incluye "order" con el orden EXACTO de la web
+        // (Temporada 1, Especial, Especial 2-The Origin, Temporada 2, ...).
         val seasonPattern = Regex(
-            """\{"id":"[^"]+","slug":"([^"]+)","label":"([^"]+)","coverImage":"[^"]*","isSpecial":(true|false),"episodeCount":(\d+)"""
+            """\{"id":"[^"]+","slug":"([^"]+)","(?:label|name)":"([^"]+)"(,"year":(null|"[^"]*"),"isSpecial":(true|false),"order":(\d+)|,"coverImage":"[^"]*","isSpecial":(true|false),"episodeCount":(\d+))"""
         )
         for (m in seasonPattern.findAll(seasonsArrayStr)) {
             val slug = m.groupValues[1]
             val label = m.groupValues[2]
-            val isSpecial = m.groupValues[3] == "true"
-            val countStr = m.groupValues[4]
-            val episodeCount = countStr.toIntOrNull() ?: 0
+            // Variante watch page: groups 3-6; variante series page: groups 7-8
+            val isSpecial = m.groupValues[5].takeIf { it.isNotEmpty() }?.equals("true", ignoreCase = true)
+                ?: m.groupValues[7].equals("true", ignoreCase = true)
+            val episodeCount = m.groupValues[6].takeIf { it.isNotEmpty() }?.toIntOrNull()
+                ?: m.groupValues[8].takeIf { it.isNotEmpty() }?.toIntOrNull()
+                ?: 0
+            val order = m.groupValues[6].takeIf { it.isNotEmpty() }?.toIntOrNull()
+                ?: (seasons.size + 1)
 
             val nextSeasonStart = seasonsArrayStr.indexOf(
                 "\"slug\":\"", m.range.last
@@ -647,6 +744,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
                     isSpecial = isSpecial,
                     firstEpNumber = firstEpNumber,
                     episodeNumbers = episodeNumbers,
+                    order = order,
                 )
             )
         }
@@ -3316,6 +3414,7 @@ var emitted = false
         val isSpecial: Boolean = false,
         val firstEpNumber: Int = 0,
         val episodeNumbers: List<Int> = emptyList(),
+        val order: Int = 0, // v22: orden real en la web
     )
 
     private data class MovieSource(

@@ -182,32 +182,70 @@ class DonghuaLifeProvider : MainAPI() {
             else -> null
         }
 
+        // ===== Metadatos (v22): puntuación, año, duración y título original =====
+        val score = parseDonghuaLifeScore(doc)
+        val year = doc.selectFirst(".fecha .field--name-field-fecha-de-emision time.datetime")?.attr("datetime")
+            ?.takeIf { it.length >= 4 }?.substring(0, 4)?.toIntOrNull()
+        val durationMinutes = doc.selectFirst(".duracion .field--name-field-duracion")?.text()
+            ?.let { parseDurationToMinutes(it) }
+        val originalTitle = doc.selectFirst(".titulo-original .field--name-field-titulo-original")?.text()?.trim() ?: ""
+
+        // ===== Títulos alternativos (v22): primera línea de la descripción =====
+        val plotPrefix = StringBuilder()
+        if (originalTitle.isNotBlank() && !originalTitle.equals(title, ignoreCase = true)) {
+            plotPrefix.append("Títulos alternativos: ").append(originalTitle).append("\n\n")
+        }
+
         val isMovie = seriesUrl.contains("/movie/") || genres.any { it.equals("Película", ignoreCase = true) }
         val tvType = if (isMovie) TvType.AnimeMovie else TvType.Anime
 
         if (isMovie) {
             return newMovieLoadResponse(title, seriesUrl, TvType.AnimeMovie, seriesUrl) {
                 posterUrl = poster
-                plot = description
+                plot = plotPrefix.toString() + description
                 tags = genres
+                this.score = Score.from10(score)
+                year?.let { this.year = it }
+                if (durationMinutes != null && durationMinutes > 0) this.duration = durationMinutes
             }
         }
 
+        // ===== Recomendaciones (v22): "Más Populares" del sidebar, sin incluir la propia serie =====
+        val recommendations = extractDonghuaLifeRecommendations(doc, seriesUrl)
+
         val episodes = ArrayList<Episode>()
+        val seasonNames = ArrayList<SeasonData>()
 
-        val seasonLinks = doc.select(".temporada .view-temporadas .views-row .serie .imagen a, .temporada .serie .imagen a")
-            .map { resolveUrl(it.attr("href")) }
+        // FIX v22 TEMPORADAS: usar el orden EXACTO de la web. Las tarjetas de
+        // .temporada .views-row están en orden DOM (Temporada 1, Especial, ...
+        // como en donghualife.com). Cada tarjeta puede ser "Temporada N" o un
+        // "Especial" (badge .especial). Antes se re-numeraba (idx+1) y se
+        // perdía la numeración real mezclando especiales con temporadas.
+        data class DlSeason(val url: String, val name: String, val isSpecial: Boolean)
+        val seasonCards = doc.select(".temporada .views-row").mapNotNull { row ->
+            val a = row.selectFirst(".temporada .serie .imagen a, .serie .imagen a") ?: return@mapNotNull null
+            val href = a.attr("href")
+            if (href.isBlank()) return@mapNotNull null
+            val cardTitle = row.selectFirst(".titulo")?.text()?.trim().orEmpty()
+            val isSpecial = row.selectFirst(".especial") != null ||
+                cardTitle.contains("especial", ignoreCase = true)
+            DlSeason(resolveUrl(href), cardTitle, isSpecial)
+        }
 
-        if (seasonLinks.isNotEmpty()) {
-            seasonLinks.forEachIndexed { idx, seasonUrl ->
-                val seasonDoc = app.get(seasonUrl, timeout = 120).document
-                val seasonTitle = seasonDoc.selectFirst(".titulo .field--name-title")?.text()
-                    ?: seasonDoc.selectFirst(".titulo h2 a span")?.text()
-                    ?: ""
-                val seasonNum = Regex("temporada\\s*(\\d+)", RegexOption.IGNORE_CASE)
-                    .find(seasonTitle)?.destructured?.component1()?.toIntOrNull()
-                    ?: (idx + 1)
+        if (seasonCards.isNotEmpty()) {
+            seasonCards.forEachIndexed { idx, season ->
+                // seasonNum interno único para agrupar episodios; displaySeason=null
+                // hace que CloudStream muestre el nombre tal cual en el selector.
+                val seasonNum = idx + 1
+                val displayName = when {
+                    season.isSpecial && Regex("^especial\\s*\\d*", RegexOption.IGNORE_CASE).containsMatchIn(season.name).not() ->
+                        "ESPECIAL ${idx + 1}-${season.name}" // ej: ESPECIAL 2-THE ORIGIN
+                    season.isSpecial -> "ESPECIAL ${season.name}"
+                    else -> "TEMPORADA ${season.name.substringAfterLast("- ").trim().ifBlank { (idx + 1).toString() }}"
+                }
+                seasonNames.add(SeasonData(season = seasonNum, name = displayName, displaySeason = null))
 
+                val seasonDoc = app.get(season.url, timeout = 120).document
                 extractEpisodesFromSeasonPage(seasonDoc, seasonNum, episodes)
 
                 val lastPageLink = seasonDoc.selectFirst("li.pager__item--last a")
@@ -217,10 +255,10 @@ class DonghuaLifeProvider : MainAPI() {
 
                 for (pageNum in 1..maxPage) {
                     try {
-                        val pageUrl = if (seasonUrl.contains("?")) {
-                            "$seasonUrl&page=$pageNum"
+                        val pageUrl = if (season.url.contains("?")) {
+                            "${season.url}&page=$pageNum"
                         } else {
-                            "$seasonUrl?page=$pageNum"
+                            "${season.url}?page=$pageNum"
                         }
                         val pageDoc = app.get(pageUrl, timeout = 120).document
                         extractEpisodesFromSeasonPage(pageDoc, seasonNum, episodes)
@@ -269,10 +307,52 @@ class DonghuaLifeProvider : MainAPI() {
         return newAnimeLoadResponse(title, seriesUrl, tvType) {
             posterUrl = poster
             addEpisodes(DubStatus.Subbed, episodes.sortedWith(compareBy({ it.season }, { it.episode })))
+            if (seasonNames.isNotEmpty()) addSeasonNames(seasonNames)
             showStatus = status
-            plot = description
+            plot = plotPrefix.toString() + description
             tags = genres
+            this.score = Score.from10(score)
+            year?.let { this.year = it }
+            if (durationMinutes != null && durationMinutes > 0) this.duration = durationMinutes
+            this.recommendations = recommendations
         }
+    }
+
+    /** v22: Puntuación del fivestar de Drupal (opción seleccionada, 0-100) → valor 0-10. */
+    private fun parseDonghuaLifeScore(doc: org.jsoup.nodes.Document): Double? {
+        val percent = doc.selectFirst(".calificacion select.vote option[selected=selected]")?.attr("value")
+            ?.toIntOrNull() ?: return null
+        if (percent <= 0) return null
+        return percent / 10.0
+    }
+
+    /** v22: Convierte textos tipo "15 min", "20 min", "1 h 20 min" a minutos. */
+    private fun parseDurationToMinutes(text: String): Int? {
+        val t = text.trim().lowercase()
+        var minutes = 0
+        Regex("(\\d+)\\s*h").find(t)?.destructured?.component1()?.toIntOrNull()?.let { minutes += it * 60 }
+        Regex("(\\d+)\\s*m").find(t)?.destructured?.component1()?.toIntOrNull()?.let { minutes += it }
+        if (minutes > 0) return minutes
+        return Regex("(\\d+)").find(t)?.destructured?.component1()?.toIntOrNull()
+    }
+
+    /** v22: Extrae la lista "Más Populares" del sidebar como recomendaciones. */
+    private fun extractDonghuaLifeRecommendations(doc: org.jsoup.nodes.Document, seriesUrl: String): List<SearchResponse> {
+        val results = ArrayList<SearchResponse>()
+        val seen = HashSet<String>()
+        doc.select(".view-mas-populares .views-row").forEach { row ->
+            val a = row.selectFirst(".serie .imagen a") ?: return@forEach
+            val href = resolveUrl(a.attr("href"))
+            if (href == seriesUrl || !seen.add(href)) return@forEach
+            val recTitle = row.selectFirst(".titulo a")?.text()?.trim()
+                ?: row.selectFirst(".titulo")?.text()?.trim()
+                ?: return@forEach
+            val recPoster = row.selectFirst("img")?.attr("src")
+            results.add(newAnimeSearchResponse(recTitle, href) {
+                this.posterUrl = resolveUrl(recPoster ?: "")
+            })
+        }
+        return results
     }
 
     private fun extractEpisodesFromSeasonPage(
@@ -285,12 +365,15 @@ class DonghuaLifeProvider : MainAPI() {
             val epLink = row.selectFirst("td a[href^=\"/episode/\"]")?.attr("href")
                 ?: row.selectFirst("td a[href]")?.attr("href")
             val isVip = row.selectFirst("td")?.text()?.contains("VIP") == true
+            // v22: fecha de emisión del episodio (columna "Fecha de Emisión")
+            val epDate = row.selectFirst("time.datetime")?.attr("datetime")
 
             if (epLink != null && !isVip) {
                 episodes.add(
                     newEpisode(resolveUrl(epLink)) {
                         this.season = seasonNum
                         this.episode = epNum
+                        addDate(epDate)
                     }
                 )
             }

@@ -178,6 +178,12 @@ class SeriesDonghuaProvider : MainAPI() {
             else -> TvType.Anime
         }
 
+        // ===== v22 Recomendaciones =====
+        // El sitio no tiene bloque de relacionados en la ficha; se usa la lista
+        // "Nuevos Episodios" del home (títulos con episodio reciente) como sección
+        // de recomendaciones, excluyendo la propia serie.
+        val recommendations = fetchSeriesDonghuaRecommendations(seriesUrl)
+
         val episodes = ArrayList<Episode>()
         doc.select("div.donghua-list-scroll ul.donghua-list a, ul.donghua-list a").map { epLink ->
             val href = epLink.attr("href")
@@ -196,6 +202,7 @@ class SeriesDonghuaProvider : MainAPI() {
         if (episodes.isEmpty() && tvType == TvType.AnimeMovie) {
             return newMovieLoadResponse(title, seriesUrl, TvType.AnimeMovie, seriesUrl) {
                 posterUrl = poster; plot = description; tags = genres
+                if (recommendations.isNotEmpty()) this.recommendations = recommendations
             }
         }
 
@@ -203,6 +210,35 @@ class SeriesDonghuaProvider : MainAPI() {
             posterUrl = poster
             addEpisodes(DubStatus.Subbed, episodes.sortedBy { it.episode })
             showStatus = status; plot = description; tags = genres
+            if (recommendations.isNotEmpty()) this.recommendations = recommendations
+        }
+    }
+
+    /**
+     * v22: recomendaciones basadas en los "Nuevos Episodios" del home.
+     * El sitio no publica puntuación ni fecha de emisión por serie/episodio
+     * (el campo de fecha de cada episodio llega vacío en el HTML), por lo que no
+     * se pueden añadir esos metadatos aquí.
+     */
+    private suspend fun fetchSeriesDonghuaRecommendations(seriesUrl: String): List<SearchResponse> {
+        return try {
+            val homeDoc = app.get("$mainUrl/", timeout = 120L).document
+            val seen = HashSet<String>()
+            val recs = ArrayList<SearchResponse>()
+            homeDoc.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").forEach { link ->
+                val href = link.attr("href")
+                if (href.contains("episodio")) return@forEach
+                val fullHref = resolveUrl(href)
+                if (fullHref == seriesUrl || !seen.add(fullHref)) return@forEach
+                val recTitle = link.selectFirst("h5")?.text()?.trim() ?: return@forEach
+                val poster = link.selectFirst("div.img img")?.attr("src")
+                recs.add(newAnimeSearchResponse(recTitle, fullHref) {
+                    this.posterUrl = resolveUrl(poster ?: "")
+                })
+            }
+            recs.take(16)
+        } catch (_: Exception) {
+            emptyList()
         }
     }
 

@@ -8,6 +8,8 @@ import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import java.util.*
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlin.collections.ArrayList
 
 class AnimeGratisProvider : MainAPI() {
@@ -27,6 +29,9 @@ class AnimeGratisProvider : MainAPI() {
     override val mainPage = mainPageOf(
         "$mainUrl/" to "Nuevos Episodios",
         "$mainUrl/donghua" to "Donghuas",
+        // v22: nuevas secciones del Home (filtros del catálogo /donghua)
+        "$mainUrl/donghua?q=&status=En+emisi%C3%B3n&genre=&year=&sort=year" to "En Emisión",
+        "$mainUrl/donghua?q=&status=Finalizado&genre=&year=&sort=year" to "Finalizados",
         "$mainUrl/directorio" to "Directorio Anime",
     )
 
@@ -102,13 +107,21 @@ class AnimeGratisProvider : MainAPI() {
         val genre: Any? = null,
         val numberOfEpisodes: Int? = null,
         val url: String? = null,
+        val alternateName: Any? = null, // v22: título alternativo
+        val startDate: String? = null,  // v22: fecha de emisión
     )
 
     // ========== getMainPage ==========
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val isHomePage = request.data == "$mainUrl/"
         val isDonghua = request.data == "$mainUrl/donghua"
-        val url = if (page > 1) "${request.data}?page=$page" else request.data
+        val isFiltered = request.data.contains("/donghua?") // v22: En Emisión / Finalizados
+        val url = when {
+            // Los filtros del catálogo ya traen query propio; paginar con &page=N
+            isFiltered && page > 1 -> "${request.data}&page=$page"
+            page > 1 -> "${request.data}?page=$page"
+            else -> request.data
+        }
 
         val doc = app.get(url, headers = headers, timeout = 30L).document
 
@@ -116,7 +129,7 @@ class AnimeGratisProvider : MainAPI() {
             isHomePage -> {
                 parseHomePageCards(doc)
             }
-            isDonghua -> {
+            isDonghua || isFiltered -> {
                 parseDonghuaCards(doc)
             }
             else -> {
@@ -389,6 +402,8 @@ class AnimeGratisProvider : MainAPI() {
         var jsonLdEpCount: Int? = null
         var jsonLdType: String? = null  // "TVSeries" or "Movie"
         var jsonLdUrl: String? = null
+        var jsonLdAltName: String? = null // v22
+        var jsonLdStartDate: String? = null // v22
 
         doc.select("script[type=application/ld+json]").forEach { script ->
             try {
@@ -415,6 +430,13 @@ class AnimeGratisProvider : MainAPI() {
                         jsonStr.contains("\"@type\":\"TVSeries\"") || jsonStr.contains("\"@type\": \"TVSeries\"") -> "TVSeries"
                         else -> null
                     }
+                    // v22: título alternativo (String o lista)
+                    jsonLdAltName = when (val alt = jsonLd.alternateName) {
+                        is String -> alt
+                        is List<*> -> alt.filterIsInstance<String>().joinToString(", ")
+                        else -> null
+                    }
+                    jsonLdStartDate = jsonLd.startDate
                 }
             } catch (_: Exception) {}
         }
@@ -439,12 +461,43 @@ class AnimeGratisProvider : MainAPI() {
             else -> null
         }
 
+        // ===== v22 Metadatos adicionales de la ficha =====
+        // Tipo/Título alternativo/año/duración vienen en el panel de metadatos:
+        //   <span>📅 2026</span> <span>🎯 En emisión</span> <span>📺 Donghua</span>
+        //   ... <div class="text-xs text-slate-300">Duración</div><div ...>27 min por episodio</div>
+        //   <p class="text-white/40 text-xs mt-1">También conocido como: 镖人 贰</p>
+        val metaSpans = doc.select("span").map { it.text().trim() }
+        val yearSpan = metaSpans.firstOrNull { Regex("""^📅\s*(\d{4})$""").matches(it) }
+        val yearInt = yearSpan?.let { Regex("(\\d{4})").find(it)?.destructured?.component1()?.toIntOrNull() }
+            ?: jsonLdStartDate?.takeIf { it.isNotBlank() }?.take(4)?.toIntOrNull()
+        val durationText = doc.select("div").firstOrNull { el ->
+            el.selectFirst("span") != null && el.text().trim() == "Duración"
+        }?.nextElementSibling()?.text()?.trim()
+            ?: run {
+                val durLabel = doc.select("div.text-xs.text-slate-300").firstOrNull { it.text().trim() == "Duración" }
+                durLabel?.nextElementSibling()?.text()?.trim()
+            }
+        val durationMinutes = durationText?.let { parseAgDuration(it) }
+        val altTitle = jsonLdAltName
+            ?: doc.selectFirst("p.text-white\\/40")?.text()
+                ?.takeIf { it.contains("conocido como", ignoreCase = true) }
+                ?.substringAfter(":")?.trim()
+            ?: ""
+        // Título alternativo en la primera línea de la descripción
+        val plotPrefix = if (altTitle.isNotBlank() && !altTitle.equals(title, ignoreCase = true)) {
+            "Títulos alternativos: $altTitle\n\n"
+        } else ""
+        val fullPlot = plotPrefix + description
+
         // FIX: Determinar tipo usando JSON-LD type Y contenido de la página
         // Verificar si hay sección de película (#ver-pelicula)
         val hasMovieSection = doc.selectFirst("#ver-pelicula") != null
         val typeText = doc.select("span").map { it.text() }.find {
             it.contains("Serie") || it.contains("OVA") || it.contains("ONA") || it.contains("Película") || it.contains("Especial") || it.contains("Movie")
         }
+        val typeBadge = doc.select("span").map { it.text() }.firstOrNull {
+            it.contains("📺") || it.contains("Donghua") || it.contains("Anime")
+        } ?: ""
         val tvType = when {
             hasMovieSection || jsonLdType == "Movie" -> TvType.AnimeMovie
             typeText?.contains(Regex("Película|Movie")) == true -> TvType.AnimeMovie
@@ -453,6 +506,22 @@ class AnimeGratisProvider : MainAPI() {
         }
 
         val episodes = ArrayList<Episode>()
+
+        // v22: fechas de publicación de los episodios. El grid del sitio no las
+        // muestra, pero cada página de episodio tiene "datePublished" en su
+        // ld+json (verificado: 2026-07-08 18:01:35). Se consultan en paralelo con
+        // un límite para no hacer una request por episodio en series largas.
+        suspend fun fetchEpisodeDate(epUrl: String): String? {
+            return try {
+                val epDoc = app.get(epUrl, headers = headers, timeout = 20L).document
+                epDoc.select("script[type=application/ld+json]")
+                    .map { it.data() }
+                    .firstOrNull { it.contains("datePublished") }
+                    ?.let { Regex(""""datePublished"\s*:\s*"([^"]+)""").find(it)?.destructured?.component1() }
+            } catch (_: Exception) {
+                null
+            }
+        }
 
         if (tvType == TvType.AnimeMovie && doc.selectFirst("#dh-episodes-grid") == null && doc.selectFirst("#episodes-grid") == null) {
             // Es una película sin grid de episodios
@@ -548,15 +617,54 @@ class AnimeGratisProvider : MainAPI() {
         // Si aún no hay episodios y es película
         if (episodes.isEmpty() && tvType == TvType.AnimeMovie) {
             return newMovieLoadResponse(title, url, TvType.AnimeMovie, url) {
-                posterUrl = poster; plot = description; tags = genres
+                posterUrl = poster; plot = fullPlot; tags = genres
+                yearInt?.let { this.year = it }
+                if (durationMinutes != null && durationMinutes > 0) this.duration = durationMinutes
             }
         }
 
+        // v22: agregar fechas de publicación a los episodios (máx 40 primeras para
+        // no hacer demasiadas requests; el resto queda sin fecha)
+        val sortedEpisodes = episodes.sortedBy { it.episode }
+        val dateMap = kotlinx.coroutines.coroutineScope {
+            sortedEpisodes.take(40).map { ep ->
+                async {
+                    ep.data to fetchEpisodeDate(ep.data)
+                }
+            }.associate { it.await() }
+        }
+        for (ep in sortedEpisodes) {
+            dateMap[ep.data]?.let { ep.addDate(it, "yyyy-MM-dd") }
+        }
+
+        // v22: recomendaciones — "Donghua similares que podrían gustarte"
+        val recommendations = doc.select(
+            "h2:contains(similares) ~ div a[href^=/donghua/], h2:contains(similares) ~ * a[href^=/donghua/]"
+        ).mapNotNull { link ->
+            val href = link.attr("href")
+            if (href.contains("episodio") || href == url) return@mapNotNull null
+            val recTitle = link.selectFirst("img")?.attr("alt")?.trim() ?: return@mapNotNull null
+            if (recTitle.isBlank()) return@mapNotNull null
+            val recPoster = link.selectFirst("img").bestImageUrl()
+            newAnimeSearchResponse(recTitle, resolveUrl(href)) {
+                this.posterUrl = resolveUrl(recPoster)
+            }
+        }.take(12)
+
         return newAnimeLoadResponse(title, url, tvType) {
             posterUrl = poster
-            addEpisodes(DubStatus.Subbed, episodes.sortedBy { it.episode })
-            showStatus = status; plot = description; tags = genres
+            addEpisodes(DubStatus.Subbed, sortedEpisodes)
+            showStatus = status; plot = fullPlot; tags = genres
+            yearInt?.let { this.year = it }
+            if (durationMinutes != null && durationMinutes > 0) this.duration = durationMinutes
+            if (recommendations.isNotEmpty()) this.recommendations = recommendations
         }
+    }
+
+    /** v22: convierte "27 min por episodio", "24 min", "Desconocida" a minutos. */
+    private fun parseAgDuration(text: String): Int? {
+        if (text.contains("Desconocida", ignoreCase = true)) return null
+        return Regex("(\\d+)").find(text)?.destructured?.component1()?.toIntOrNull()
     }
 
     /**
