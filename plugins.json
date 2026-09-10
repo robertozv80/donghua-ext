@@ -9,7 +9,7 @@
       "robertozv80"
     ],
     "description": "AnimeGratis - Anime y donghua en espa\u00f1ol gratis",
-    "fileSize": 50256,
+    "fileSize": 58569,
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
     "language": "es",
     "tvTypes": [
@@ -17,7 +17,7 @@
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=animegratis.net&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-d5ab2e0070a2f041ae8d3f0bc6280b425e72528576fd4fa64bcb4d6a40bb4fce"
+    "fileHash": "sha256-0e950b335b609cbc7d7aceaf2b52c74aed76e950cb576f8ab868268732995b7c"
   },
   {
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/DonghuaLifeBetaProvider.cs3",
@@ -29,7 +29,7 @@
       "robertozv80"
     ],
     "description": "DonghuaLifeBETA - Donghuas en espa\u00f1ol con subt\u00edtulos",
-    "fileSize": 162245,
+    "fileSize": 164451,
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
     "language": "es",
     "tvTypes": [
@@ -37,7 +37,7 @@
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=donghualife.com&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-958d2c8aea3e71f5e12a0911f4ab638a36f036664aa2a586a600c92707534591"
+    "fileHash": "sha256-38da20bfd9c83b17bf19961ee2b811e192056b81da1c60f8cea292a91e9237fb"
   },
   {
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/DonghuaLifeProvider.cs3",
@@ -49,7 +49,7 @@
       "robertozv80"
     ],
     "description": "DonghuaLife - Donghuas en espa\u00f1ol con subt\u00edtulos",
-    "fileSize": 73786,
+    "fileSize": 79960,
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
     "language": "es",
     "tvTypes": [
@@ -57,7 +57,7 @@
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=donghualife.com&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-101c903410337923853e3b48b110ed00a1a3d652bd1b808b11f640ec9d2ed526"
+    "fileHash": "sha256-14b64f0482e65a48c1de89e4f3ee33480456e238d0669fe99bb6dcf50ebd3d72"
   },
   {
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/DonghuaWorldProvider.cs3",
@@ -68,10 +68,10 @@
     "authors": [
       "robertozv80"
     ],
-    "fileSize": 31418,
+    "fileSize": 33143,
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
     "apiVersion": 1,
-    "fileHash": "sha256-24b4f036f920f76d6753f486f3051bb18ab97675f8d93451dd15cfdcb86148b4"
+    "fileHash": "sha256-40a43824b819f8c16190214340a849922413c89026625a9ae7cd1b74eafa66cc"
   },
   {
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/MundoDonghuaProvider.cs3",
@@ -83,7 +83,7 @@
       "robertozv80"
     ],
     "description": "MundoDonghua - Donghuas y anime chino en espa\u00f1ol",
-    "fileSize": 48749,
+    "fileSize": 47254,
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
     "language": "es",
     "tvTypes": [
@@ -91,7 +91,7 @@
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=mundodonghua.com&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-9d28d8993594ceac25243efcbaa2b56bf3c2cf5e7cbf0ca658f58a8475b35174"
+    "fileHash": "sha256-ec069c2d77d2bbf4fbf0e498a437f4bd66ac3758d78eef45ffc2b1e32d7aa78f"
   },
   {
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/SeriesDonghuaProvider.cs3",
@@ -103,7 +103,7 @@
       "robertozv80"
     ],
     "description": "SeriesDonghua - Donghuas y anime chino en espa\u00f1ol",
-    "fileSize": 50704,
+    "fileSize": 52275,
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
     "language": "es",
     "tvTypes": [
@@ -111,6 +111,6 @@
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=seriesdonghua.com&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-78573fb0aa43f337174dca6e4e3026172884957fe5329a6fb2ff389bc2fdec14"
+    "fileHash": "sha256-2980e69f66ccd7dae4b35795db0dcc0c4f882d3e864cf3167aeb35a19abacf2b"
   }
 ]
