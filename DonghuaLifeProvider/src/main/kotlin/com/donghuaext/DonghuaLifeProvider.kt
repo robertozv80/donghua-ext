@@ -211,7 +211,7 @@ class DonghuaLifeProvider : MainAPI() {
         }
 
         // ===== Recomendaciones (v22): "Más Populares" del sidebar, sin incluir la propia serie =====
-        val recommendations = extractDonghuaLifeRecommendations(doc, seriesUrl)
+        val recommendations = extractDonghuaLifeRecommendations(doc, seriesUrl, title)
 
         val episodes = ArrayList<Episode>()
         val seasonNames = ArrayList<SeasonData>()
@@ -341,23 +341,64 @@ class DonghuaLifeProvider : MainAPI() {
      * NOTA del usuario: mezclar en orden aleatorio y devolver máximo 10 para que
      * no salgan siempre las mismas.
      */
-    private fun extractDonghuaLifeRecommendations(doc: org.jsoup.nodes.Document, seriesUrl: String): List<SearchResponse> {
-        val results = ArrayList<SearchResponse>()
-        val seen = HashSet<String>()
-        doc.select(".view-mas-populares .views-row").forEach { row ->
-            val a = row.selectFirst(".serie .imagen a") ?: return@forEach
-            val href = resolveUrl(a.attr("href"))
-            if (href == seriesUrl || !seen.add(href)) return@forEach
-            val recTitle = row.selectFirst(".titulo a")?.text()?.trim()
-                ?: row.selectFirst(".titulo")?.text()?.trim()
-                ?: return@forEach
-            val recPoster = row.selectFirst("img")?.attr("src")
-            results.add(newAnimeSearchResponse(recTitle, href) {
-                this.posterUrl = resolveUrl(recPoster ?: "")
-            })
+    /**
+     * v22.3: recomendaciones con la NOTA del usuario:
+     * 1) título base (sin "temp N" / "latino" etc.) -> resultados del buscador
+     *    interno cuyo título comparte el mismo nombre parcial (otras temporadas);
+     * 2) el resto: similares aleatorios de la sección "Más Populares".
+     * Máximo 10 resultados.
+     */
+    private suspend fun extractDonghuaLifeRecommendations(
+        doc: org.jsoup.nodes.Document,
+        seriesUrl: String,
+        seriesTitle: String
+    ): List<SearchResponse> {
+        return try {
+            val results = ArrayList<SearchResponse>()
+            val seen = HashSet<String>().apply { add(seriesUrl) }
+
+            // 1) Otras temporadas con el mismo nombre parcial (buscador interno)
+            val base = seriesTitle.lowercase()
+                .replace(Regex("\\btemp(orada)?\\s*\\d+\\b", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("\\b(latino|castellano|doblada|subtitulada)\\b", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("\\s+-\\s+.*$"), "")
+                .trim()
+            if (base.isNotBlank()) {
+                val q = java.net.URLEncoder.encode(base, "UTF-8")
+                val searchDoc = app.get("$mainUrl/search?search_api_fulltext=$q", timeout = 120).document
+                val searchContainer = searchDoc.selectFirst("div.region-content") ?: searchDoc
+                searchContainer.select(".views-row .serie").forEach {
+                    val title = it.selectFirst(".titulo")?.text()?.trim() ?: return@forEach
+                    val href = it.selectFirst(".imagen a")?.attr("href") ?: return@forEach
+                    val full = resolveUrl(href)
+                    if (full in seen || !title.lowercase().contains(base)) return@forEach
+                    seen.add(full)
+                    results.add(newAnimeSearchResponse(title, full) {
+                        this.posterUrl = resolveUrl(it.selectFirst(".imagen img")?.attr("src") ?: "")
+                    })
+                }
+            }
+
+            // 2) Similares aleatorios de "Más Populares"
+            val pool = ArrayList<SearchResponse>()
+            doc.select(".view-mas-populares .views-row").forEach { row ->
+                val a = row.selectFirst(".serie .imagen a") ?: return@forEach
+                val href = resolveUrl(a.attr("href"))
+                if (href in seen || !seen.add(href)) return@forEach
+                val recTitle = row.selectFirst(".titulo a")?.text()?.trim()
+                    ?: row.selectFirst(".titulo")?.text()?.trim()
+                    ?: return@forEach
+                val recPoster = row.selectFirst("img")?.attr("src")
+                pool.add(newAnimeSearchResponse(recTitle, href) {
+                    this.posterUrl = resolveUrl(recPoster ?: "")
+                })
+            }
+            pool.shuffle()
+            results.addAll(pool)
+            results.take(10)
+        } catch (_: Exception) {
+            emptyList()
         }
-        results.shuffle()
-        return results.take(10)
     }
 
     private fun extractEpisodesFromSeasonPage(

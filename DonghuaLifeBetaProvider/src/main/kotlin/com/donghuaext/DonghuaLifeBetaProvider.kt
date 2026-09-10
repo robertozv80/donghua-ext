@@ -356,9 +356,14 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 // "9796b713-...-temporada-1"), /series/<slug> responde "Serie no encontrada".
                 // En ese caso usar la propia página watch, que contiene la lista completa.
                 val probe = try { app.get(candidate, timeout = 30) } catch (_: Exception) { null }
-                if (probe != null && probe.isSuccessful &&
+                // v22.3 FIX: el payload RSC trae "seasons" ESCAPADO (\"seasons\"); antes el
+                // probe solo buscaba la forma literal y siempre fallaba -> al entrar desde
+                // "Últimos Episodios" se parseaba la página watch del EPISODIO (pocos
+                // episodios, sin descripción) en lugar de la página de la serie.
+                val probeOk = probe != null && probe.isSuccessful &&
                     !probe.text.contains("no encontrada", ignoreCase = true) &&
-                    probe.text.contains("\"seasons\":")) {
+                    (probe.text.contains("\"seasons\":") || probe.text.contains("\\\"seasons\\\":"))
+                if (probeOk) {
                     candidate
                 } else {
                     url

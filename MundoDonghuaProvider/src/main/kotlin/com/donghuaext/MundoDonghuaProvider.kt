@@ -436,12 +436,17 @@ class MundoDonghuaProvider : MainAPI() {
         for (script in doc.select("script")) {
             val scriptData = script.data()
             if (scriptData.contains("eval(function(p,a,c,k,e")) {
-                val packedChunks = scriptData.split(",0,{}))")
-                    .filter { it.contains("eval(function(p,a,c,k,e") }
-                for (chunk in packedChunks) {
-                    val packed = Regex("eval\\(function\\(p,a,c,k,e,.*").find(chunk)?.value ?: continue
+                // FIX v22.3: cada eval() es una LÍNEA completa del script. El regex
+                // interno de getAndUnpack es eval\(function\(p,a,c,k,e,.*\)\) y REQUIERE
+                // el terminador "))"; el split anterior por ",0,{}))" lo eliminaba y
+                // getAndUnpack devolvía el string aún empaquetado -> 0 enlaces.
+                // Ahora se captura cada línea completa conservando su terminador.
+                val packedList = Regex("eval\\(function\\(p,a,c,k,e,[^\\r\\n]+")
+                    .findAll(scriptData).map { it.value }.toList()
+                for (packed in packedList) {
                     try {
-                        val unpack = getAndUnpack(packed) ?: continue
+                        val unpack = getAndUnpack(packed)
+                        if (unpack.isNullOrEmpty() || unpack.contains("eval(function(p,a,c,k,e")) continue
 
                         // ===== Asura (HLS m3u8) - Servidor principal sin anuncios =====
                         if (unpack.contains("asura_player") || unpack.contains("redirector")) {

@@ -181,7 +181,8 @@ class SeriesDonghuaProvider : MainAPI() {
         // ===== v22.2 Recomendaciones =====
         // NOTA del usuario: primero otras temporadas del mismo nombre, luego
         // similares aleatorios (máx 10).
-        val recommendations = fetchSeriesDonghuaRecommendations(seriesUrl, title)
+        val genreHrefs = doc.select("a.generos").map { it.attr("href") }
+        val recommendations = fetchSeriesDonghuaRecommendations(seriesUrl, title, genreHrefs)
 
         val episodes = ArrayList<Episode>()
         doc.select("div.donghua-list-scroll ul.donghua-list a, ul.donghua-list a").map { epLink ->
@@ -225,7 +226,11 @@ class SeriesDonghuaProvider : MainAPI() {
      * 2) El resto: títulos del home (aleatorio). Máximo 10 resultados.
      * Si no hay temporadas del mismo nombre, solo similares aleatorios.
      */
-    private suspend fun fetchSeriesDonghuaRecommendations(seriesUrl: String, seriesTitle: String): List<SearchResponse> {
+    private suspend fun fetchSeriesDonghuaRecommendations(
+        seriesUrl: String,
+        seriesTitle: String,
+        genreHrefs: List<String> = emptyList()
+    ): List<SearchResponse> {
         return try {
             val all = ArrayList<SearchResponse>()
             val seen = mutableSetOf(seriesUrl)
@@ -265,8 +270,36 @@ class SeriesDonghuaProvider : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-            // Similares aleatorios desde el home
-            try {
+            // v22.3: similares por CATEGORÍA — elegir un género aleatorio de la ficha
+            // (/lucha/, /artes-marciales/, ...) y tomar títulos de esa página.
+            if (all.size < 10 && genreHrefs.isNotEmpty()) {
+                try {
+                    val genrePath = genreHrefs.random().let {
+                        if (it.startsWith("http")) it.substringAfter(mainUrl, it) else it
+                    }
+                    if (genrePath.isNotBlank() && genrePath != "/") {
+                        val genreDoc = app.get(resolveUrl(genrePath), timeout = 120L).document
+                        val poolG = ArrayList<SearchResponse>()
+                        genreDoc.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").forEach { link ->
+                            if (poolG.size >= 40) return@forEach
+                            val href = link.attr("href")
+                            if (href.contains("episodio")) return@forEach
+                            val fullHref = resolveUrl(href)
+                            if (fullHref in seen) return@forEach
+                            val t = link.selectFirst("h5")?.text()?.trim() ?: return@forEach
+                            seen.add(fullHref)
+                            poolG.add(newAnimeSearchResponse(t, fullHref) {
+                                this.posterUrl = resolveUrl(link.selectFirst("div.img img")?.attr("src") ?: "")
+                            })
+                        }
+                        poolG.shuffle()
+                        all.addAll(poolG)
+                    }
+                } catch (_: Exception) {}
+            }
+
+            // Similares aleatorios desde el home (relleno si la categoría no alcanzó)
+            if (all.size < 10) try {
                 val homeDoc = app.get("$mainUrl/", timeout = 120L).document
                 val pool = ArrayList<SearchResponse>()
                 homeDoc.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").forEach { link ->
