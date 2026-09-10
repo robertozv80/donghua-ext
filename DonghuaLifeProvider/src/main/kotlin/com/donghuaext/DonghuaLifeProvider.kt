@@ -336,7 +336,11 @@ class DonghuaLifeProvider : MainAPI() {
         return Regex("(\\d+)").find(t)?.destructured?.component1()?.toIntOrNull()
     }
 
-    /** v22: Extrae la lista "Más Populares" del sidebar como recomendaciones. */
+    /**
+     * v22.2: Extrae la lista "Más Populares" del sidebar como recomendaciones.
+     * NOTA del usuario: mezclar en orden aleatorio y devolver máximo 10 para que
+     * no salgan siempre las mismas.
+     */
     private fun extractDonghuaLifeRecommendations(doc: org.jsoup.nodes.Document, seriesUrl: String): List<SearchResponse> {
         val results = ArrayList<SearchResponse>()
         val seen = HashSet<String>()
@@ -352,7 +356,8 @@ class DonghuaLifeProvider : MainAPI() {
                 this.posterUrl = resolveUrl(recPoster ?: "")
             })
         }
-        return results
+        results.shuffle()
+        return results.take(10)
     }
 
     private fun extractEpisodesFromSeasonPage(

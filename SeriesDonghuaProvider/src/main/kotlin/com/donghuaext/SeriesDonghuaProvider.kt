@@ -178,11 +178,10 @@ class SeriesDonghuaProvider : MainAPI() {
             else -> TvType.Anime
         }
 
-        // ===== v22 Recomendaciones =====
-        // El sitio no tiene bloque de relacionados en la ficha; se usa la lista
-        // "Nuevos Episodios" del home (títulos con episodio reciente) como sección
-        // de recomendaciones, excluyendo la propia serie.
-        val recommendations = fetchSeriesDonghuaRecommendations(seriesUrl)
+        // ===== v22.2 Recomendaciones =====
+        // NOTA del usuario: primero otras temporadas del mismo nombre, luego
+        // similares aleatorios (máx 10).
+        val recommendations = fetchSeriesDonghuaRecommendations(seriesUrl, title)
 
         val episodes = ArrayList<Episode>()
         doc.select("div.donghua-list-scroll ul.donghua-list a, ul.donghua-list a").map { epLink ->
@@ -214,29 +213,79 @@ class SeriesDonghuaProvider : MainAPI() {
         }
     }
 
+    /** v22.2: normaliza un título para comparar bases (minúsculas, sin acentos). */
+    private fun sdNormalize(t: String): String = java.text.Normalizer.normalize(t.lowercase(), java.text.Normalizer.Form.NFD)
+        .replace(Regex("\\p{Mn}+"), "")
+        .replace(Regex("[^a-z0-9]+"), " ").trim()
+
     /**
-     * v22: recomendaciones basadas en los "Nuevos Episodios" del home.
-     * El sitio no publica puntuación ni fecha de emisión por serie/episodio
-     * (el campo de fecha de cada episodio llega vacío en el HTML), por lo que no
-     * se pueden añadir esos metadatos aquí.
+     * v22.2: recomendaciones con la NOTA del usuario:
+     * 1) Otras temporadas del mismo nombre (misma base de slug, p.ej.
+     *    "jade-dynasty-4" -> base "jade-dynasty") usando el buscador del sitio;
+     * 2) El resto: títulos del home (aleatorio). Máximo 10 resultados.
+     * Si no hay temporadas del mismo nombre, solo similares aleatorios.
      */
-    private suspend fun fetchSeriesDonghuaRecommendations(seriesUrl: String): List<SearchResponse> {
+    private suspend fun fetchSeriesDonghuaRecommendations(seriesUrl: String, seriesTitle: String): List<SearchResponse> {
         return try {
-            val homeDoc = app.get("$mainUrl/", timeout = 120L).document
-            val seen = HashSet<String>()
-            val recs = ArrayList<SearchResponse>()
-            homeDoc.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").forEach { link ->
-                val href = link.attr("href")
-                if (href.contains("episodio")) return@forEach
-                val fullHref = resolveUrl(href)
-                if (fullHref == seriesUrl || !seen.add(fullHref)) return@forEach
-                val recTitle = link.selectFirst("h5")?.text()?.trim() ?: return@forEach
-                val poster = link.selectFirst("div.img img")?.attr("src")
-                recs.add(newAnimeSearchResponse(recTitle, fullHref) {
-                    this.posterUrl = resolveUrl(poster ?: "")
-                })
+            val all = ArrayList<SearchResponse>()
+            val seen = mutableSetOf(seriesUrl)
+
+            // Base del slug: /donghua/jade-dynasty-4 -> "jade-dynasty"
+            val selfSlug = seriesUrl.substringAfterLast("/")
+            val baseSlug = Regex("-\\d+$").replace(selfSlug, "")
+            val norm = sdNormalize(seriesTitle)
+            val baseNorm = Regex("\\s+\\d+$").replace(norm, "").trim()
+
+            if (baseSlug.isNotBlank() && baseSlug != selfSlug || baseNorm.isNotBlank() && baseNorm != norm) {
+                try {
+                    val q = baseNorm.ifBlank { baseSlug.replace("-", " ") }
+                    val searchDoc = app.get(
+                        "$mainUrl/busquedas/${java.net.URLEncoder.encode(q, "UTF-8")}",
+                        timeout = 120L
+                    ).document
+                    val mainContent = searchDoc.selectFirst("div.col-md-9") ?: searchDoc
+                    val seasons = ArrayList<Triple<String, String, String>>() // url, title, poster
+                    mainContent.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").forEach { link ->
+                        val href = link.attr("href")
+                        if (href.contains("episodio")) return@forEach
+                        val fullHref = resolveUrl(href)
+                        if (fullHref in seen) return@forEach
+                        val slug = fullHref.substringAfterLast("/")
+                        val t = link.selectFirst("h5")?.text()?.trim() ?: return@forEach
+                        val isSameBase = slug.startsWith(baseSlug) ||
+                            (baseNorm.isNotBlank() && sdNormalize(t).startsWith(baseNorm))
+                        if (!isSameBase) return@forEach
+                        seen.add(fullHref)
+                        seasons.add(Triple(fullHref, t, link.selectFirst("div.img img")?.attr("src") ?: ""))
+                    }
+                    seasons.sortBy { Regex("(\\d+)$").find(it.first.substringAfterLast("/"))?.groupValues?.get(1)?.toIntOrNull() ?: 0 }
+                    seasons.forEach { (u, t, p) ->
+                        all.add(newAnimeSearchResponse(t, u) { this.posterUrl = resolveUrl(p) })
+                    }
+                } catch (_: Exception) {}
             }
-            recs.take(16)
+
+            // Similares aleatorios desde el home
+            try {
+                val homeDoc = app.get("$mainUrl/", timeout = 120L).document
+                val pool = ArrayList<SearchResponse>()
+                homeDoc.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").forEach { link ->
+                    if (pool.size >= 60) return@forEach
+                    val href = link.attr("href")
+                    if (href.contains("episodio")) return@forEach
+                    val fullHref = resolveUrl(href)
+                    if (fullHref in seen) return@forEach
+                    val recTitle = link.selectFirst("h5")?.text()?.trim() ?: return@forEach
+                    seen.add(fullHref)
+                    val poster = link.selectFirst("div.img img")?.attr("src")
+                    pool.add(newAnimeSearchResponse(recTitle, fullHref) {
+                        this.posterUrl = resolveUrl(poster ?: "")
+                    })
+                }
+                pool.shuffle()
+                all.addAll(pool)
+            } catch (_: Exception) {}
+            all.take(10)
         } catch (_: Exception) {
             emptyList()
         }

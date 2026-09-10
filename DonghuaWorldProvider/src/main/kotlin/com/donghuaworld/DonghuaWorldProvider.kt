@@ -394,8 +394,8 @@ class DonghuaWorldProvider : MainAPI() {
             }
         }
 
-        // ===== v22 Recomendaciones: sección "Recommended Series" de la ficha =====
-        val recommendations = extractDwwRecommendations(document, seriesUrl)
+        // ===== v22.2 Recomendaciones: temporadas del mismo nombre + similares =====
+        val recommendations = extractDwwRecommendations(document, seriesUrl, title)
 
         // Sort episodes by number (ascending)
         val sortedEpisodes = episodes.sortedBy { it.episode ?: 0 }
@@ -427,30 +427,93 @@ class DonghuaWorldProvider : MainAPI() {
         return Regex("""(\d+)\s*min""", RegexOption.IGNORE_CASE).find(t)?.destructured?.component1()?.toIntOrNull()
     }
 
+    /** v22.2: normaliza un slug/título para comparar bases. */
+    private fun dwwNormalize(t: String): String = java.text.Normalizer.normalize(t.lowercase(), java.text.Normalizer.Form.NFD)
+        .replace(Regex("\\p{Mn}+"), "")
+        .replace(Regex("[^a-z0-9]+"), " ").trim()
+
     /**
-     * v22: Extrae la sección "Recommended Series" de la página de detalle.
-     * Las URLs de episodio se pasan tal cual: load() las resuelve vía breadcrumb.
+     * v22.2: recomendaciones con la NOTA del usuario:
+     * 1) Otras temporadas del mismo nombre (misma base de slug, p.ej.
+     *    "jade-dynasty-season-4" -> base "jade-dynasty") usando el buscador ?s=;
+     * 2) El resto: "Recommended Series" de la ficha + resultados del buscador,
+     *    en orden aleatorio. Máximo 10 resultados.
      */
-    private fun extractDwwRecommendations(document: org.jsoup.nodes.Document, seriesUrl: String): List<SearchResponse> {
-        val results = ArrayList<SearchResponse>()
+    private suspend fun extractDwwRecommendations(
+        document: org.jsoup.nodes.Document,
+        seriesUrl: String,
+        seriesTitle: String
+    ): List<SearchResponse> {
+        val all = ArrayList<SearchResponse>()
         val seen = HashSet<String>()
-        // La sección Recommended Series está tras el heading; buscar todos los
-        // articles que aparezcan después de ese texto dentro del contenedor principal.
+        seen.add(seriesUrl)
+
+        // Base del slug: /anime/jade-dynasty-season-4/ -> "jade-dynasty"
+        val selfSlug = seriesUrl.trimEnd('/').substringAfterLast("/")
+        val baseSlug = selfSlug
+            .replace(Regex("-season-\\d+$"), "")
+            .replace(Regex("-\\d+$"), "")
+        val norm = dwwNormalize(seriesTitle)
+        val baseNorm = Regex("\\s+(?:season\\s+)?\\d+$").replace(norm, "").trim()
+
+        // 1) Temporadas del mismo nombre vía buscador
+        val candidatePool = ArrayList<SearchResponse>()
+        if (baseSlug.isNotBlank() && baseSlug != selfSlug) {
+            try {
+                val q = java.net.URLEncoder.encode(baseSlug.replace("-", " "), "UTF-8")
+                val searchDoc = app.get("$mainUrl/?s=$q").document
+                data class SeasonCandidate(val url: String, val response: SearchResponse, val seasonNum: Int)
+                val seasons = ArrayList<SeasonCandidate>()
+                searchDoc.select("article").forEach { art ->
+                    val parsed = parseArticleCard(art) ?: return@forEach
+                    val slug = parsed.url.trimEnd('/').substringAfterLast("/")
+                    if (slug in seen || !slug.startsWith(baseSlug)) return@forEach
+                    seen.add(slug)
+                    val num = Regex("(?:-season)?-(\\d+)$").find(slug)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                    seasons.add(SeasonCandidate(slug, parsed, num))
+                }
+                seasons.sortedBy { it.seasonNum }.forEach { all.add(it.response) }
+            } catch (_: Exception) {}
+        }
+
+        // 2) "Recommended Series" de la ficha (fuente de similares)
         val recommendedAnchor = document.select("h2, h3, .releases h3").firstOrNull {
             it.text().contains("Recommended", ignoreCase = true)
-        } ?: return results
-        var container: org.jsoup.nodes.Element? = recommendedAnchor.parent()
-        while (container != null && container.select("article").isEmpty()) {
-            container = container.nextElementSibling()
         }
-        val articles = container?.select("article") ?: return results
-        for (art in articles) {
-            val parsed = parseArticleCard(art) ?: continue
-            val key = parsed.url
-            if (key == seriesUrl || !seen.add(key)) continue
-            results.add(parsed)
+        if (recommendedAnchor != null) {
+            var container: org.jsoup.nodes.Element? = recommendedAnchor.parent()
+            while (container != null && container.select("article").isEmpty()) {
+                container = container.nextElementSibling()
+            }
+            container?.select("article")?.forEach { art ->
+                val parsed = parseArticleCard(art) ?: return@forEach
+                val key = parsed.url.trimEnd('/').substringAfterLast("/")
+                if (key in seen) return@forEach
+                seen.add(key)
+                candidatePool.add(parsed)
+            }
         }
-        return results.take(16)
+
+        // 3) Si faltan, completar con resultados del buscador que no sean temporadas
+        if (candidatePool.size < 10 && baseSlug.isNotBlank()) {
+            try {
+                val q = java.net.URLEncoder.encode(
+                    (baseNorm.ifBlank { baseSlug.replace("-", " ") }).take(60), "UTF-8"
+                )
+                val searchDoc = app.get("$mainUrl/?s=$q").document
+                searchDoc.select("article").forEach { art ->
+                    if (candidatePool.size >= 40) return@forEach
+                    val parsed = parseArticleCard(art) ?: return@forEach
+                    val slug = parsed.url.trimEnd('/').substringAfterLast("/")
+                    if (slug in seen) return@forEach
+                    seen.add(slug)
+                    candidatePool.add(parsed)
+                }
+            } catch (_: Exception) {}
+        }
+        candidatePool.shuffle()
+        all.addAll(candidatePool)
+        return all.take(10)
     }
 
     /**

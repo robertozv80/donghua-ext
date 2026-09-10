@@ -454,6 +454,9 @@ class DonghuaLifeBetaProvider : MainAPI() {
         // los muestra nativamente con score/year/duration/showStatus.
         val score = parseBetaScore(html, rscPayload)
 
+        // v22.2: recomendaciones (temporadas del mismo nombre + similares aleatorios)
+        val recommendations = fetchBetaRecommendations(seriesUrl, title)
+
         // v22: Título alternativo (Título original / "También conocido como") en la
         // primera línea de la descripción.
         val originalTitle = extractOriginalTitle(html, rscPayload)
@@ -476,6 +479,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 year = yearInt
                 if (durationMinutes > 0) this.duration = durationMinutes
                 this.score = Score.from10(score)
+                if (recommendations.isNotEmpty()) this.recommendations = recommendations
             }
         }
 
@@ -564,6 +568,98 @@ class DonghuaLifeBetaProvider : MainAPI() {
             year = yearInt
             if (durationMinutes > 0) this.duration = durationMinutes
             this.score = Score.from10(score)
+            if (recommendations.isNotEmpty()) this.recommendations = recommendations
+        }
+    }
+
+    /** v22.2: normaliza un título para comparar bases (minúsculas, sin acentos). */
+    private fun betaNormalize(t: String): String = java.text.Normalizer.normalize(t.lowercase(), java.text.Normalizer.Form.NFD)
+        .replace(Regex("\\p{Mn}+"), "")
+        .replace(Regex("[^a-z0-9]+"), " ").trim()
+
+    /**
+     * v22.2: recomendaciones con la NOTA del usuario:
+     * 1) Otras temporadas del mismo nombre (misma base, p.ej. "Jade Dynasty")
+     *    usando el buscador interno del sitio;
+     * 2) El resto: títulos del catálogo (buscador por término), en orden aleatorio.
+     * Máximo 10 resultados. Si no hay temporadas del mismo nombre, solo similares.
+     */
+    private suspend fun fetchBetaRecommendations(seriesUrl: String, seriesTitle: String): List<SearchResponse> {
+        return try {
+            val all = ArrayList<SearchResponse>()
+            val seenSlugs = mutableSetOf(seriesUrl.substringAfterLast("/"))
+
+            val norm = betaNormalize(seriesTitle)
+            val baseNorm = Regex("\\s+\\d+$").replace(norm, "").trim()
+            val baseSlug = baseNorm.replace(" ", "-")
+            val query = if (baseNorm.isNotBlank() && baseNorm != norm) baseNorm else norm.take(15)
+
+            if (query.isNotBlank()) {
+                val encodedQuery = java.net.URLEncoder.encode(query, "UTF-8")
+                val results = ArrayList<SearchResponse>()
+                for (pageType in listOf("series", "peliculas")) {
+                    try {
+                        val pageUrl = "$mainUrl/$pageType?q=$encodedQuery"
+                        val doc = app.get(pageUrl, timeout = 30).document
+                        val selector = if (pageType == "series") "a.poster-card[href^='/series/']" else "a.poster-card[href^='/peliculas/']"
+                        doc.select(selector).forEach { a ->
+                            val href = a.attr("href")
+                            if (href.isBlank()) return@forEach
+                            val slug = href.substringAfterLast("/")
+                            if (slug in seenSlugs) return@forEach
+                            val t = a.selectFirst("img")?.attr("alt")?.trim()
+                                ?: a.selectFirst("p.font-black")?.text()?.trim()
+                                ?: return@forEach
+                            // Para temporadas: exigir la misma base de slug
+                            val isSeason = baseSlug.isNotBlank() &&
+                                (slug.startsWith(baseSlug) || betaNormalize(t).startsWith(baseNorm))
+                            if (baseNorm.isNotBlank() && baseNorm != norm && !isSeason) return@forEach
+                            seenSlugs.add(slug)
+                            val poster = a.selectFirst("img")?.attr("src")?.let { resolveUrl(extractNextImagePath(it)) }
+                            results.add(newAnimeSearchResponse(t, resolveUrl(href)) {
+                                this.posterUrl = poster
+                            })
+                        }
+                    } catch (_: Exception) {}
+                }
+                // Temporadas primero (orden numérico), luego el resto
+                val (seasons, others) = results.partition { rec ->
+                    baseSlug.isNotBlank() && rec.url.substringAfterLast("/").startsWith(baseSlug) &&
+                        rec.url != seriesUrl
+                }
+                seasons.sortedBy { rec ->
+                    Regex("(\\d+)$").find(rec.url.substringAfterLast("/"))?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                }.forEach { all.add(it) }
+                others.forEach { if (all.size < 10) all.add(it) }
+            }
+
+            if (all.size < 10) {
+                try {
+                    val poolUrl = "$mainUrl/series"
+                    val doc = app.get(poolUrl, timeout = 30).document
+                    val pool = ArrayList<SearchResponse>()
+                    doc.select("a.poster-card[href^='/series/']").forEach { a ->
+                        if (pool.size >= 60) return@forEach
+                        val href = a.attr("href")
+                        if (href.isBlank()) return@forEach
+                        val slug = href.substringAfterLast("/")
+                        if (slug in seenSlugs) return@forEach
+                        val t = a.selectFirst("img")?.attr("alt")?.trim()
+                            ?: a.selectFirst("p.font-black")?.text()?.trim()
+                            ?: return@forEach
+                        seenSlugs.add(slug)
+                        val poster = a.selectFirst("img")?.attr("src")?.let { resolveUrl(extractNextImagePath(it)) }
+                        pool.add(newAnimeSearchResponse(t, resolveUrl(href)) {
+                            this.posterUrl = poster
+                        })
+                    }
+                    pool.shuffle()
+                    all.addAll(pool)
+                } catch (_: Exception) {}
+            }
+            all.take(10)
+        } catch (_: Exception) {
+            emptyList()
         }
     }
 

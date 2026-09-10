@@ -7,8 +7,46 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.getAndUnpack
 import com.lagradost.cloudstream3.utils.Qualities
-import kotlinx.coroutines.async
+import com.lagradost.cloudstream3.extractors.StreamWishExtractor
 import kotlin.collections.ArrayList
+
+// v22.2: extractores propios para servidores que CloudStream no trae integrados
+// (vgembed y bysekoze no existen en la lista de extractores del APK).
+// Ambos sitios son variantes de la familia StreamWish/JWPlayer, así que el
+// extractor genérico de StreamWish (unpack + jwplayer setup) funciona para ellos.
+private val mdVgExtractor = object : StreamWishExtractor() {
+    override var name = "Vg"
+    override var mainUrl = "https://vgembed.com"
+}
+
+private val mdFmoonExtractor = object : StreamWishExtractor() {
+    override var name = "Fmoon"
+    override var mainUrl = "https://bysekoze.com"
+}
+
+/**
+ * v22.2: resolver un embed de forma SERIE (como en v21, que reproducía bien).
+ * La carga en paralelo con coroutineScope+async provocó una regresión (ningún
+ * video reproducía), así que cada extractor se ejecuta inmediatamente al
+ * detectarlo, con dedup por URL.
+ */
+private suspend fun mdHandleEmbed(
+    embedUrl: String,
+    seen: MutableSet<String>,
+    referer: String,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+) {
+    if (!seen.add(embedUrl)) return
+    try {
+        when {
+            embedUrl.contains("vgembed.com") -> mdVgExtractor.getUrl(embedUrl, referer, subtitleCallback, callback)
+            embedUrl.contains("bysekoze.com") || embedUrl.contains("filemoon") ->
+                mdFmoonExtractor.getUrl(embedUrl, referer, subtitleCallback, callback)
+            else -> loadExtractor(embedUrl, referer, subtitleCallback, callback)
+        }
+    } catch (_: Exception) {}
+}
 
 // FIX v22.1: embeds conocidos para el fallback de HTML crudo (por si cambia el empaquetado)
 private val MD_RAW_EMBED_REGEXES = listOf(
@@ -215,6 +253,7 @@ class MundoDonghuaProvider : MainAPI() {
         val title = doc.selectFirst("h1.md-detail-title")?.text() ?: ""
         val description = doc.selectFirst("p.md-detail-synopsis")?.text() ?: ""
         val genres = doc.select("a.md-genre-tag").map { it.text() }
+
         val status = when (doc.selectFirst("span.md-emision-badge")?.text()?.trim()) {
             "En Emisión" -> ShowStatus.Ongoing
             "Finalizada" -> ShowStatus.Completed
@@ -244,10 +283,8 @@ class MundoDonghuaProvider : MainAPI() {
         }
 
         // ===== v22 Recomendaciones =====
-        // El sitio no tiene bloque de relacionados en la ficha ni puntuación
-        // numérica; se usa la lista de episodios recientes del home como sección
-        // de recomendaciones, excluyendo la propia serie.
-        val recommendations = fetchMundoRecommendations(donghuaUrl)
+        // (implementadas en fetchMundoRecommendations más abajo)
+        val recommendations = fetchMundoRecommendations(donghuaUrl, title)
 
         // Para películas sin episodios, devolver respuesta de película
         if (episodes.isEmpty() && tvType == TvType.AnimeMovie) {
@@ -287,35 +324,65 @@ class MundoDonghuaProvider : MainAPI() {
     }
 
     /**
-     * v22: recomendaciones desde los "Nuevos Episodios" del home.
-     * El sitio no publica puntuación ni fecha por episodio (no hay campo de
-     * fecha ni en la ficha ni en la página de episodio), así que no se pueden
-     * añadir esos metadatos aquí.
+     * v22.2: recomendaciones con la NOTA del usuario:
+     * 1) primero las otras temporadas de la misma serie (mismo slug base,
+     *    p.ej. "jade-dynasty-4" -> base "jade-dynasty"), en orden numérico;
+     * 2) el resto: títulos del directorio general (aleatorio), excluyendo la
+     *    serie actual y las temporadas ya agregadas. Máximo 10.
      */
-    private suspend fun fetchMundoRecommendations(donghuaUrl: String): List<SearchResponse> {
+    private suspend fun fetchMundoRecommendations(donghuaUrl: String, seriesTitle: String): List<SearchResponse> {
         return try {
-            val homeDoc = app.get("$mainUrl/", timeout = 120).document
-            val seen = HashSet<String>()
-            val recs = ArrayList<SearchResponse>()
-            val cards = homeDoc.select("div#nuevos-episodios-grid div.md-card").ifEmpty {
-                homeDoc.select("div.md-card")
-            }
-            cards.forEach { card ->
-                val href = card.selectFirst("a")?.attr("href") ?: return@forEach
-                val seriesHref = if (href.contains("/ver/")) {
-                    val slug = Regex("/ver/([^/]+)").find(href)?.destructured?.component1() ?: return@forEach
-                    "$mainUrl/donghua/$slug"
-                } else {
-                    resolveUrl(href)
+            val all = ArrayList<SearchResponse>()
+
+            // 1) Otras temporadas: el listado completo vive en lista-donghuas
+            val baseSlug = donghuaUrl.substringAfterLast("/").substringBeforeLast("-")
+            val baseLower = Regex("\\d+$").replace(baseSlug, "").trimEnd('-')
+            if (baseLower.isNotBlank()) {
+                val listing = app.get("$mainUrl/lista-donghuas", timeout = 120).document
+                val seenSeasons = HashSet<String>()
+                listing.select("a[href*='/donghua/$baseLower']").forEach { a ->
+                    val href = a.attr("href")
+                    val slug = href.substringAfterLast("/")
+                    if (slug in seenSeasons || "$mainUrl/donghua/$slug" == donghuaUrl) return@forEach
+                    val card = a.closest("div.md-card") ?: a
+                    val t = card.selectFirst("h3.md-card-title")?.text()?.trim()
+                        ?: card.selectFirst("h5.md-card-title")?.text()?.trim()
+                        ?: a.attr("title").ifBlank { slug }
+                    seenSeasons.add(slug)
+                    val poster = card.selectFirst("div.md-card-img img")?.let { getBestImgSrc(it) }
+                    all.add(newAnimeSearchResponse(t, "$mainUrl/donghua/$slug") {
+                        this.posterUrl = resolveUrl(poster ?: "")
+                    })
                 }
-                if (seriesHref == donghuaUrl || !seen.add(seriesHref)) return@forEach
-                val recTitle = card.selectFirst("h3.md-card-title")?.text()?.trim() ?: return@forEach
+                // Ordenar por el número de temporada dentro del slug
+                all.sortBy { rec ->
+                    Regex("(\\d+)$").find(rec.url.substringAfterLast("/"))?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                }
+            }
+
+            // 2) Similares aleatorios del directorio general
+            val seen = all.mapTo(HashSet()) { it.url }
+            seen.add(donghuaUrl)
+            val pool = ArrayList<SearchResponse>()
+            val listing = app.get("$mainUrl/lista-donghuas", timeout = 120).document
+            listing.select("div.md-card").forEach { card ->
+                if (pool.size >= 40) return@forEach
+                val a = card.selectFirst("a[href*='/donghua/']") ?: return@forEach
+                val href = a.attr("href")
+                val fullUrl = resolveUrl(href)
+                if (fullUrl in seen) return@forEach
+                val t = card.selectFirst("h3.md-card-title")?.text()?.trim()
+                    ?: card.selectFirst("h5.md-card-title")?.text()?.trim()
+                    ?: return@forEach
                 val poster = card.selectFirst("div.md-card-img img")?.let { getBestImgSrc(it) }
-                recs.add(newAnimeSearchResponse(recTitle, seriesHref) {
+                seen.add(fullUrl)
+                pool.add(newAnimeSearchResponse(t, fullUrl) {
                     this.posterUrl = resolveUrl(poster ?: "")
                 })
             }
-            recs.take(16)
+            pool.shuffle()
+            all.addAll(pool)
+            all.take(10)
         } catch (_: Exception) {
             emptyList()
         }
@@ -486,9 +553,7 @@ class MundoDonghuaProvider : MainAPI() {
                                 } else {
                                     "https://bysekoze.com/e/${fmMatch.destructured.component1()}"
                                 }
-                                try {
-                                    seenEmbeds.add(fmUrl)
-                                } catch (_: Exception) {}
+                                mdHandleEmbed(fmUrl, seenEmbeds, data, subtitleCallback, callback)
                                 break
                             }
                         }
@@ -497,9 +562,7 @@ class MundoDonghuaProvider : MainAPI() {
                         val voeRegex = Regex("voe\\.sx/e/([a-zA-Z0-9]+)")
                         val voeId = voeRegex.find(unpack)?.destructured?.component1()
                         if (!voeId.isNullOrEmpty()) {
-                            try {
-                                seenEmbeds.add("https://voe.sx/e/$voeId")
-                            } catch (_: Exception) {}
+                            mdHandleEmbed("https://voe.sx/e/$voeId", seenEmbeds, data, subtitleCallback, callback)
                         }
 
                         // ===== Vhide / VidHide (vidhidepro.com) =====
@@ -510,10 +573,8 @@ class MundoDonghuaProvider : MainAPI() {
                         for (vhPattern in vhPatterns) {
                             val vhId = vhPattern.find(unpack)?.destructured?.component1()
                             if (!vhId.isNullOrEmpty()) {
-                                try {
-                                    val prefix = if (vhPattern.pattern.contains("/v/")) "v" else "e"
-                                    seenEmbeds.add("https://vidhidepro.com/$prefix/$vhId")
-                                } catch (_: Exception) {}
+                                val prefix = if (vhPattern.pattern.contains("/v/")) "v" else "e"
+                                mdHandleEmbed("https://vidhidepro.com/$prefix/$vhId", seenEmbeds, data, subtitleCallback, callback)
                                 break
                             }
                         }
@@ -526,9 +587,7 @@ class MundoDonghuaProvider : MainAPI() {
                         for (kagaPattern in kagaPatterns) {
                             val kagaId = kagaPattern.find(unpack)?.destructured?.component1()
                             if (!kagaId.isNullOrEmpty()) {
-                                try {
-                                    seenEmbeds.add("https://vgembed.com/e/$kagaId")
-                                } catch (_: Exception) {}
+                                mdHandleEmbed("https://vgembed.com/e/$kagaId", seenEmbeds, data, subtitleCallback, callback)
                                 break
                             }
                         }
@@ -541,9 +600,7 @@ class MundoDonghuaProvider : MainAPI() {
                         for (swPattern in swPatterns) {
                             val swId = swPattern.find(unpack)?.destructured?.component1()
                             if (!swId.isNullOrEmpty()) {
-                                try {
-                                    seenEmbeds.add("https://embedwish.com/e/$swId")
-                                } catch (_: Exception) {}
+                                mdHandleEmbed("https://embedwish.com/e/$swId", seenEmbeds, data, subtitleCallback, callback)
                                 break
                             }
                         }
@@ -576,9 +633,7 @@ class MundoDonghuaProvider : MainAPI() {
                         )
                         for (regex in iframeRegexes) {
                             for (match in regex.findAll(unpack)) {
-                                try {
-                                    seenEmbeds.add(match.value)
-                                } catch (_: Exception) {}
+                                mdHandleEmbed(match.value, seenEmbeds, data, subtitleCallback, callback)
                             }
                         }
 
@@ -591,24 +646,7 @@ class MundoDonghuaProvider : MainAPI() {
         // deja de empaquetar los players). Los ya procesados no se repiten.
         for (regex in MD_RAW_EMBED_REGEXES) {
             for (match in regex.findAll(rawHtml)) {
-                val embedUrl = match.value
-                try {
-                    seenEmbeds.add(embedUrl)
-                } catch (_: Exception) {}
-            }
-        }
-
-        // v22.1: cargar TODOS los extractores en paralelo (por eso Vg/Sw aparecen
-        // al mismo tiempo que VH aunque sus CDNs tardan más en responder)
-        if (seenEmbeds.isNotEmpty()) {
-            kotlinx.coroutines.coroutineScope {
-                seenEmbeds.map { embedUrl ->
-                    async {
-                        try {
-                            loadExtractor(embedUrl, data, subtitleCallback, callback)
-                        } catch (_: Exception) {}
-                    }
-                }.forEach { it.await() }
+                mdHandleEmbed(match.value, seenEmbeds, data, subtitleCallback, callback)
             }
         }
 

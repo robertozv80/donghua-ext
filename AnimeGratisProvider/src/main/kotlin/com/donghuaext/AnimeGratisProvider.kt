@@ -637,19 +637,9 @@ class AnimeGratisProvider : MainAPI() {
             dateMap[ep.data]?.let { ep.addDate(it, "yyyy-MM-dd") }
         }
 
-        // v22: recomendaciones — "Donghua similares que podrían gustarte"
-        val recommendations = doc.select(
-            "h2:contains(similares) ~ div a[href^=/donghua/], h2:contains(similares) ~ * a[href^=/donghua/]"
-        ).mapNotNull { link ->
-            val href = link.attr("href")
-            if (href.contains("episodio") || href == url) return@mapNotNull null
-            val recTitle = link.selectFirst("img")?.attr("alt")?.trim() ?: return@mapNotNull null
-            if (recTitle.isBlank()) return@mapNotNull null
-            val recPoster = link.selectFirst("img").bestImageUrl()
-            newAnimeSearchResponse(recTitle, resolveUrl(href)) {
-                this.posterUrl = resolveUrl(recPoster)
-            }
-        }.take(12)
+        // v22.2: recomendaciones — NOTA del usuario: primero las otras
+        // temporadas del mismo nombre, luego similares aleatorios (máx 10).
+        val recommendations = fetchAgRecommendations(url, title)
 
         return newAnimeLoadResponse(title, url, tvType) {
             posterUrl = poster
@@ -665,6 +655,88 @@ class AnimeGratisProvider : MainAPI() {
     private fun parseAgDuration(text: String): Int? {
         if (text.contains("Desconocida", ignoreCase = true)) return null
         return Regex("(\\d+)").find(text)?.destructured?.component1()?.toIntOrNull()
+    }
+
+    /** v22.2: normaliza un título para comparar bases (minúsculas, sin acentos). */
+    private fun agNormalize(t: String): String = java.text.Normalizer.normalize(t.lowercase(), java.text.Normalizer.Form.NFD)
+        .replace(Regex("\\p{Mn}+"), "")
+        .replace(Regex("[^a-z0-9]+"), " ").trim()
+
+    /**
+     * v22.2: recomendaciones con la NOTA del usuario:
+     * 1) Otras temporadas del mismo nombre (misma base, p.ej. "Jade Dynasty")
+     *    buscando la base en el directorio /donghua?q=;
+     * 2) El resto: títulos del directorio general (ssr-init), en orden aleatorio.
+     * Máximo 10 resultados. Si no hay temporadas del mismo nombre, solo similares.
+     */
+    private suspend fun fetchAgRecommendations(selfUrl: String, seriesTitle: String): List<SearchResponse> {
+        return try {
+            val all = ArrayList<SearchResponse>()
+            val seen = mutableSetOf(selfUrl)
+
+            // Normaliza: "Jade Dynasty 4" -> base "jade dynasty"
+            val norm = agNormalize(seriesTitle)
+            val baseNorm = Regex("\\s+\\d+$").replace(norm, "").trim()
+            val baseSlug = baseNorm.replace(" ", "-")
+
+            if (baseNorm.isNotBlank() && baseNorm != norm) {
+                try {
+                    val qDoc = app.get(
+                        "$mainUrl/donghua?q=${java.net.URLEncoder.encode(baseNorm, "UTF-8")}",
+                        headers = headers, timeout = 30L
+                    ).document
+                    qDoc.select("a[href^='/donghua/'], a[href^=\"/donghua/\"]").forEach { link ->
+                        val href = link.attr("href")
+                        if (href.contains("episodio")) return@forEach
+                        val full = resolveUrl(href)
+                        if (full in seen) return@forEach
+                        val slug = href.substringAfterLast("/")
+                        // Debe compartir la base: jade-dynasty-2, jade-dynasty-3...
+                        if (!slug.startsWith(baseSlug)) return@forEach
+                        val t = link.selectFirst("h3")?.text()?.trim()
+                            ?: link.selectFirst("img")?.attr("alt")?.trim()
+                            ?: return@forEach
+                        if (agNormalize(t) == norm) return@forEach // la propia serie
+                        if (full == selfUrl) return@forEach
+                        seen.add(full)
+                        all.add(newAnimeSearchResponse(t, full) {
+                            this.posterUrl = resolveUrl(link.selectFirst("img").bestImageUrl())
+                        })
+                    }
+                    all.sortBy { rec ->
+                        Regex("(\\d+)$").find(rec.url.substringAfterLast("/"))?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                    }
+                } catch (_: Exception) {}
+            }
+
+            // Similares aleatorios del directorio general
+            val pool = ArrayList<SearchResponse>()
+            try {
+                val dirDoc = app.get("$mainUrl/directorio", headers = headers, timeout = 30L).document
+                val ssrInit = dirDoc.selectFirst("script#ssr-init")?.data()
+                if (!ssrInit.isNullOrEmpty()) {
+                    val ssr = parseJson<SsrInit>(ssrInit)
+                    ssr.animes?.forEach { anime ->
+                        if (pool.size >= 60) return@forEach
+                        val title = anime.t ?: return@forEach
+                        val slug = anime.sl ?: return@forEach
+                        val contentType = anime.ty?.lowercase() ?: ""
+                        val href = if (contentType.contains("donghua")) "$mainUrl/donghua/$slug" else "$mainUrl/anime/$slug"
+                        if (href in seen) return@forEach
+                        if (baseNorm.isNotBlank() && slug.startsWith(baseSlug)) return@forEach // ya van como temporadas
+                        seen.add(href)
+                        pool.add(newAnimeSearchResponse(title, href) {
+                            this.posterUrl = extractBestImageUrl(anime.im, anime.fb, anime.fb2)
+                        })
+                    }
+                }
+            } catch (_: Exception) {}
+            pool.shuffle()
+            all.addAll(pool)
+            all.take(10)
+        } catch (_: Exception) {
+            emptyList()
+        }
     }
 
     /**
