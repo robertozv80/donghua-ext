@@ -351,23 +351,33 @@ class DonghuaLifeBetaProvider : MainAPI() {
             val match = Regex("""^(.+?)(?:-(\d+))??-(\d+)$""").find(path)
             if (match != null) {
                 val slug = match.groupValues[1]
-                val candidate = "$mainUrl/series/$slug"
-                // v16 FIX: cuando la temporada usa slug UUID (p.ej. Eternal God Emperor:
-                // "9796b713-...-temporada-1"), /series/<slug> responde "Serie no encontrada".
-                // En ese caso usar la propia página watch, que contiene la lista completa.
-                val probe = try { app.get(candidate, timeout = 30) } catch (_: Exception) { null }
-                // v22.3 FIX: el payload RSC trae "seasons" ESCAPADO (\"seasons\"); antes el
-                // probe solo buscaba la forma literal y siempre fallaba -> al entrar desde
-                // "Últimos Episodios" se parseaba la página watch del EPISODIO (pocos
-                // episodios, sin descripción) en lugar de la página de la serie.
-                val probeOk = probe != null && probe.isSuccessful &&
-                    !probe.text.contains("no encontrada", ignoreCase = true) &&
-                    (probe.text.contains("\"seasons\":") || probe.text.contains("\\\"seasons\\\":"))
-                if (probeOk) {
-                    candidate
-                } else {
-                    url
+                // v22.4 FIX: el slug del watch puede incluir el número de TEMPORADA
+                // (ej. "apotheosis-2-53" -> "apotheosis-2"), pero la página real de la
+                // serie suele ser el slug SIN número ("/series/apotheosis"). Probar el
+                // slug completo y, si no existe, reintentar sin el sufijo numérico.
+                val candidates = mutableListOf(slug)
+                Regex("-\\d+$").find(slug)?.let {
+                    candidates.add(slug.substring(0, it.range.first))
                 }
+                var chosen: String? = null
+                for (cand in candidates) {
+                    if (cand.isBlank()) continue
+                    val candidate = "$mainUrl/series/$cand"
+                    // v16 FIX: cuando la temporada usa slug UUID (p.ej. Eternal God Emperor:
+                    // "9796b713-...-temporada-1"), /series/<slug> responde "Serie no encontrada".
+                    // En ese caso usar la propia página watch, que contiene la lista completa.
+                    // v22.3 FIX: el payload RSC trae "seasons" ESCAPADO (\"seasons\"); el probe
+                    // debe aceptar ambas formas o siempre caería a la página del episodio.
+                    val probe = try { app.get(candidate, timeout = 30) } catch (_: Exception) { null }
+                    val probeOk = probe != null && probe.isSuccessful &&
+                        !probe.text.contains("no encontrada", ignoreCase = true) &&
+                        (probe.text.contains("\"seasons\":") || probe.text.contains("\\\"seasons\\\":"))
+                    if (probeOk) {
+                        chosen = candidate
+                        break
+                    }
+                }
+                chosen ?: url
             } else {
                 url
             }

@@ -342,10 +342,12 @@ class DonghuaLifeProvider : MainAPI() {
      * no salgan siempre las mismas.
      */
     /**
-     * v22.3: recomendaciones con la NOTA del usuario:
+     * v22.4: recomendaciones con la NOTA del usuario:
      * 1) título base (sin "temp N" / "latino" etc.) -> resultados del buscador
      *    interno cuyo título comparte el mismo nombre parcial (otras temporadas);
-     * 2) el resto: similares aleatorios de la sección "Más Populares".
+     * 2) el resto: similares ALEATORIOS del catálogo paginado /donghuas (una página
+     *    al azar de las ~22). La sección "Más Populares" solo tiene 5 series fijas
+     *    y por eso las recomendaciones se repetían siempre.
      * Máximo 10 resultados.
      */
     private suspend fun extractDonghuaLifeRecommendations(
@@ -379,22 +381,47 @@ class DonghuaLifeProvider : MainAPI() {
                 }
             }
 
-            // 2) Similares aleatorios de "Más Populares"
-            val pool = ArrayList<SearchResponse>()
-            doc.select(".view-mas-populares .views-row").forEach { row ->
-                val a = row.selectFirst(".serie .imagen a") ?: return@forEach
-                val href = resolveUrl(a.attr("href"))
-                if (href in seen || !seen.add(href)) return@forEach
-                val recTitle = row.selectFirst(".titulo a")?.text()?.trim()
-                    ?: row.selectFirst(".titulo")?.text()?.trim()
-                    ?: return@forEach
-                val recPoster = row.selectFirst("img")?.attr("src")
-                pool.add(newAnimeSearchResponse(recTitle, href) {
-                    this.posterUrl = resolveUrl(recPoster ?: "")
-                })
+            // 2) Similares aleatorios del catálogo paginado /donghuas (página al azar)
+            //    La sección "Más Populares" de la ficha solo trae ~5 series fijas.
+            try {
+                val lastPage = doc.select("li.pager__item--last a")
+                    .firstOrNull()?.attr("href")
+                    ?.let { Regex("page=(\\d+)").find(it)?.destructured?.component1()?.toIntOrNull() }
+                    ?: 21 // ~22 páginas de catálogo al momento de escribir esto
+                val pool = ArrayList<SearchResponse>()
+                var attempts = 0
+                while (pool.size < 20 && attempts < 2) {
+                    attempts++
+                    val pg = (0..lastPage).random()
+                    val catDoc = app.get("$mainUrl/donghuas?page=$pg", timeout = 120).document
+                    catDoc.select(".views-row .serie").forEach { card ->
+                        if (pool.size >= 20) return@forEach
+                        val href = resolveUrl(card.selectFirst(".imagen a")?.attr("href") ?: return@forEach)
+                        if (href in seen || !seen.add(href)) return@forEach
+                        val recTitle = card.selectFirst(".titulo")?.text()?.trim()
+                            ?: card.selectFirst(".titulo a")?.text()?.trim()
+                            ?: return@forEach
+                        pool.add(newAnimeSearchResponse(recTitle, href) {
+                            this.posterUrl = resolveUrl(card.selectFirst(".imagen img")?.attr("src") ?: "")
+                        })
+                    }
+                }
+                pool.shuffle()
+                results.addAll(pool)
+            } catch (_: Exception) {
+                // Fallback: usar las ~5 series fijas de "Más Populares" de la ficha
+                doc.select(".view-mas-populares .views-row").forEach { row ->
+                    val a = row.selectFirst(".serie .imagen a") ?: return@forEach
+                    val href = resolveUrl(a.attr("href"))
+                    if (href in seen || !seen.add(href)) return@forEach
+                    val recTitle = row.selectFirst(".titulo a")?.text()?.trim()
+                        ?: row.selectFirst(".titulo")?.text()?.trim()
+                        ?: return@forEach
+                    results.add(newAnimeSearchResponse(recTitle, href) {
+                        this.posterUrl = resolveUrl(row.selectFirst("img")?.attr("src") ?: "")
+                    })
+                }
             }
-            pool.shuffle()
-            results.addAll(pool)
             results.take(10)
         } catch (_: Exception) {
             emptyList()
