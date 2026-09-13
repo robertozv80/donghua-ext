@@ -29,7 +29,7 @@
       "robertozv80"
     ],
     "description": "DonghuaLifeBETA - Donghuas en espa\u00f1ol con subt\u00edtulos",
-    "fileSize": 171119,
+    "fileSize": 171984,
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
     "language": "es",
     "tvTypes": [
@@ -37,7 +37,7 @@
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=donghualife.com&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-02d847214c82992cada292e195cfa999622258ab1b1b24bf8449b938ccb64891"
+    "fileHash": "sha256-c949025151acb60845a0cc6856deffca5212654093d92cb35a27e833bd9056c4"
   },
   {
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/DonghuaLifeProvider.cs3",
@@ -83,7 +83,7 @@
       "robertozv80"
     ],
     "description": "MundoDonghua - Donghuas y anime chino en espa\u00f1ol",
-    "fileSize": 55069,
+    "fileSize": 55885,
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
     "language": "es",
     "tvTypes": [
@@ -91,7 +91,7 @@
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=mundodonghua.com&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-fd60b6aac6a9944d4e34636193f36753e2dbb5cb39bb94ea6fad3acee1dc4185"
+    "fileHash": "sha256-19c99b7cf5454e0937a2100f20e6b7788198408a51872d6baaa0837d0e90638d"
   },
   {
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/SeriesDonghuaProvider.cs3",
@@ -103,7 +103,7 @@
       "robertozv80"
     ],
     "description": "SeriesDonghua - Donghuas y anime chino en espa\u00f1ol",
-    "fileSize": 58165,
+    "fileSize": 63262,
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
     "language": "es",
     "tvTypes": [
@@ -111,6 +111,6 @@
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=seriesdonghua.com&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-d9c5a056c38b7f9052f4c0e6190d6baa3eecd338846ec01fe0527d5132b9527f"
+    "fileHash": "sha256-70be738c30134884c45687194a8e81a781542a538abb90d5472662dd75a22128"
   }
 ]
