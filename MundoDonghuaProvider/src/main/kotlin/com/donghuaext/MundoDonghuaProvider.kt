@@ -334,29 +334,50 @@ class MundoDonghuaProvider : MainAPI() {
         return try {
             val all = ArrayList<SearchResponse>()
 
-            // 1) Otras temporadas: el listado completo vive en lista-donghuas
-            val baseSlug = donghuaUrl.substringAfterLast("/").substringBeforeLast("-")
-            val baseLower = Regex("\\d+$").replace(baseSlug, "").trimEnd('-')
+            // 1) Otras temporadas: v22.5 FIX — usar la BÚSQUEDA del sitio con el término
+            // base (sin número de temporada). El listado general (lista-donghuas) es
+            // paginado y no contiene la mayoría de temporadas (ej. Tales of Demons and
+            // Gods 2..9 solo aparecen vía /busquedas?donghua=tales+of+demons+and+gods).
+            // Término base del slug: tales-of-demons-and-gods-10 -> "tales-of-demons-and-gods"
+            val baseLower = Regex("\\d+$").replace(donghuaUrl.substringAfterLast("/").substringBeforeLast("-"), "").trimEnd('-')
             if (baseLower.isNotBlank()) {
-                val listing = app.get("$mainUrl/lista-donghuas", timeout = 120).document
                 val seenSeasons = HashSet<String>()
-                listing.select("a[href*='/donghua/$baseLower']").forEach { a ->
-                    val href = a.attr("href")
-                    val slug = href.substringAfterLast("/")
-                    if (slug in seenSeasons || "$mainUrl/donghua/$slug" == donghuaUrl) return@forEach
-                    val card = a.closest("div.md-card") ?: a
-                    val t = card.selectFirst("h3.md-card-title")?.text()?.trim()
-                        ?: card.selectFirst("h5.md-card-title")?.text()?.trim()
-                        ?: a.attr("title").ifBlank { slug }
-                    seenSeasons.add(slug)
-                    val poster = card.selectFirst("div.md-card-img img")?.let { getBestImgSrc(it) }
-                    all.add(newAnimeSearchResponse(t, "$mainUrl/donghua/$slug") {
-                        this.posterUrl = resolveUrl(poster ?: "")
-                    })
-                }
-                // Ordenar por el número de temporada dentro del slug
-                all.sortBy { rec ->
-                    Regex("(\\d+)$").find(rec.url.substringAfterLast("/"))?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                // Término de búsqueda: desde el título propio sin el número final
+                // ("Tales of Demons and Gods Season10" -> "tales of demons and gods")
+                val searchTerm = Regex("\\s*(temporada|season|s)\\s*\\d+$", RegexOption.IGNORE_CASE)
+                    .replace(seriesTitle, "").trim()
+                    .ifBlank { Regex("\\s+\\d+$").replace(seriesTitle, "").trim() }
+                val queries = LinkedHashSet<String>()
+                if (searchTerm.isNotBlank()) queries.add(searchTerm)
+                queries.add(baseLower.replace("-", " "))
+                queryLoop@ for (q in queries) {
+                    try {
+                        val searchDoc = app.get("$mainUrl/busquedas?donghua=" + java.net.URLEncoder.encode(q, "UTF-8"), timeout = 60).document
+                        val found = ArrayList<Triple<String, String, String>>() // slug, title, poster
+                        searchDoc.select("a[href*='/donghua/']").forEach { a ->
+                            val href = a.attr("href")
+                            val slug = href.substringAfterLast("/")
+                            if (!slug.startsWith(baseLower) || slug in seenSeasons) return@forEach
+                            if ("$mainUrl/donghua/$slug" == donghuaUrl) { seenSeasons.add(slug); return@forEach }
+                            val t = a.selectFirst("h5.md-card-title")?.text()?.trim()
+                                ?: a.selectFirst("h3.md-card-title")?.text()?.trim()
+                                ?: a.attr("alt").ifBlank { slug }
+                            val poster = a.selectFirst("img")?.let { getBestImgSrc(it) }
+                            seenSeasons.add(slug)
+                            found.add(Triple(slug, t, poster ?: ""))
+                        }
+                        if (found.isNotEmpty()) {
+                            found.sortBy { rec ->
+                                Regex("(\\d+)$").find(rec.first)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                            }
+                            found.forEach { (slug, t, poster) ->
+                                all.add(newAnimeSearchResponse(t, "$mainUrl/donghua/$slug") {
+                                    this.posterUrl = resolveUrl(poster)
+                                })
+                            }
+                            break@queryLoop
+                        }
+                    } catch (_: Exception) {}
                 }
             }
 
@@ -454,13 +475,16 @@ class MundoDonghuaProvider : MainAPI() {
                             val redirectorRegex = Regex("redirector\\.php\\?slug=([A-Za-z0-9+/=]+)")
                             val asuraSlug = redirectorRegex.find(unpack)?.destructured?.component1()
                             if (!asuraSlug.isNullOrEmpty()) {
+                                // v22.5 FIX: el sitio movió el reproductor de mdplayer.xyz a
+                                // mdnemonicplayer.xyz (verificado en vivo: el dominio nuevo
+                                // devuelve un M3U8 válido; el viejo responde basura de 25 bytes).
                                 try {
-                                    val m3u8Url = "https://www.mdplayer.xyz/nemonicplayer/redirector.php?slug=$asuraSlug"
+                                    val m3u8Url = "https://www.mdnemonicplayer.xyz/nemonicplayer/redirector.php?slug=$asuraSlug"
                                     generateM3u8("Asura", m3u8Url, datafix).forEach(callback)
                                 } catch (_: Exception) {
                                     // Fallback: intentar generar M3U8 sin verificar
                                     try {
-                                        val m3u8Url = "https://www.mdplayer.xyz/nemonicplayer/redirector.php?slug=$asuraSlug"
+                                        val m3u8Url = "https://www.mdnemonicplayer.xyz/nemonicplayer/redirector.php?slug=$asuraSlug"
                                         generateM3u8("Asura", m3u8Url, datafix).forEach(callback)
                                     } catch (_: Exception) {}
                                 }

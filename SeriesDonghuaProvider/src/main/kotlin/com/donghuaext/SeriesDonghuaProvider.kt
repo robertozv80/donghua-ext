@@ -241,31 +241,68 @@ class SeriesDonghuaProvider : MainAPI() {
             val norm = sdNormalize(seriesTitle)
             val baseNorm = Regex("\\s+\\d+$").replace(norm, "").trim()
 
-            if (baseSlug.isNotBlank() && baseSlug != selfSlug || baseNorm.isNotBlank() && baseNorm != norm) {
+            // v22.5 FIX: el título puede traer sufijo de temporada ("Tales Of Demons and
+            // Gods Season10", "Doupo Cangqiong Temporada 3"). Buscar con ese sufijo
+            // adjunto devuelve resultados NO relacionados (verificado: "...gods season"
+            // devuelve Combat Continent, Martial Master, etc.). Quitarlo antes.
+            val titleNoSeason = Regex("\\s*(temporada|season|s)\\s*\\d+$", RegexOption.IGNORE_CASE)
+                .replace(seriesTitle, "").trim()
+                .ifBlank { Regex("\\s+\\d+$").replace(seriesTitle, "").trim() }
+            val normNoSeason = if (titleNoSeason != seriesTitle) sdNormalize(titleNoSeason) else ""
+
+            if (baseSlug.isNotBlank() && baseSlug != selfSlug || baseNorm.isNotBlank() && baseNorm != norm || normNoSeason.isNotBlank() && normNoSeason != norm) {
                 try {
-                    val q = baseNorm.ifBlank { baseSlug.replace("-", " ") }
-                    val searchDoc = app.get(
-                        "$mainUrl/busquedas/${java.net.URLEncoder.encode(q, "UTF-8")}",
-                        timeout = 120L
-                    ).document
-                    val mainContent = searchDoc.selectFirst("div.col-md-9") ?: searchDoc
-                    val seasons = ArrayList<Triple<String, String, String>>() // url, title, poster
-                    mainContent.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").forEach { link ->
-                        val href = link.attr("href")
-                        if (href.contains("episodio")) return@forEach
-                        val fullHref = resolveUrl(href)
-                        if (fullHref in seen) return@forEach
-                        val slug = fullHref.substringAfterLast("/")
-                        val t = link.selectFirst("h5")?.text()?.trim() ?: return@forEach
-                        val isSameBase = slug.startsWith(baseSlug) ||
-                            (baseNorm.isNotBlank() && sdNormalize(t).startsWith(baseNorm))
-                        if (!isSameBase) return@forEach
-                        seen.add(fullHref)
-                        seasons.add(Triple(fullHref, t, link.selectFirst("div.img img")?.attr("src") ?: ""))
+                    // v22.5: probar varias variantes de consulta hasta que una devuelva
+                    // temporadas del mismo nombre (antes solo "tales+of+demons+and+gods
+                    // +season10" que no matcheaba nada).
+                    val queries = LinkedHashSet<String>()
+                    if (normNoSeason.isNotBlank() && normNoSeason != norm) queries.add(normNoSeason)
+                    if (baseNorm.isNotBlank()) queries.add(baseNorm)
+                    if (queries.isEmpty()) queries.add(baseSlug.replace("-", " "))
+                    var searchDoc: org.jsoup.nodes.Document? = null
+                    var usedQ = ""
+                    for (q in queries) {
+                        try {
+                            val d = app.get(
+                                "$mainUrl/busquedas/${java.net.URLEncoder.encode(q, "UTF-8")}",
+                                timeout = 120L
+                            ).document
+                            val hasMatch = d.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").any { link ->
+                                val t = link.selectFirst("h5")?.text()?.trim() ?: ""
+                                val href = link.attr("href")
+                                !href.contains("episodio") &&
+                                    (sdNormalize(t).startsWith(normNoSeason.ifBlank { baseNorm }) ||
+                                     href.substringAfterLast("/").startsWith(baseSlug))
+                            }
+                            if (hasMatch || searchDoc == null) {
+                                searchDoc = d
+                                usedQ = q
+                            }
+                            if (hasMatch) break
+                        } catch (_: Exception) {}
                     }
-                    seasons.sortBy { Regex("(\\d+)$").find(it.first.substringAfterLast("/"))?.groupValues?.get(1)?.toIntOrNull() ?: 0 }
-                    seasons.forEach { (u, t, p) ->
-                        all.add(newAnimeSearchResponse(t, u) { this.posterUrl = resolveUrl(p) })
+                    if (searchDoc != null) {
+                        val mainDoc = searchDoc
+                        val mainContent = mainDoc.selectFirst("div.col-md-9") ?: mainDoc
+                        val seasons = ArrayList<Triple<String, String, String>>() // url, title, poster
+                        mainContent.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").forEach { link ->
+                            val href = link.attr("href")
+                            if (href.contains("episodio")) return@forEach
+                            val fullHref = resolveUrl(href)
+                            if (fullHref in seen) return@forEach
+                            val slug = fullHref.substringAfterLast("/")
+                            val t = link.selectFirst("h5")?.text()?.trim() ?: return@forEach
+                            val isSameBase = slug.startsWith(baseSlug) ||
+                                (baseNorm.isNotBlank() && sdNormalize(t).startsWith(baseNorm)) ||
+                                (normNoSeason.isNotBlank() && normNoSeason != norm && sdNormalize(t).startsWith(normNoSeason))
+                            if (!isSameBase) return@forEach
+                            seen.add(fullHref)
+                            seasons.add(Triple(fullHref, t, link.selectFirst("div.img img")?.attr("src") ?: ""))
+                        }
+                        seasons.sortBy { Regex("(\\d+)$").find(it.first.substringAfterLast("/"))?.groupValues?.get(1)?.toIntOrNull() ?: 0 }
+                        seasons.forEach { (u, t, p) ->
+                            all.add(newAnimeSearchResponse(t, u) { this.posterUrl = resolveUrl(p) })
+                        }
                     }
                 } catch (_: Exception) {}
             }
@@ -488,46 +525,57 @@ class SeriesDonghuaProvider : MainAPI() {
                     }
                 }
 
-                // Skadi → ok.ru
+                // Skadi → ok.ru — v22.5: contar enlaces emitidos, no solo "no-excepción".
+                // loadExtractor(ok.ru) puede retornar sin enlaces (HTTP 302 del endpoint de
+                // metadata) y al marcar foundLinks=true bloqueaba el fallback propio.
                 videoMap.skadi?.let { rawValue ->
                     val url = decodeDoubleEncoded(rawValue)
                     if (url.startsWith("http")) {
-                        try { loadExtractor(url, data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {
-                            foundLinks = extractOkRu(url, data, "ok.ru", callback) || foundLinks
-                        }
+                        var links = 0
+                        try { loadExtractor(url, data, subtitleCallback, callback) } catch (_: Exception) {}
+                        try {
+                            extractOkRu(url, data, serverName = "Ok", callback = { links++; callback(it) })
+                        } catch (_: Exception) {}
+                        if (links > 0) foundLinks = true
                     }
                 }
 
-                // Fembed → Rumble / StreamSB / genérico
+                // Fembed → Strsb (likessb.com, detrás de parklogic) / genérico — v22.5:
+                // contar enlaces emitidos; likessb devuelve una página de redirección
+                // publicitaria y loadExtractor "tiene éxito" sin emitir nada.
                 videoMap.fembed?.let { rawValue ->
                     val url = decodeDoubleEncoded(rawValue)
                     if (url.startsWith("http")) {
-                        try { loadExtractor(url, data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {
-                            when {
-                                url.contains("rumble.com") -> foundLinks = extractRumble(url, data, "Rumble", callback) || foundLinks
-                                else -> foundLinks = extractGenericVideo(url, data, "Server", callback) || foundLinks
-                            }
+                        var links = 0
+                        try { loadExtractor(url, data, subtitleCallback, callback) } catch (_: Exception) {}
+                        if (url.contains("rumble.com")) {
+                            try { extractRumble(url, data, "Rumble") { links++; callback(it) } } catch (_: Exception) {}
+                        } else {
+                            try { extractGenericVideo(url, data, "Strsb") { links++; callback(it) } } catch (_: Exception) {}
                         }
+                        if (links > 0) foundLinks = true
                     }
                 }
 
-                // Tape → Odysee
+                // Tape → Odysee — v22.5: contar enlaces emitidos
                 videoMap.tape?.let { rawValue ->
                     val url = decodeDoubleEncoded(rawValue)
                     if (url.startsWith("http")) {
-                        try { loadExtractor(url, data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {
-                            foundLinks = extractOdysee(url, data, "Odysee", callback) || foundLinks
-                        }
+                        var links = 0
+                        try { loadExtractor(url, data, subtitleCallback, callback) } catch (_: Exception) {}
+                        try { extractOdysee(url, data, "Odysee") { links++; callback(it) } } catch (_: Exception) {}
+                        if (links > 0) foundLinks = true
                     }
                 }
 
-                // Amagi → Voe.sx
+                // Amagi → Voe.sx — v22.5: contar enlaces emitidos
                 videoMap.amagi?.let { rawValue ->
                     val url = decodeDoubleEncoded(rawValue)
                     if (url.startsWith("http")) {
-                        try { loadExtractor(url, data, subtitleCallback, callback); foundLinks = true } catch (_: Exception) {
-                            foundLinks = extractVoe(url, data, "Voe", callback) || foundLinks
-                        }
+                        var links = 0
+                        try { loadExtractor(url, data, subtitleCallback, callback) } catch (_: Exception) {}
+                        try { extractVoe(url, data, "Voe") { links++; callback(it) } } catch (_: Exception) {}
+                        if (links > 0) foundLinks = true
                     }
                 }
             }
@@ -670,22 +718,65 @@ class SeriesDonghuaProvider : MainAPI() {
         return false
     }
 
+    /**
+     * v22.5 FIX: extractor propio de ok.ru reescrito.
+     * - La página embed trae TODO en data-options: hlsManifestUrl (m3u8) y videos[] (mp4 por calidad).
+     * - El JSON interno usa escapes \u0026 para '&' → desescapar o las URLs quedan rotas.
+     * - hlsManifestUrl se entrega via generateM3u8 (multi-calidad), igual que el player web.
+     */
     private suspend fun extractOkRu(videoUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit): Boolean {
         try {
             val html = app.get(videoUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
             val dataMatch = Regex("""data-options="([^"]+)"""").find(html)
             if (dataMatch != null) {
-                val optionsJson = dataMatch.destructured.component1().replace("&quot;", "\"").replace("&amp;", "&")
-                for (m in Regex("""(https?://[^"]+\.(?:mp4|m3u8)[^"]*)""").findAll(optionsJson)) {
-                    callback(newExtractorLink(source = serverName, name = serverName, url = m.value) { this.referer = videoUrl; this.quality = Qualities.Unknown.value })
+                val optionsJson = dataMatch.destructured.component1()
+                    .replace("&quot;", "\"")
+                    .replace("&amp;", "&")
+                    .replace("\\u0026", "&")
+                    .replace("\\u002F", "/")
+                    .replace("\\/", "/")
+                var found = false
+                // 1) HLS manifest (multi-calidad)
+                Regex("""hlsManifestUrl\"?\s*:\s*\"?([^\",]+)""").find(optionsJson)?.let { hm ->
+                    val m3u8 = hm.destructured.component1().trim()
+                    if (m3u8.startsWith("http")) {
+                        try {
+                            generateM3u8(serverName, m3u8, "https://ok.ru").forEach(callback)
+                            found = true
+                        } catch (_: Exception) {}
+                    }
+                }
+                // 2) videos[] con mp4 por calidad ("name":"1080"|"720"|"mobile"...)
+                Regex("""\{[^{}]*?\"name\"\s*:\s*\"([^\"]+)\"[^{}]*?\"url\"\s*:\s*\"([^\"]+)\"[^{}]*?\}""").findAll(optionsJson).forEach { vm ->
+                    val qName = vm.destructured.component1()
+                    val vUrl = vm.destructured.component2()
+                    if (vUrl.startsWith("http")) {
+                        val q = when {
+                            qName.contains("1080") -> Qualities.P1080.value
+                            qName.contains("720") -> Qualities.P720.value
+                            qName.contains("480") -> Qualities.P480.value
+                            qName.contains("360") -> Qualities.P360.value
+                            else -> Qualities.Unknown.value
+                        }
+                        callback(newExtractorLink(source = serverName, name = "$serverName ${q / 1000}p", url = vUrl) {
+                            this.referer = "https://ok.ru"
+                            this.quality = q
+                        })
+                        found = true
+                    }
+                }
+                if (found) return true
+                // 3) Fallback: cualquier mp4/m3u8 dentro de data-options
+                for (m in Regex("""(https?://[^\"]+\.(?:mp4|m3u8)[^\"]*)""").findAll(optionsJson)) {
+                    callback(newExtractorLink(source = serverName, name = serverName, url = m.value) { this.referer = "https://ok.ru"; this.quality = Qualities.Unknown.value })
                     return true
                 }
             }
-            Regex("""<meta\s+property=["']og:video(?::url)?["']\s+content=["']([^"']+)["']""").find(html)?.let { m ->
+            Regex("""<meta\s+property=[\"']og:video(?::url)?[\"']\s+content=[\"']([^\"']+)[\"']""").find(html)?.let { m ->
                 callback(newExtractorLink(source = serverName, name = serverName, url = m.destructured.component1()) { this.referer = videoUrl; this.quality = Qualities.Unknown.value })
                 return true
             }
-            for (m in Regex("""(https?://[^"'\s<>]+\.(?:mp4|m3u8)[^"'\s<>]*)""").findAll(html)) {
+            for (m in Regex("""(https?://[^\"'\s<>]+\.(?:mp4|m3u8)[^\"'\s<>]*)""").findAll(html)) {
                 callback(newExtractorLink(source = serverName, name = serverName, url = m.value) { this.referer = videoUrl; this.quality = Qualities.Unknown.value })
                 return true
             }

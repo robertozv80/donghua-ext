@@ -122,18 +122,32 @@ class DonghuaLifeBetaProvider : MainAPI() {
         when {
             url.endsWith("/") && !url.contains("#") -> {
                 val doc = app.get(url, timeout = 60).document
+                // v22.5 FIX: el sitio nuevo emite watch-URLs con ID de EPISODIO tipo UUID
+                // ("/watch/5273fa2e-...-temporada-1-3"), que NO contienen el slug de la
+                // serie. La página watch es client-rendered y no trae datos => cargarla
+                // desde la app producía fichas rotas (ej. "DOMINIO SIN LIMITES - EPISODIO
+                // 80"). El payload RSC del HOME trae pares watchHref→seriesHref; los
+                // usamos para reescribir cada enlace de la card a la página de la SERIE.
+                val rawHtml = try { app.get(url, timeout = 60).text } catch (_: Exception) { "" }
+                val hrefMap = Regex("\\\"watchHref\\\":\\\"([^\"\\\\]+)\\\",\\\"seriesHref\\\":\\\"([^\"\\\\]+)\\\"")
+                    .findAll(rawHtml)
+                    .map { it.destructured.component1() to it.destructured.component2() }
+                    .toMap()
                 doc.select("#latest-episodes-scroll a[href*='/watch/']").forEach { a ->
                     val href = a.attr("href")
+                    // Preferir la página de la serie; conservar el badge "EP n"
+                    val seriesHref = hrefMap[href] ?: hrefMap.entries
+                        .firstOrNull { it.key.startsWith(href.substringBeforeLast("-")) }?.value
+                    val targetHref = seriesHref ?: href
                     val title = a.selectFirst("p.line-clamp-2")?.text()?.trim()
                         ?: a.selectFirst("img")?.attr("alt")?.trim()
                         ?: href.substringAfterLast("/").replace("-", " ")
                     val epBadge = a.selectFirst("span")?.text()?.trim() ?: ""
                     val epNum = Regex("""EP\s*(\d+)""", RegexOption.IGNORE_CASE).find(epBadge)
                         ?.groupValues?.get(1)?.toIntOrNull()
-                        ?: Regex("""/(?:watch/)?(?:[^/]+-)*(\d+)$""").find(href)?.groupValues?.get(1)?.toIntOrNull()
                     val poster = a.selectFirst("img")?.attr("src")?.let { resolveUrl(extractNextImagePath(it)) }
                     home.add(
-                        newAnimeSearchResponse(title, resolveUrl(href), TvType.Anime) {
+                        newAnimeSearchResponse(title, resolveUrl(targetHref), TvType.Anime) {
                             this.posterUrl = poster
                             if (epNum != null) addDubStatus(DubStatus.Subbed, epNum)
                         }
