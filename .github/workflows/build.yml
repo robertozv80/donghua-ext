@@ -21,11 +21,9 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      # v3 obligatorio: v2 instala el paquete "tools" del SDK, que Google eliminó
-      # del repositorio => "Failed to find package 'tools'" y el workflow muere aquí.
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
+      # Sin android-actions/setup-android: intenta instalar el paquete legacy "tools"
+      # que Google eliminó del repositorio del SDK (falle igual en v2 y v3), y es
+      # innecesario: los runners de GitHub ya traen el SDK preinstalado con licencias.
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
