@@ -403,7 +403,7 @@ class MundoDonghuaProvider : MainAPI() {
             }
             pool.shuffle()
             all.addAll(pool)
-            all.take(10)
+            all.take(16)
         } catch (_: Exception) {
             emptyList()
         }

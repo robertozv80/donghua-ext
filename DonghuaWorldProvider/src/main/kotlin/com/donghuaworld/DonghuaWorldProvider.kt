@@ -495,14 +495,14 @@ class DonghuaWorldProvider : MainAPI() {
         }
 
         // 3) Si faltan, completar con resultados del buscador que no sean temporadas
-        if (candidatePool.size < 10 && baseSlug.isNotBlank()) {
+        if (candidatePool.size < 16 && baseSlug.isNotBlank()) {
             try {
                 val q = java.net.URLEncoder.encode(
                     (baseNorm.ifBlank { baseSlug.replace("-", " ") }).take(60), "UTF-8"
                 )
                 val searchDoc = app.get("$mainUrl/?s=$q").document
                 searchDoc.select("article").forEach { art ->
-                    if (candidatePool.size >= 40) return@forEach
+                    if (candidatePool.size >= 60) return@forEach
                     val parsed = parseArticleCard(art) ?: return@forEach
                     val slug = parsed.url.trimEnd('/').substringAfterLast("/")
                     if (slug in seen) return@forEach
@@ -511,9 +511,38 @@ class DonghuaWorldProvider : MainAPI() {
                 }
             } catch (_: Exception) {}
         }
+        // v22.6: "Recommended Series" + buscador suelen dar < 16 => rellenar con una
+        // página ALEATORIA del catálogo paginado /anime/page/N/ (misma mecánica que
+        // DonghuaLife usa con /donghuas?page=N). Así las recomendaciones varían cada vez.
+        if (candidatePool.size < 16) {
+            try {
+                val catDoc = app.get("$mainUrl/anime/").document
+                val lastPage = catDoc.select("a[href*=/anime/page/]")
+                    .mapNotNull {
+                        Regex("""/anime/page/(\d+)/""").find(it.attr("href"))
+                            ?.groupValues?.get(1)?.toIntOrNull()
+                    }
+                    .maxOrNull() ?: 0
+                val top = if (lastPage >= 2) minOf(lastPage, 80) else 30
+                val rnd = java.util.Random()
+                for (attempt in 1..3) {
+                    if (candidatePool.size >= 16) break
+                    val p = 2 + rnd.nextInt(maxOf(1, top - 1))
+                    val pageDoc = app.get("$mainUrl/anime/page/$p/").document
+                    pageDoc.select("article").forEach { art ->
+                        if (candidatePool.size >= 16) return@forEach
+                        val parsed = parseArticleCard(art) ?: return@forEach
+                        val slug = parsed.url.trimEnd('/').substringAfterLast("/")
+                        if (slug in seen) return@forEach
+                        seen.add(slug)
+                        candidatePool.add(parsed)
+                    }
+                }
+            } catch (_: Exception) {}
+        }
         candidatePool.shuffle()
         all.addAll(candidatePool)
-        return all.take(10)
+        return all.take(16)
     }
 
     /**

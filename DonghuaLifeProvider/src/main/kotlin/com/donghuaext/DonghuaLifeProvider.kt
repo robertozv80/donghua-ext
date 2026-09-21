@@ -390,12 +390,12 @@ class DonghuaLifeProvider : MainAPI() {
                     ?: 21 // ~22 páginas de catálogo al momento de escribir esto
                 val pool = ArrayList<SearchResponse>()
                 var attempts = 0
-                while (pool.size < 20 && attempts < 2) {
+                while (pool.size < 24 && attempts < 2) {
                     attempts++
                     val pg = (0..lastPage).random()
                     val catDoc = app.get("$mainUrl/donghuas?page=$pg", timeout = 120).document
                     catDoc.select(".views-row .serie").forEach { card ->
-                        if (pool.size >= 20) return@forEach
+                        if (pool.size >= 24) return@forEach
                         val href = resolveUrl(card.selectFirst(".imagen a")?.attr("href") ?: return@forEach)
                         if (href in seen || !seen.add(href)) return@forEach
                         val recTitle = card.selectFirst(".titulo")?.text()?.trim()
@@ -422,7 +422,7 @@ class DonghuaLifeProvider : MainAPI() {
                     })
                 }
             }
-            results.take(10)
+            results.take(16)
         } catch (_: Exception) {
             emptyList()
         }

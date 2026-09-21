@@ -128,7 +128,9 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 // desde la app producía fichas rotas (ej. "DOMINIO SIN LIMITES - EPISODIO
                 // 80"). El payload RSC del HOME trae pares watchHref→seriesHref; los
                 // usamos para reescribir cada enlace de la card a la página de la SERIE.
-                val rawHtml = try { app.get(url, timeout = 60).text } catch (_: Exception) { "" }
+                // v22.6: pedir SIEMPRE con headers de navegador; un GET pelado puede recibir
+                // una página reducida sin payload RSC => mapa vacío => watch-UUIDs sin reescribir.
+                val rawHtml = try { app.get(url, headers = browserHeaders, timeout = 60).text } catch (_: Exception) { "" }
                 val hrefMap = Regex("\\\"watchHref\\\":\\\"([^\"\\\\]+)\\\",\\\"seriesHref\\\":\\\"([^\"\\\\]+)\\\"")
                     .findAll(rawHtml)
                     .map { it.destructured.component1() to it.destructured.component2() }
@@ -138,6 +140,12 @@ class DonghuaLifeBetaProvider : MainAPI() {
                     // Preferir la página de la serie; conservar el badge "EP n"
                     val seriesHref = hrefMap[href] ?: hrefMap.entries
                         .firstOrNull { it.key.startsWith(href.substringBeforeLast("-")) }?.value
+                        ?: hrefMap.entries.firstOrNull { entry ->
+                            // v22.6: watch-UUIDs pueden diferir del mapping en el sufijo
+                            // ("-t1-1" vs "-temporada-1-1"); comparar por prefijo UUID.
+                            val m = Regex("""^/watch/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}""").find(href)
+                            m != null && entry.key.startsWith(m.value)
+                        }?.value
                     val targetHref = seriesHref ?: href
                     val title = a.selectFirst("p.line-clamp-2")?.text()?.trim()
                         ?: a.selectFirst("img")?.attr("alt")?.trim()
@@ -358,6 +366,18 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val isSeries = url.contains("/series/")
 
         val seriesUrl = if (isWatch) {
+            // v22.6 FIX: la página watch (sea UUID "/watch/5273fa2e-...-temporada-1-4" o
+            // slug "/watch/shattering-galaxy-1-60") trae en su payload RSC el campo
+            // "seriesSlug" con el slug EXACTO de la serie — es la señal definitiva del
+            // sitio. Antes se derivaba el slug desde la propia URL de watch: con UUID eso
+            // era imposible (el "slug" era el UUID) y con slugs tipo "apotheosis-2-53"
+            // daba "apotheosis-2" (la serie real es "apotheosis") => la app mostraba la
+            // página del EPISODIO ("DOMINIO SIN LIMITES - EPISODIO 80") en vez de la serie.
+            val watchHtml = try {
+                app.get(url, headers = browserHeaders, timeout = 30).text
+            } catch (_: Exception) { "" }
+            val seriesSlug = Regex("""\\?"seriesSlug\\?":\\?"([^"\\]+)""")
+                .find(watchHtml)?.groupValues?.get(1)
             val path = url.substringAfter("/watch/")
             // v17 FIX: el sufijo de temporada es opcional — Eternal God Emperor usa URLs
             // como "...-temporada-1-5" (sin guión entre "temporada-1" y el episodio).
@@ -369,20 +389,23 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 // (ej. "apotheosis-2-53" -> "apotheosis-2"), pero la página real de la
                 // serie suele ser el slug SIN número ("/series/apotheosis"). Probar el
                 // slug completo y, si no existe, reintentar sin el sufijo numérico.
-                val candidates = mutableListOf(slug)
+                val candidates = mutableListOf<String>()
+                if (!seriesSlug.isNullOrBlank()) candidates.add(seriesSlug)
+                if (slug !in candidates) candidates.add(slug)
                 Regex("-\\d+$").find(slug)?.let {
-                    candidates.add(slug.substring(0, it.range.first))
+                    val base = slug.substring(0, it.range.first)
+                    if (base !in candidates) candidates.add(base)
                 }
                 var chosen: String? = null
                 for (cand in candidates) {
-                    if (cand.isBlank()) continue
+                    if (cand.isBlank() || Regex("^[0-9a-f]{8}-").containsMatchIn(cand)) continue
                     val candidate = "$mainUrl/series/$cand"
                     // v16 FIX: cuando la temporada usa slug UUID (p.ej. Eternal God Emperor:
                     // "9796b713-...-temporada-1"), /series/<slug> responde "Serie no encontrada".
                     // En ese caso usar la propia página watch, que contiene la lista completa.
                     // v22.3 FIX: el payload RSC trae "seasons" ESCAPADO (\"seasons\"); el probe
                     // debe aceptar ambas formas o siempre caería a la página del episodio.
-                    val probe = try { app.get(candidate, timeout = 30) } catch (_: Exception) { null }
+                    val probe = try { app.get(candidate, headers = browserHeaders, timeout = 30) } catch (_: Exception) { null }
                     val probeOk = probe != null && probe.isSuccessful &&
                         !probe.text.contains("no encontrada", ignoreCase = true) &&
                         (probe.text.contains("\"seasons\":") || probe.text.contains("\\\"seasons\\\":"))
@@ -659,10 +682,10 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 seasons.sortedBy { rec ->
                     Regex("(\\d+)$").find(rec.url.substringAfterLast("/"))?.groupValues?.get(1)?.toIntOrNull() ?: 0
                 }.forEach { all.add(it) }
-                others.forEach { if (all.size < 10) all.add(it) }
+                others.forEach { if (all.size < 16) all.add(it) }
             }
 
-            if (all.size < 10) {
+            if (all.size < 16) {
                 try {
                     val poolUrl = "$mainUrl/series"
                     val doc = app.get(poolUrl, timeout = 30).document
@@ -686,7 +709,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
                     all.addAll(pool)
                 } catch (_: Exception) {}
             }
-            all.take(10)
+            all.take(16)
         } catch (_: Exception) {
             emptyList()
         }

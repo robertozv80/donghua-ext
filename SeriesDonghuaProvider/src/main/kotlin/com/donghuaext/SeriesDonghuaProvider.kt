@@ -309,7 +309,7 @@ class SeriesDonghuaProvider : MainAPI() {
 
             // v22.3: similares por CATEGORÍA — elegir un género aleatorio de la ficha
             // (/lucha/, /artes-marciales/, ...) y tomar títulos de esa página.
-            if (all.size < 10 && genreHrefs.isNotEmpty()) {
+            if (all.size < 16 && genreHrefs.isNotEmpty()) {
                 try {
                     val genrePath = genreHrefs.random().let {
                         if (it.startsWith("http")) it.substringAfter(mainUrl, it) else it
@@ -336,7 +336,7 @@ class SeriesDonghuaProvider : MainAPI() {
             }
 
             // Similares aleatorios desde el home (relleno si la categoría no alcanzó)
-            if (all.size < 10) try {
+            if (all.size < 16) try {
                 val homeDoc = app.get("$mainUrl/", timeout = 120L).document
                 val pool = ArrayList<SearchResponse>()
                 homeDoc.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").forEach { link ->
@@ -355,7 +355,7 @@ class SeriesDonghuaProvider : MainAPI() {
                 pool.shuffle()
                 all.addAll(pool)
             } catch (_: Exception) {}
-            all.take(10)
+            all.take(16)
         } catch (_: Exception) {
             emptyList()
         }
