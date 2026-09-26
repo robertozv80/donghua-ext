@@ -11,3 +11,7 @@ local.properties
 *.apk
 *.cs3
 /builds/local.properties
+
+# Artefactos de compilación de los módulos (generados, no versionar)
+*/build/
+build/

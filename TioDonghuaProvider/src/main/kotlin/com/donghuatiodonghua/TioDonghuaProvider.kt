@@ -50,6 +50,13 @@ class TioDonghuaProvider : MainAPI() {
         "$mainUrl/##top" to "Top Más Vistas",
         "$mainUrl/donghua/" to "Últimos Agregados",
         "$mainUrl/peliculas/" to "Películas Recientes",
+        // v23.1: no hay páginas /generos/ ni /animes/ (404 verificado), pero las
+        // páginas de género de Dooplay sí existen: /genero/accion/ etc.
+        // (30 fichas por página, paginadas /genero/X/page/N/).
+        "$mainUrl/genero/accion/" to "Género: Acción",
+        "$mainUrl/genero/artes-marciales/" to "Género: Artes Marciales",
+        "$mainUrl/genero/aventura/" to "Género: Aventura",
+        "$mainUrl/genero/fantasia/" to "Género: Fantasía",
     )
 
     private val pageHeaders = mapOf(
@@ -82,6 +89,7 @@ class TioDonghuaProvider : MainAPI() {
         val isTop = request.data == "$mainUrl/##top"
         val isCatalog = request.data == "$mainUrl/donghua/"
         val isMovies = request.data == "$mainUrl/peliculas/"
+        val isGenre = request.data.contains("$mainUrl/genero/")
 
         // "Top Más Vistas" y "Películas Recientes" no tienen paginación real
         if ((isTop || isMovies) && page > 1) {
@@ -91,6 +99,7 @@ class TioDonghuaProvider : MainAPI() {
         val url = when {
             isHome && page > 1 -> "$mainUrl/episodios/page/$page/" // archivo /episodios/ (30/pág, mismo markup)
             isCatalog && page > 1 -> "$mainUrl/donghua/page/$page/"
+            isGenre && page > 1 -> "${request.data.trimEnd('/')}/page/$page/"
             else -> request.data
         }
         val doc = app.get(url, headers = pageHeaders, timeout = 30L).document
@@ -109,6 +118,8 @@ class TioDonghuaProvider : MainAPI() {
             isTop -> doc.select("div#featured-titles article.item").mapNotNull { parseTdCard(it) }
             // Últimos Agregados: catálogo /donghua/ ("Recently added")
             isCatalog -> doc.select("div#archive-content article.item").mapNotNull { parseTdCard(it) }
+            // Géneros: /genero/X/ usa div.items.full con los mismos cards
+            isGenre -> doc.select("div.items article.item").mapNotNull { parseTdCard(it) }
             // Películas Recientes: sección del home
             else -> sectionArticles(doc, "PELICULAS").mapNotNull { parseTdCard(it) }
         }
@@ -508,6 +519,10 @@ class TioDonghuaProvider : MainAPI() {
         when {
             u.contains("dailymotion.com") ->
                 extractTdDailymotion(u, referer, serverName, cb)
+            // modagamers: 302 a publicidad que planta cookie sid, luego challenge con
+            // JS redirect (verificado en vivo); seguir la cadena con reintentos.
+            u.contains("modagamers") ->
+                extractTdPackedFromChallenge(u, referer, serverName, cb)
             // Familia streamwish/filelions/vidguard: players con JS empaquetado
             u.contains("wish") || u.contains("sblona") || u.contains("ahvsh") ||
                 u.contains("filelions") || u.contains("luluvdo") ||
@@ -519,6 +534,85 @@ class TioDonghuaProvider : MainAPI() {
             }
         }
         return links > 0
+    }
+
+    /**
+     * v23.1: GET con manejo del challenge tipo modagamers. Patrón observado en
+     * vivo: la primera visita a una URL devuelve 302 hacia un click de publicidad
+     * y planta la cookie sid; repitiendo la MISMA URL con esa cookie el servidor
+     * responde 200 (o una página con window.location.replace hacia el siguiente
+     * paso). HTTP 429 = rate limit: esperar y reintentar.
+     */
+    private suspend fun tdGetWithChallenge(startUrl: String, referer: String?, maxSteps: Int = 5): String? {
+        var current = startUrl
+        repeat(maxSteps) {
+            val resp = try {
+                app.get(
+                    current, referer = referer,
+                    headers = mapOf("User-Agent" to USER_AGENT),
+                    timeout = 20L, allowRedirects = false
+                )
+            } catch (_: Exception) {
+                return null
+            }
+            when {
+                resp.code in 300..399 -> {
+                    // Redirect de publicidad: la cookie sid ya quedó en la sesión
+                    // de NiceHttp; reintentar la MISMA URL.
+                }
+                resp.code == 429 -> kotlinx.coroutines.delay(2500)
+                else -> {
+                    val text = resp.text
+                    val jsRedirect = Regex("window\\.location\\.replace\\('([^']+)'")
+                        .find(text)?.groupValues?.get(1)
+                    if (jsRedirect != null) {
+                        current = jsRedirect
+                    } else if (text.length > 1500) {
+                        return text
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    /** modagamers: resolver challenge y buscar m3u8/mp4 en el player final. */
+    private suspend fun extractTdPackedFromChallenge(
+        embedUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val html = tdGetWithChallenge(embedUrl, referer) ?: return false
+        return extractTdPackedFromHtml(html, referer, serverName, callback)
+    }
+
+    /** Búsqueda de fuentes de video sobre un HTML de player ya resuelto. */
+    private suspend fun extractTdPackedFromHtml(
+        html: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val unpacked = try { getAndUnpack(html) } catch (_: Exception) { html }
+        var found = false
+        Regex("""["']?hls["']?\s*:\s*\{[^}]*?["']?(?:url|file)["']?\s*:\s*["']([^"']+)["']""")
+            .find(unpacked)?.let { m ->
+                try { generateM3u8(serverName, m.groupValues[1], referer).forEach(callback); found = true } catch (_: Exception) {}
+            }
+        if (!found) {
+            Regex("""["']file["']\s*:\s*["']([^"']+\.m3u8[^"']*)["']""").findAll(unpacked).forEach { m ->
+                try { generateM3u8(serverName, m.groupValues[1], referer).forEach(callback); found = true } catch (_: Exception) {}
+            }
+        }
+        if (!found) {
+            Regex("""(https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)""").findAll(unpacked).forEach { m ->
+                try { generateM3u8(serverName, m.value, referer).forEach(callback); found = true } catch (_: Exception) {}
+            }
+        }
+        if (!found) {
+            Regex("""["']?file["']?\s*:\s*["']([^"']+\.mp4[^"']*)["']""").findAll(unpacked).forEach { m ->
+                callback(newExtractorLink(source = serverName, name = serverName, url = m.groupValues[1]) {
+                    this.referer = referer; this.quality = Qualities.Unknown.value
+                })
+                found = true
+            }
+        }
+        return found
     }
 
     /**
