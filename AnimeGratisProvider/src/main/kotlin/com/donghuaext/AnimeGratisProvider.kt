@@ -7,6 +7,7 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.getAndUnpack
 import java.util.*
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -794,26 +795,18 @@ class AnimeGratisProvider : MainAPI() {
         val doc = app.get(data, headers = headers, timeout = 30L).document
         var foundLinks = false
 
-        // Método 1: Botones de servidor (data-url)
-        doc.select("button.server-btn[data-url], button.server-tab[data-url]").forEach { btn ->
-            val videoUrl = btn.attr("data-url").trim()
-            val serverName = btn.text().trim().ifBlank { "Server" }
-            if (videoUrl.isNotEmpty() && videoUrl.startsWith("http")) {
-                foundLinks = processVideoUrl(videoUrl, data, serverName, subtitleCallback, callback) || foundLinks
+        // v22.8 FIX: la página usa botones class="server-option-btn" con data-url
+        // (ya no server-btn/server-tab): con el selector viejo NO se encontraba
+        // ningún servidor y por eso algunos episodios daban "No se encuentran
+        // enlaces". Seleccionar cualquier elemento con data-url y nombrar por host.
+        doc.select("[data-url]").forEach { el ->
+            val videoUrl = el.attr("data-url").trim()
+            if (videoUrl.startsWith("http")) {
+                foundLinks = processVideoUrl(videoUrl, data, serverNameFromUrl(videoUrl), subtitleCallback, callback) || foundLinks
             }
         }
 
-        // Método 2: data-url en cualquier elemento
-        if (!foundLinks) {
-            doc.select("[data-url]").forEach { el ->
-                val videoUrl = el.attr("data-url").trim()
-                if (videoUrl.isNotEmpty() && videoUrl.startsWith("http")) {
-                    foundLinks = processVideoUrl(videoUrl, data, "Server", subtitleCallback, callback) || foundLinks
-                }
-            }
-        }
-
-        // Método 3: Iframe
+        // Método 2: Iframe
         if (!foundLinks) {
             doc.select("iframe").forEach { iframe ->
                 val src = listOf("src", "data-src").map { iframe.attr(it).trim() }.firstOrNull { it.isNotBlank() }
@@ -826,7 +819,7 @@ class AnimeGratisProvider : MainAPI() {
             }
         }
 
-        // Método 4: URLs en scripts
+        // Método 3: URLs en scripts
         if (!foundLinks) {
             for (script in doc.select("script")) {
                 val scriptData = script.data()
@@ -850,26 +843,122 @@ class AnimeGratisProvider : MainAPI() {
         return foundLinks
     }
 
+    /** Nombre de servidor legible a partir del host ("https://voe.sx/.." -> "Voe"). */
+    private fun serverNameFromUrl(url: String): String {
+        return try {
+            val host = java.net.URI(url).host ?: return "Server"
+            host.removePrefix("www.").substringBefore(".").replaceFirstChar { it.uppercase() }
+        } catch (_: Exception) {
+            "Server"
+        }
+    }
+
+    /**
+     * v22.8 FIX: contar ENLACES EMITIDOS en vez de "no-excepción". Antes
+     * loadExtractor marcaba found=true aunque no emitiera nada (hosts muertos
+     * como vidhide/mp4upload con "File was deleted") y se saltaba el resto.
+     */
     private suspend fun processVideoUrl(
         videoUrl: String, referer: String, serverName: String,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ): Boolean {
-        var found = false
-        try { loadExtractor(videoUrl, referer, subtitleCallback, callback); found = true } catch (_: Exception) {}
-        if (!found) {
-            when {
-                videoUrl.contains("zilla-networks.com") || videoUrl.contains("player.zilla") ->
-                    found = extractFromPage(videoUrl, referer, serverName, callback)
-                videoUrl.contains("dailymotion.com") -> {
-                    val videoId = Regex("dailymotion\\.com/(?:embed/)?video/([a-zA-Z0-9]+)")
-                        .find(videoUrl)?.destructured?.component1()
-                    if (!videoId.isNullOrEmpty()) found = extractDailymotionApi(videoId, referer, serverName, callback)
-                }
-                videoUrl.contains("ok.ru") -> found = extractOkRu(videoUrl, referer, serverName, callback)
-                else -> found = extractFromPage(videoUrl, referer, serverName, callback)
+        var links = 0
+        val counting: (ExtractorLink) -> Unit = { links++; callback(it) }
+
+        when {
+            // Jugadores encriptados de jkanime (Opción 1/2 del sitio)
+            videoUrl.contains("jkanime.net/jkplayer") ->
+                extractJkPlayer(videoUrl, referer, serverName, counting)
+            // Familia streamwish (sfastwish.com, ...wish..., streamta)
+            videoUrl.contains("wish") || videoUrl.contains("sfast") || videoUrl.contains("streamta") ->
+                extractStreamwish(videoUrl, referer, serverName, counting)
+            videoUrl.contains("zilla-networks.com") || videoUrl.contains("player.zilla") ->
+                extractFromPage(videoUrl, referer, serverName, counting)
+            videoUrl.contains("dailymotion.com") -> {
+                val videoId = Regex("dailymotion\\.com/(?:embed/)?video/([a-zA-Z0-9]+)")
+                    .find(videoUrl)?.destructured?.component1()
+                if (!videoId.isNullOrEmpty()) extractDailymotionApi(videoId, referer, serverName, counting)
             }
+            videoUrl.contains("ok.ru") ->
+                extractOkRu(videoUrl, referer, serverName, counting)
         }
-        return found
+        // Genérico: extractor nativo de CloudStream (voe, mega, mixdrop, ...)
+        if (links == 0) {
+            try { loadExtractor(videoUrl, referer, subtitleCallback, counting) } catch (_: Exception) {}
+        }
+        // Último recurso: buscar m3u8/mp4 en la página del player
+        if (links == 0) {
+            extractFromPage(videoUrl, referer, serverName, counting)
+        }
+        return links > 0
+    }
+
+    /**
+     * v22.8: extractor propio para los jugadores encriptados de jkanime
+     * (jkplayer/um y /umv) que animegratis usa como servidores principales.
+     * El HTML del player trae el manifest .m3u8 directo (verificado en vivo:
+     * nika.playmudos.com/....m3u8?st=...&e=..., reproduce incluso sin referer).
+     */
+    private suspend fun extractJkPlayer(playerUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit): Boolean {
+        return try {
+            val text = app.get(playerUrl, referer = referer, headers = headers, timeout = 15L).text
+            var found = false
+            Regex("""(https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)""").findAll(text).forEach { m ->
+                try { generateM3u8(serverName, m.value, playerUrl).forEach(callback); found = true } catch (_: Exception) {}
+            }
+            if (!found) {
+                Regex("""(https?://[^"'\s<>]+\.mp4[^"'\s<>]*)""").findAll(text).forEach { m ->
+                    callback(newExtractorLink(source = serverName, name = serverName, url = m.value) {
+                        this.referer = playerUrl; this.quality = Qualities.Unknown.value
+                    })
+                    found = true
+                }
+            }
+            found
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * v22.8: extractor propio para streamwish/sfastwish (embed con JS ofuscado
+     * eval(function(p,a,c,k,e,d))). getAndUnpack devuelve el script con
+     * "hls": {"url": ...} / "file": "...m3u8...".
+     */
+    private suspend fun extractStreamwish(videoUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit): Boolean {
+        return try {
+            val html = app.get(videoUrl, referer = referer, headers = headers, timeout = 15L).text
+            val unpacked = try { getAndUnpack(html) } catch (_: Exception) { html }
+            var found = false
+            // 1) "hls": {"url": "...m3u8..."}
+            Regex("""["']?hls["']?\s*:\s*\{[^}]*?["']?(?:url|file)["']?\s*:\s*["']([^"']+)["']""").find(unpacked)?.let { m ->
+                try { generateM3u8(serverName, m.destructured.component1(), referer).forEach(callback); found = true } catch (_: Exception) {}
+            }
+            // 2) "file": "...m3u8..."
+            if (!found) {
+                Regex("""["']file["']\s*:\s*["']([^"']+\.m3u8[^"']*)["']""").findAll(unpacked).forEach { m ->
+                    try { generateM3u8(serverName, m.destructured.component1(), referer).forEach(callback); found = true } catch (_: Exception) {}
+                }
+            }
+            // 3) m3u8 directos
+            if (!found) {
+                Regex("""(https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)""").findAll(unpacked).forEach { m ->
+                    try { generateM3u8(serverName, m.destructured.component1(), referer).forEach(callback); found = true } catch (_: Exception) {}
+                }
+            }
+            // 4) mp4
+            if (!found) {
+                Regex("""["']?file["']?\s*:\s*["']([^"']+\.mp4[^"']*)["']""").findAll(unpacked).forEach { m ->
+                    callback(newExtractorLink(source = serverName, name = serverName, url = m.destructured.component1()) {
+                        this.referer = referer; this.quality = Qualities.Unknown.value
+                    })
+                    found = true
+                }
+            }
+            found
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private suspend fun extractFromPage(playerUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit): Boolean {

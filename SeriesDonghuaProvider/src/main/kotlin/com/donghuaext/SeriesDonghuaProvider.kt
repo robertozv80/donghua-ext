@@ -219,12 +219,26 @@ class SeriesDonghuaProvider : MainAPI() {
         .replace(Regex("\\p{Mn}+"), "")
         .replace(Regex("[^a-z0-9]+"), " ").trim()
 
+    /** Slug de una URL de ficha: "https://seriesdonghua.com/jade-dynasty-3/" -> "jade-dynasty-3". */
+    private fun slugOf(url: String): String =
+        url.trimEnd('/').substringAfterLast('/').lowercase()
+
     /**
-     * v22.2: recomendaciones con la NOTA del usuario:
-     * 1) Otras temporadas del mismo nombre (misma base de slug, p.ej.
-     *    "jade-dynasty-4" -> base "jade-dynasty") usando el buscador del sitio;
-     * 2) El resto: títulos del home (aleatorio). Máximo 10 resultados.
-     * Si no hay temporadas del mismo nombre, solo similares aleatorios.
+     * v22.7: recomendaciones con la NOTA del usuario:
+     * 1) Otras temporadas del mismo nombre (misma base de slug) vía buscador;
+     * 2) Similares: página aleatoria de un género (de la ficha o del catálogo) y
+     *    fallback final por página aleatoria de /todos-los-donghuas. Tope 16.
+     *
+     * Fixes v22.7 (verificados en vivo contra el sitio):
+     * - La página de género y el catálogo SOLO listan 12 fichas por página y el home
+     *   ya no trae fichas (solo episodios): por eso nunca se llegaba a 16.
+     * - El buscador NO matchea títulos con apóstrofes ni con sufijo de temporada:
+     *   "a record of a mortal's journey to immortality" y "renegade immortal batle
+     *   of the gods" devuelven "Tenemos un problema". Consultar con el slug real
+     *   (apóstrofe eliminado) sí funciona: "a record of a mortals journey to
+     *   immortality" -> 7 temporadas.
+     * - La ficha ya no siempre expone enlaces de género (clase "generos"); usar
+     *   /todos-los-donghuas?pag=N (38 páginas) como relleno universal.
      */
     private suspend fun fetchSeriesDonghuaRecommendations(
         seriesUrl: String,
@@ -235,32 +249,53 @@ class SeriesDonghuaProvider : MainAPI() {
             val all = ArrayList<SearchResponse>()
             val seen = mutableSetOf(seriesUrl)
 
-            // Base del slug: /donghua/jade-dynasty-4 -> "jade-dynasty"
-            val selfSlug = seriesUrl.substringAfterLast("/")
+            // Base del slug: /jade-dynasty-4 -> "jade-dynasty"
+            val selfSlug = slugOf(seriesUrl)
             val baseSlug = Regex("-\\d+$").replace(selfSlug, "")
             val norm = sdNormalize(seriesTitle)
             val baseNorm = Regex("\\s+\\d+$").replace(norm, "").trim()
 
-            // v22.5 FIX: el título puede traer sufijo de temporada ("Tales Of Demons and
-            // Gods Season10", "Doupo Cangqiong Temporada 3"). Buscar con ese sufijo
-            // adjunto devuelve resultados NO relacionados (verificado: "...gods season"
-            // devuelve Combat Continent, Martial Master, etc.). Quitarlo antes.
+            // v22.5: el título puede traer sufijo de temporada ("... Season10",
+            // "... Temporada 3"). Buscar con ese sufijo devuelve resultados no
+            // relacionados; quitarlo antes.
             val titleNoSeason = Regex("\\s*(temporada|season|s)\\s*\\d+$", RegexOption.IGNORE_CASE)
                 .replace(seriesTitle, "").trim()
                 .ifBlank { Regex("\\s+\\d+$").replace(seriesTitle, "").trim() }
             val normNoSeason = if (titleNoSeason != seriesTitle) sdNormalize(titleNoSeason) else ""
 
-            if (baseSlug.isNotBlank() && baseSlug != selfSlug || baseNorm.isNotBlank() && baseNorm != norm || normNoSeason.isNotBlank() && normNoSeason != norm) {
-                try {
-                    // v22.5: probar varias variantes de consulta hasta que una devuelva
-                    // temporadas del mismo nombre (antes solo "tales+of+demons+and+gods
-                    // +season10" que no matcheaba nada).
-                    val queries = LinkedHashSet<String>()
-                    if (normNoSeason.isNotBlank() && normNoSeason != norm) queries.add(normNoSeason)
-                    if (baseNorm.isNotBlank()) queries.add(baseNorm)
-                    if (queries.isEmpty()) queries.add(baseSlug.replace("-", " "))
+            /**
+             * v22.7: acepta una ficha como temporada del mismo nombre comparando
+             * slug Y base normalizada del título (la base del slug falla cuando el
+             * sitio translitera distinto, p.ej. "mortals" en slug vs "mortal's" en
+             * título, o "batle" vs "battle").
+             */
+            fun isSameBase(candidateSlug: String, candidateTitle: String): Boolean {
+                val cBase = Regex("-\\d+$").replace(candidateSlug, "")
+                if (baseSlug.isNotBlank() && cBase.startsWith(baseSlug)) return true
+                val tNorm = sdNormalize(candidateTitle)
+                val tBase = Regex("\\s+\\d+$").replace(tNorm, "").trim()
+                if (baseNorm.isNotBlank() && (tNorm.startsWith(baseNorm) || baseNorm.startsWith(tBase))) return true
+                if (normNoSeason.isNotBlank() && normNoSeason != norm && tNorm.startsWith(normNoSeason)) return true
+                return false
+            }
+
+            // ===== 1) Otras temporadas del mismo nombre vía buscador =====
+            // v22.7: las consultas del título normalizado fallan cuando traen
+            // apóstrofes ("mortal's") o sufijo de temporada. Añadir SIEMPRE el slug
+            // base real (ej. "a record of a mortals journey to immortality") como
+            // variante, es la que matchea con el buscador del sitio.
+            try {
+                val queries = LinkedHashSet<String>()
+                if (normNoSeason.isNotBlank() && normNoSeason != norm) queries.add(normNoSeason)
+                if (baseNorm.isNotBlank()) queries.add(baseNorm)
+                if (baseSlug.isNotBlank() && baseSlug != selfSlug) {
+                    queries.add(baseSlug.replace("-", " "))
+                    // slug con sufijo de temporada también matchea ("renegade immortal
+                    // battle of the gods" con slug "renegade-immortal-battle-of-the-gods")
+                    if (selfSlug != baseSlug) queries.add(selfSlug.replace("-", " "))
+                }
+                if (queries.isNotEmpty()) {
                     var searchDoc: org.jsoup.nodes.Document? = null
-                    var usedQ = ""
                     for (q in queries) {
                         try {
                             val d = app.get(
@@ -268,21 +303,15 @@ class SeriesDonghuaProvider : MainAPI() {
                                 timeout = 120L
                             ).document
                             val hasMatch = d.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").any { link ->
-                                val t = link.selectFirst("h5")?.text()?.trim() ?: ""
                                 val href = link.attr("href")
-                                !href.contains("episodio") &&
-                                    (sdNormalize(t).startsWith(normNoSeason.ifBlank { baseNorm }) ||
-                                     href.substringAfterLast("/").startsWith(baseSlug))
+                                if (href.contains("episodio")) return@any false
+                                isSameBase(slugOf(resolveUrl(href)), link.selectFirst("h5")?.text()?.trim() ?: "")
                             }
-                            if (hasMatch || searchDoc == null) {
-                                searchDoc = d
-                                usedQ = q
-                            }
+                            if (hasMatch || searchDoc == null) searchDoc = d
                             if (hasMatch) break
                         } catch (_: Exception) {}
                     }
-                    if (searchDoc != null) {
-                        val mainDoc = searchDoc
+                    searchDoc?.let { mainDoc ->
                         val mainContent = mainDoc.selectFirst("div.col-md-9") ?: mainDoc
                         val seasons = ArrayList<Triple<String, String, String>>() // url, title, poster
                         mainContent.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").forEach { link ->
@@ -290,12 +319,8 @@ class SeriesDonghuaProvider : MainAPI() {
                             if (href.contains("episodio")) return@forEach
                             val fullHref = resolveUrl(href)
                             if (fullHref in seen) return@forEach
-                            val slug = fullHref.substringAfterLast("/")
                             val t = link.selectFirst("h5")?.text()?.trim() ?: return@forEach
-                            val isSameBase = slug.startsWith(baseSlug) ||
-                                (baseNorm.isNotBlank() && sdNormalize(t).startsWith(baseNorm)) ||
-                                (normNoSeason.isNotBlank() && normNoSeason != norm && sdNormalize(t).startsWith(normNoSeason))
-                            if (!isSameBase) return@forEach
+                            if (!isSameBase(slugOf(fullHref), t)) return@forEach
                             seen.add(fullHref)
                             seasons.add(Triple(fullHref, t, link.selectFirst("div.img img")?.attr("src") ?: ""))
                         }
@@ -304,43 +329,80 @@ class SeriesDonghuaProvider : MainAPI() {
                             all.add(newAnimeSearchResponse(t, u) { this.posterUrl = resolveUrl(p) })
                         }
                     }
-                } catch (_: Exception) {}
+                }
+            } catch (_: Exception) {}
+
+            /**
+             * v22.7: relleno "similares" desde una página de género. La página solo
+             * lista 12 fichas, pero tiene paginación /genero/page/N/ — elegir una
+             * página al azar para variar los resultados.
+             */
+            suspend fun fillFromGenre(genrePathRaw: String): Boolean {
+                val genrePath = genrePathRaw.let {
+                    if (it.startsWith("http")) it.substringAfter(mainUrl, it) else it
+                }.trimEnd('/')
+                if (genrePath.isBlank() || genrePath == "/") return false
+                return try {
+                    // Detectar última página de la paginación del género (page/N)
+                    val firstDoc = app.get(resolveUrl(genrePath), timeout = 120L).document
+                    val lastPage = Regex("/page/(\\d+)/?").findAll(firstDoc.html())
+                        .mapNotNull { it.groupValues[1].toIntOrNull() }.maxOrNull() ?: 1
+                    val page = if (lastPage > 1) (1..lastPage).random() else 1
+                    val doc = if (page == 1) firstDoc else
+                        app.get(resolveUrl("$genrePath/page/$page/"), timeout = 120L).document
+                    val poolG = ArrayList<SearchResponse>()
+                    doc.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").forEach { link ->
+                        if (poolG.size >= 40) return@forEach
+                        val href = link.attr("href")
+                        if (href.contains("episodio")) return@forEach
+                        val fullHref = resolveUrl(href)
+                        if (fullHref in seen) return@forEach
+                        val t = link.selectFirst("h5")?.text()?.trim() ?: return@forEach
+                        seen.add(fullHref)
+                        poolG.add(newAnimeSearchResponse(t, fullHref) {
+                            this.posterUrl = resolveUrl(link.selectFirst("div.img img")?.attr("src") ?: "")
+                        })
+                    }
+                    poolG.shuffle()
+                    all.addAll(poolG)
+                    all.size >= 16
+                } catch (_: Exception) { false }
             }
 
-            // v22.3: similares por CATEGORÍA — elegir un género aleatorio de la ficha
-            // (/lucha/, /artes-marciales/, ...) y tomar títulos de esa página.
-            if (all.size < 16 && genreHrefs.isNotEmpty()) {
-                try {
-                    val genrePath = genreHrefs.random().let {
-                        if (it.startsWith("http")) it.substringAfter(mainUrl, it) else it
+            // ===== 2) Similares: género de la ficha (si expone) o del catálogo =====
+            if (all.size < 16) {
+                var filled = false
+                if (genreHrefs.isNotEmpty()) {
+                    val candidates = genreHrefs.shuffled()
+                    for (g in candidates) {
+                        if (all.size >= 16) break
+                        if (fillFromGenre(g)) { filled = true; break }
                     }
-                    if (genrePath.isNotBlank() && genrePath != "/") {
-                        val genreDoc = app.get(resolveUrl(genrePath), timeout = 120L).document
-                        val poolG = ArrayList<SearchResponse>()
-                        genreDoc.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").forEach { link ->
-                            if (poolG.size >= 40) return@forEach
-                            val href = link.attr("href")
-                            if (href.contains("episodio")) return@forEach
-                            val fullHref = resolveUrl(href)
-                            if (fullHref in seen) return@forEach
-                            val t = link.selectFirst("h5")?.text()?.trim() ?: return@forEach
-                            seen.add(fullHref)
-                            poolG.add(newAnimeSearchResponse(t, fullHref) {
-                                this.posterUrl = resolveUrl(link.selectFirst("div.img img")?.attr("src") ?: "")
-                            })
-                        }
-                        poolG.shuffle()
-                        all.addAll(poolG)
+                }
+                // v22.7 fallback: géneros comunes del catálogo (la ficha a veces no
+                // expone enlaces de género, p.ej. Jade Dynasty 3, Renegade Immortal)
+                if (!filled && all.size < 16) {
+                    for (g in listOf("accion", "aventura", "artes-marciales", "fantasia", "lucha", "cultivacion").shuffled()) {
+                        if (all.size >= 16) break
+                        if (fillFromGenre("/$g/")) break
                     }
-                } catch (_: Exception) {}
+                }
             }
 
-            // Similares aleatorios desde el home (relleno si la categoría no alcanzó)
+            // ===== 3) Fallback final: página aleatoria del catálogo =====
+            // v22.7: /todos-los-donghuas lista 12 fichas por página y tiene ~38
+            // páginas; el home ya solo trae episodios (no fichas), así que el relleno
+            // anterior por home nunca devolvía nada.
             if (all.size < 16) try {
-                val homeDoc = app.get("$mainUrl/", timeout = 120L).document
+                val firstDoc = app.get("$mainUrl/todos-los-donghuas", timeout = 120L).document
+                val lastPage = Regex("pag=(\\d+)").findAll(firstDoc.html())
+                    .mapNotNull { it.groupValues[1].toIntOrNull() }.maxOrNull() ?: 1
+                val page = if (lastPage > 1) (1..lastPage).random() else 1
+                val doc = if (page == 1) firstDoc else
+                    app.get("$mainUrl/todos-los-donghuas?pag=$page", timeout = 120L).document
                 val pool = ArrayList<SearchResponse>()
-                homeDoc.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").forEach { link ->
-                    if (pool.size >= 60) return@forEach
+                doc.select("div.item a.angled-img, div.item.col-lg-3 a, div.item.col-lg-2 a").forEach { link ->
+                    if (pool.size >= 40) return@forEach
                     val href = link.attr("href")
                     if (href.contains("episodio")) return@forEach
                     val fullHref = resolveUrl(href)
