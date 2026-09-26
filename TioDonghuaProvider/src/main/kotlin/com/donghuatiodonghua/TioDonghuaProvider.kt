@@ -21,34 +21,60 @@ const val TD_USER_AGENT =
  */
 private suspend fun extractTdOkRu(embedUrl: String, referer: String, name: String, callback: (ExtractorLink) -> Unit): Boolean {
     return try {
-        val html = app.get(embedUrl, referer = referer,
+        // v24.1: el embed puede llegar protocol-relative (//ok.ru/...) dentro del
+        // HTML dtshcode; sin esquema la petición falla.
+        val url = if (embedUrl.startsWith("//")) "https:$embedUrl" else embedUrl
+        val html = app.get(url, referer = referer,
             headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L).text
+        // v24.1: decodificar TODOS los escapes del data-options: &quot;, \/ y
+        // \uXXXX (\u0026 = '&'). Sin esto la URL del manifiesto llega con
+        // '\u0026' literal, el player la descarta y el episodio queda sin
+        // enlaces (verificado en logcat 16:49:45, "M3u8 Playlist is not a
+        // Master Playlist").
         val options = Regex("data-options=\"([^\"]+)\"").find(html)
             ?.groupValues?.get(1)
             ?.replace("&quot;", "\"")
             ?.replace("\\/", "/")
+            ?.let { Regex("""\\u([0-9a-fA-F]{4})""").replace(it) { m ->
+                m.groupValues[1].toInt(16).toChar().toString()
+            } }
             ?: return false
         var found = false
-        // hlsManifestUrl (mejor opción: adaptable)
+        // hlsManifestUrl (mejor opción: adaptable). v24.1: VALIDAR el manifiesto
+        // antes de entregarlo: generateM3u8 no lanza excepción con contenido
+        // inválido y M3u8Helper filtra el link en reproducción => toast "Enlaces
+        // no encontrados". Si no responde #EXTM3U, caer al fallback progresivo.
         Regex("\"hlsManifestUrl\":\"([^\"]+)\"").find(options)?.let { m ->
-            try { generateM3u8(name, m.groupValues[1], embedUrl).forEach(callback); found = true } catch (_: Exception) {}
+            try {
+                val manifest = app.get(m.groupValues[1], referer = url,
+                    headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L).text
+                if (manifest.trimStart().startsWith("#EXTM3U")) {
+                    generateM3u8(name, m.groupValues[1], url).forEach(callback)
+                    found = true
+                }
+            } catch (_: Exception) {}
         }
-        // Fallback: videos[] con urls progresivas por calidad
+        // Fallback: videos[] con urls progresivas por calidad. v24.1: emitir
+        // TODAS las calidades disponibles (antes solo la última, y solo si
+        // generateM3u8 lanzaba excepción, que nunca ocurría con un manifiesto
+        // inválido).
         if (!found) {
-            val videoPairs = Regex("\"name\":\"(mobile|lowest|low|sd|hd|full|super)\",\"url\":\"([^\"]+)\"")
-                .findAll(options).toList()
-            videoPairs.lastOrNull()?.let { m ->
-                callback(newExtractorLink(source = name, name = name, url = m.groupValues[2]) {
-                    this.referer = embedUrl
-                    this.quality = when (m.groupValues[1]) {
-                        "full", "super" -> Qualities.P1080.value
-                        "hd" -> Qualities.P720.value
-                        "sd" -> Qualities.P480.value
-                        else -> Qualities.P360.value
+            Regex("\"name\":\"(mobile|lowest|low|sd|hd|full|super)\",\"url\":\"([^\"]+)\"")
+                .findAll(options).forEach { m ->
+                    val progressive = m.groupValues[2]
+                    if (progressive.startsWith("http")) {
+                        callback(newExtractorLink(source = name, name = name, url = progressive) {
+                            this.referer = url
+                            this.quality = when (m.groupValues[1]) {
+                                "full", "super" -> Qualities.P1080.value
+                                "hd" -> Qualities.P720.value
+                                "sd" -> Qualities.P480.value
+                                else -> Qualities.P360.value
+                            }
+                        })
+                        found = true
                     }
-                })
-                found = true
-            }
+                }
         }
         found
     } catch (_: Exception) {
@@ -145,7 +171,8 @@ class TioDonghuaProvider : MainAPI() {
         "$mainUrl/genero/accion/" to "Género: Acción",
         "$mainUrl/genero/artes-marciales/" to "Género: Artes Marciales",
         "$mainUrl/genero/aventura/" to "Género: Aventura",
-        "$mainUrl/genero/fantasia/" to "Género: Fantasía",
+        // v24.1: "Género: Fantasía" eliminada por pedido del usuario (liberar
+        // espacio en el home).
     )
 
     private val pageHeaders = mapOf(
@@ -189,6 +216,10 @@ class TioDonghuaProvider : MainAPI() {
 
         val url = when {
             isHome && page > 1 -> "$mainUrl/episodios/page/$page/" // archivo /episodios/ (30/pág, mismo markup)
+            // v24.1 FIX: el Top vive en el HOME (div#featured-titles); la URL
+            // derivada "$mainUrl/top" da 404 (la rama isTop se perdió en la
+            // refactor v24.0) => la sección salía VACÍA.
+            isTop -> "$mainUrl/"
             isCatalog && page > 1 -> "$mainUrl/donghua/page/$page/"
             isMovies && page > 1 -> "$mainUrl/peliculas/page/$page/" // 404 si no existe: hasNext=false
             isGenre && page > 1 -> "${request.data.trimEnd('/')}/page/$page/"

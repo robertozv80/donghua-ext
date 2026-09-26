@@ -131,8 +131,16 @@ class DonghuaLifeBetaProvider : MainAPI() {
                 // v22.6: pedir SIEMPRE con headers de navegador; un GET pelado puede recibir
                 // una página reducida sin payload RSC => mapa vacío => watch-UUIDs sin reescribir.
                 val rawHtml = try { app.get(url, headers = browserHeaders, timeout = 60).text } catch (_: Exception) { "" }
-                val hrefMap = Regex("\\\"watchHref\\\":\\\"([^\"\\\\]+)\\\",\\\"seriesHref\\\":\\\"([^\"\\\\]+)\\\"")
-                    .findAll(rawHtml)
+                // v24.1 FIX: el payload RSC escapa comillas (\"watchHref\") y barras
+                // (\/); el regex anterior exigía '"watchHref"' pelado, nunca matcheaba
+                // => mapa vacío, las cards conservaban la watch-URL y al tocarlas se
+                // abría la página del EPISODIO ("Trama no encontrada"). Des-escapar con
+                // extractRscPayload (mismo mecanismo de load()) y aplicar regex
+                // simples sobre el texto limpio. El regex anterior, ademas de no
+                // tolerar escapes, usaba \s en raw string (backslash literal).
+                val rscHome = extractRscPayload(rawHtml)
+                val hrefMap = Regex("\"watchHref\":\"([^\"]+)\",\"seriesHref\":\"([^\"]+)\"")
+                    .findAll(rscHome)
                     .map { it.destructured.component1() to it.destructured.component2() }
                     .toMap()
                 doc.select("#latest-episodes-scroll a[href*='/watch/']").forEach { a ->
@@ -379,58 +387,68 @@ class DonghuaLifeBetaProvider : MainAPI() {
         val isSeries = url.contains("/series/")
 
         val seriesUrl = if (isWatch) {
-            // v22.6 FIX: la página watch (sea UUID "/watch/5273fa2e-...-temporada-1-4" o
-            // slug "/watch/shattering-galaxy-1-60") trae en su payload RSC el campo
-            // "seriesSlug" con el slug EXACTO de la serie — es la señal definitiva del
-            // sitio. Antes se derivaba el slug desde la propia URL de watch: con UUID eso
-            // era imposible (el "slug" era el UUID) y con slugs tipo "apotheosis-2-53"
-            // daba "apotheosis-2" (la serie real es "apotheosis") => la app mostraba la
-            // página del EPISODIO ("DOMINIO SIN LIMITES - EPISODIO 80") en vez de la serie.
+            // v24.1 FIX (reescritura completa): la navegación desde "Últimos
+            // Episodios" abría la página del EPISODIO ("I Am The Fated Villain -
+            // Capitulo 21 · Trama no encontrada") en vez de la ficha de la serie.
+            // Tres fallas encadenadas, verificadas en vivo:
+            //  1) el regex de seriesSlug exigía '?' literal (\? matchea el carácter
+            //     '?', no la barra invertida del payload) => NUNCA matcheaba;
+            //  2) el probe de validez rechazaba TODAS las páginas de serie porque
+            //     contienen "Página no encontrada" en el boundary prerenderizado
+            //     del payload RSC (falso positivo), y además exigía "seasons": que
+            //     el sitio ya no emite;
+            //  3) slugs estilo "/watch/<serie>-capitulo-21" no casaban con el
+            //     seriesSlug real (la serie es /series/<serie> a secas).
             val watchHtml = try {
                 app.get(url, headers = browserHeaders, timeout = 30).text
             } catch (_: Exception) { "" }
-            val seriesSlug = Regex("""\\?"seriesSlug\\?":\\?"([^"\\]+)""")
-                .find(watchHtml)?.groupValues?.get(1)
+            // seriesSlug del payload RSC (con o sin escapes): señal definitiva
+            // v24.1: des-escapar el payload RSC y regex simple; el anterior
+            // exigia '?' literal (\? matchea el caracter '?', no la barra) y
+            // nunca encontro el seriesSlug.
+            val watchPayload = extractRscPayload(watchHtml)
+            val seriesSlug = Regex("\"seriesSlug\":\"([^\"]+)\"")
+                .find(watchPayload)?.groupValues?.get(1)
             val path = url.substringAfter("/watch/")
-            // v17 FIX: el sufijo de temporada es opcional — Eternal God Emperor usa URLs
-            // como "...-temporada-1-5" (sin guión entre "temporada-1" y el episodio).
-            // Antes este regex exigía dos guiones y devolvía un slug corrupto ("...-1").
-            val match = Regex("""^(.+?)(?:-(\d+))??-(\d+)$""").find(path)
+            // Sufijo "capitulo-N" (estilo slug) o "-temporada-1-N"/"-N" (estilo UUID)
+            val pathSlug = path.replace(Regex("-capitulo-\\d+$", RegexOption.IGNORE_CASE), "")
+            val match = Regex("""^(.+?)(?:-(\d+))??-(\d+)$""").find(pathSlug)
+            val candidates = mutableListOf<String>()
+            if (!seriesSlug.isNullOrBlank()) candidates.add(seriesSlug)
             if (match != null) {
                 val slug = match.groupValues[1]
-                // v22.4 FIX: el slug del watch puede incluir el número de TEMPORADA
-                // (ej. "apotheosis-2-53" -> "apotheosis-2"), pero la página real de la
-                // serie suele ser el slug SIN número ("/series/apotheosis"). Probar el
-                // slug completo y, si no existe, reintentar sin el sufijo numérico.
-                val candidates = mutableListOf<String>()
-                if (!seriesSlug.isNullOrBlank()) candidates.add(seriesSlug)
                 if (slug !in candidates) candidates.add(slug)
                 Regex("-\\d+$").find(slug)?.let {
                     val base = slug.substring(0, it.range.first)
                     if (base !in candidates) candidates.add(base)
                 }
-                var chosen: String? = null
-                for (cand in candidates) {
-                    if (cand.isBlank() || Regex("^[0-9a-f]{8}-").containsMatchIn(cand)) continue
-                    val candidate = "$mainUrl/series/$cand"
-                    // v16 FIX: cuando la temporada usa slug UUID (p.ej. Eternal God Emperor:
-                    // "9796b713-...-temporada-1"), /series/<slug> responde "Serie no encontrada".
-                    // En ese caso usar la propia página watch, que contiene la lista completa.
-                    // v22.3 FIX: el payload RSC trae "seasons" ESCAPADO (\"seasons\"); el probe
-                    // debe aceptar ambas formas o siempre caería a la página del episodio.
-                    val probe = try { app.get(candidate, headers = browserHeaders, timeout = 30) } catch (_: Exception) { null }
-                    val probeOk = probe != null && probe.isSuccessful &&
-                        !probe.text.contains("no encontrada", ignoreCase = true) &&
-                        (probe.text.contains("\"seasons\":") || probe.text.contains("\\\"seasons\\\":"))
-                    if (probeOk) {
-                        chosen = candidate
-                        break
-                    }
-                }
-                chosen ?: url
-            } else {
-                url
             }
+            // El slug de la URL menos "capitulo-N" (ej. i-am-the-fated-villain)
+            if (pathSlug !in candidates) candidates.add(pathSlug)
+            Regex("-\\d+$").find(pathSlug)?.let {
+                val base = pathSlug.substring(0, it.range.first)
+                if (base !in candidates) candidates.add(base)
+            }
+            var chosen: String? = null
+            for (cand in candidates) {
+                if (cand.isBlank() || Regex("^[0-9a-f]{8}-").containsMatchIn(cand)) continue
+                val candidate = "$mainUrl/series/$cand"
+                // v24.1: probe ROBUSTO. Una página de serie VÁLIDA trae en su RSC
+                // "seriesSlug" + ld+json con @type TVSeries. La de serie inexistente
+                // NO trae seriesSlug. (Antes: exigir ausencia de "no encontrada"
+                // rechazaba todo — el boundary prerenderizado la incluye SIEMPRE.)
+                val probe = try { app.get(candidate, headers = browserHeaders, timeout = 30) } catch (_: Exception) { null }
+                val probeOk = probe != null && probe.isSuccessful &&
+                    probe.text.contains("seriesSlug") &&
+                    (probe.text.contains("TVSeries") || probe.text.contains("ld+json"))
+                if (probeOk) {
+                    chosen = candidate
+                    break
+                }
+            }
+            // Red de seguridad final: si nada resolvió, quedarse en la watch page
+            // (mejor episodio suelto que crash/404).
+            chosen ?: url
         } else {
             url
         }
