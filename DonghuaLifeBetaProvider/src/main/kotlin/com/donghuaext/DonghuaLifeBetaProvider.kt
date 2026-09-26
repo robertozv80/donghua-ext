@@ -150,17 +150,30 @@ class DonghuaLifeBetaProvider : MainAPI() {
                     val title = a.selectFirst("p.line-clamp-2")?.text()?.trim()
                         ?: a.selectFirst("img")?.attr("alt")?.trim()
                         ?: href.substringAfterLast("/").replace("-", " ")
+                    // v24: nunca mostrar una watch-URL cruda como título: si el
+                    // título de la card viene vacío y el target es una serie con
+                    // slug, generar un título legible desde el slug.
+                    val displayTitle = if (title.isBlank()) {
+                        when {
+                            targetHref.contains("/series/") -> targetHref.trimEnd('/')
+                                .substringAfterLast('/').replace("-", " ")
+                                .replaceFirstChar { it.uppercase() }
+                            else -> "Episodio"
+                        }
+                    } else title
                     val epBadge = a.selectFirst("span")?.text()?.trim() ?: ""
                     val epNum = Regex("""EP\s*(\d+)""", RegexOption.IGNORE_CASE).find(epBadge)
                         ?.groupValues?.get(1)?.toIntOrNull()
                     val poster = a.selectFirst("img")?.attr("src")?.let { resolveUrl(extractNextImagePath(it)) }
                     home.add(
-                        newAnimeSearchResponse(title, resolveUrl(targetHref), TvType.Anime) {
+                        newAnimeSearchResponse(displayTitle, resolveUrl(targetHref), TvType.Anime) {
                             this.posterUrl = poster
                             if (epNum != null) addDubStatus(DubStatus.Subbed, epNum)
                         }
                     )
                 }
+                // v24: dedupe por URL+episodio (el home a veces repite una serie
+                // con 2 episodios; sin dedupe la sección muestra títulos "duplicados")
                 hasNext = false
             }
 
@@ -276,7 +289,7 @@ class DonghuaLifeBetaProvider : MainAPI() {
         }
 
         return newHomePageResponse(
-            list = HomePageList(request.name, home, isHorizontalImages = false),
+            list = HomePageList(request.name, home.distinctBy { "${it.url}|${(it as? AnimeSearchResponse)?.episodes?.get(DubStatus.Subbed)}" }, isHorizontalImages = false),
             hasNext = hasNext
         )
     }

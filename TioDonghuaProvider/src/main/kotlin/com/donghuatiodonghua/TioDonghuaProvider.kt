@@ -11,6 +11,95 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlin.collections.ArrayList
 
+/** UA de navegador (necesario para varios hosts). */
+const val TD_USER_AGENT =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+
+/**
+ * v24: extractor de Ok.Ru (odnoklassniki). La página del embed trae el
+ * hlsManifestUrl y las urls progresivas en el atributo data-options.
+ */
+private suspend fun extractTdOkRu(embedUrl: String, referer: String, name: String, callback: (ExtractorLink) -> Unit): Boolean {
+    return try {
+        val html = app.get(embedUrl, referer = referer,
+            headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L).text
+        val options = Regex("data-options=\"([^\"]+)\"").find(html)
+            ?.groupValues?.get(1)
+            ?.replace("&quot;", "\"")
+            ?.replace("\\/", "/")
+            ?: return false
+        var found = false
+        // hlsManifestUrl (mejor opción: adaptable)
+        Regex("\"hlsManifestUrl\":\"([^\"]+)\"").find(options)?.let { m ->
+            try { generateM3u8(name, m.groupValues[1], embedUrl).forEach(callback); found = true } catch (_: Exception) {}
+        }
+        // Fallback: videos[] con urls progresivas por calidad
+        if (!found) {
+            val videoPairs = Regex("\"name\":\"(mobile|lowest|low|sd|hd|full|super)\",\"url\":\"([^\"]+)\"")
+                .findAll(options).toList()
+            videoPairs.lastOrNull()?.let { m ->
+                callback(newExtractorLink(source = name, name = name, url = m.groupValues[2]) {
+                    this.referer = embedUrl
+                    this.quality = when (m.groupValues[1]) {
+                        "full", "super" -> Qualities.P1080.value
+                        "hd" -> Qualities.P720.value
+                        "sd" -> Qualities.P480.value
+                        else -> Qualities.P360.value
+                    }
+                })
+                found = true
+            }
+        }
+        found
+    } catch (_: Exception) {
+        false
+    }
+}
+
+/**
+ * v24: extractor de Rumble. La página del embed incluye el embed JS con
+ * los mp4 directos por calidad (hugh.cdn.rumble.cloud).
+ */
+private suspend fun extractTdRumble(embedUrl: String, referer: String, name: String, callback: (ExtractorLink) -> Unit): Boolean {
+    return try {
+        val html = app.get(embedUrl, referer = referer,
+            headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L).text
+        // Las URLs vienen con \/ escapado dentro del JSON del embed
+        val fixed = html.replace("\\/", "/")
+        val url = Regex("https://[a-z0-9.]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4")
+            .find(fixed)?.value ?: return false
+        callback(newExtractorLink(source = name, name = name, url = url) {
+            this.referer = embedUrl
+            this.quality = Qualities.Unknown.value
+        })
+        true
+    } catch (_: Exception) {
+        false
+    }
+}
+
+/**
+ * v24: extractor de StreamTape. El HTML del player trae el enlace directo
+ * `//<host>.streamtape.<tld>/get_video?id=...&expires=...&ip=...&token=...`
+ * (revelado solo tras el click; nos basta con extraerlo del HTML).
+ */
+private suspend fun extractTdStreamTape(embedUrl: String, referer: String, name: String, callback: (ExtractorLink) -> Unit): Boolean {
+    return try {
+        val html = app.get(embedUrl, referer = referer,
+            headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L).text
+        val direct = Regex("(?:https?:)?//[a-z0-9-]+\\.streamtape[a-z.]*/get_video\\?[^\"'\\s<>]+", RegexOption.IGNORE_CASE)
+            .find(html)?.value ?: return false
+        val fixedUrl = if (direct.startsWith("//")) "https:$direct" else direct
+        callback(newExtractorLink(source = name, name = name, url = fixedUrl) {
+            this.referer = embedUrl
+            this.quality = Qualities.Unknown.value
+        })
+        true
+    } catch (_: Exception) {
+        false
+    }
+}
+
 /**
  * TioDonghua (https://tiodonghua.lat/) — WordPress con tema Dooplay.
  *
@@ -45,11 +134,11 @@ class TioDonghuaProvider : MainAPI() {
         TvType.AnimeMovie,
     )
 
-    override val mainPage = mainPageOf(
+    override val    mainPage = mainPageOf(
         "$mainUrl/" to "Últimos Episodios",
         "$mainUrl/##top" to "Top Más Vistas",
         "$mainUrl/donghua/" to "Últimos Agregados",
-        "$mainUrl/peliculas/" to "Películas Recientes",
+        "$mainUrl/##peliculas" to "Películas Recientes",
         // v23.1: no hay páginas /generos/ ni /animes/ (404 verificado), pero las
         // páginas de género de Dooplay sí existen: /genero/accion/ etc.
         // (30 fichas por página, paginadas /genero/X/page/N/).
@@ -88,21 +177,27 @@ class TioDonghuaProvider : MainAPI() {
         val isHome = request.data == "$mainUrl/"
         val isTop = request.data == "$mainUrl/##top"
         val isCatalog = request.data == "$mainUrl/donghua/"
-        val isMovies = request.data == "$mainUrl/peliculas/"
+        // v24: /peliculas/ es un archivo propio (sin header "PELICULAS"), así que
+        // se pide directo en vez de la sección del home (que carga por AJAX).
+        val isMovies = request.data == "$mainUrl/##peliculas"
         val isGenre = request.data.contains("$mainUrl/genero/")
 
-        // "Top Más Vistas" y "Películas Recientes" no tienen paginación real
-        if ((isTop || isMovies) && page > 1) {
+        // "Top Más Vistas" no tiene paginación real
+        if (isTop && page > 1) {
             return newHomePageResponse(list = HomePageList(request.name, emptyList()), hasNext = false)
         }
 
         val url = when {
             isHome && page > 1 -> "$mainUrl/episodios/page/$page/" // archivo /episodios/ (30/pág, mismo markup)
             isCatalog && page > 1 -> "$mainUrl/donghua/page/$page/"
+            isMovies && page > 1 -> "$mainUrl/peliculas/page/$page/" // 404 si no existe: hasNext=false
             isGenre && page > 1 -> "${request.data.trimEnd('/')}/page/$page/"
-            else -> request.data
+            else -> request.data.removePrefix("$mainUrl/##").let { if (it == request.data) request.data else "$mainUrl/${it.removePrefix("$mainUrl/")}" }
         }
-        val doc = app.get(url, headers = pageHeaders, timeout = 30L).document
+        val doc = app.get(
+            if (isMovies) "$mainUrl/peliculas/" else url,
+            headers = pageHeaders, timeout = 30L
+        ).document
 
         val items: List<SearchResponse> = when {
             // Últimos Episodios: cards article.item.episodes con span.serie
@@ -120,19 +215,27 @@ class TioDonghuaProvider : MainAPI() {
             isCatalog -> doc.select("div#archive-content article.item").mapNotNull { parseTdCard(it) }
             // Géneros: /genero/X/ usa div.items.full con los mismos cards
             isGenre -> doc.select("div.items article.item").mapNotNull { parseTdCard(it) }
-            // Películas Recientes: sección del home
+            // Películas: catálogo /peliculas/ con div#archive-content
+            isMovies -> doc.select("div#archive-content article.item").mapNotNull { parseTdCard(it) }
+            // Resto: sección del home por h2
             else -> sectionArticles(doc, "PELICULAS").mapNotNull { parseTdCard(it) }
         }
 
         // El home y /episodios/ tienen miles de páginas (16,594 episodios):
-        // permitir paginación infinita; Top/Películas no tienen paginación real.
+        // permitir paginación infinita; Top no tiene paginación real.
         val hasNext = when {
             isHome -> true
-            isTop || isMovies -> false
+            isTop -> false
+            isMovies -> page == 1 && doc.select("div#archive-content article.item").isNotEmpty() &&
+                doc.html().contains("peliculas/page/2/")
             else -> doc.select("a[href*=\"page/${page + 1}/\"]").isNotEmpty()
         }
+        // v24: "Últimos Episodios" como fila de imágenes horizontales (las cards
+        // ya son panorámicas 300x170: carrusel visual tipo "Captura home
+        // donghualife.png"; CloudStream no expone hero/spotlight a los plugins,
+        // esta es la fila más grande que permite la API).
         return newHomePageResponse(
-            list = HomePageList(request.name, items.distinctBy { it.url }, isHorizontalImages = false),
+            list = HomePageList(request.name, items.distinctBy { it.url }, isHorizontalImages = isHome),
             hasNext = hasNext
         )
     }
@@ -151,21 +254,36 @@ class TioDonghuaProvider : MainAPI() {
         return emptyList()
     }
 
-    /** Card de ficha (donghua/película) del home o catálogo. */
+    /**
+     * Card de ficha (donghua/película) del home o catálogo.
+     * v24: soporta cards de /peliculas/ (div.image con h3 sin <a>) y muestra
+     * el PUNTAJE (div.rating, ej. "9.8") en la etiqueta de la card en vez de
+     * "Subtitulado": se setea score y no se marca dubStatus.
+     */
     private fun parseTdCard(article: org.jsoup.nodes.Element): SearchResponse? {
         val href = article.selectFirst("div.poster a[href], div.image a[href], a[href]")?.attr("href") ?: return null
         if (!href.contains("/donghua/") && !href.contains("/peliculas/")) return null
         val title = article.select("h3 a").firstOrNull { it.text().isNotBlank() }?.text()?.trim()
+            ?: article.selectFirst("h3.title")?.text()?.trim()
+            ?: article.selectFirst("h3")?.text()?.trim()
             ?: article.selectFirst("img")?.attr("alt")?.trim()
             ?: return null
         val poster = article.selectFirst("img")?.attr("src") ?: ""
+        val rating = article.selectFirst("div.rating")?.text()?.trim()
         return newAnimeSearchResponse(tdCleanTitle(title), href) {
             this.posterUrl = poster
-            addDubStatus(DubStatus.Subbed)
+            if (!rating.isNullOrBlank()) {
+                try { Score.from10(rating)?.let { this.score = it } } catch (_: Exception) {}
+            }
         }
     }
 
-    /** Card de episodio ("Últimos Episodios"): el nombre de la serie está en span.serie. */
+    /**
+     * Card de episodio ("Últimos Episodios"): el nombre de la serie está en
+     * span.serie; el h3 trae "Episodio N" y el span "S1 EN / fecha".
+     * v24: mostrar el número de episodio en la etiqueta de la card
+     * ("Subtitulado • N") y el score de la serie si viene en el RSC.
+     */
     private fun parseTdEpisodeCard(article: org.jsoup.nodes.Element): SearchResponse? {
         val href = article.selectFirst("a[href*=\"/episodios/\"]")?.attr("href") ?: return null
         val serieName = article.selectFirst("span.serie")?.text()?.trim()
@@ -173,9 +291,16 @@ class TioDonghuaProvider : MainAPI() {
         else tdCleanTitle(article.selectFirst("img")?.attr("alt") ?: "")
         if (title.isBlank()) return null
         val poster = article.selectFirst("img")?.attr("src") ?: ""
+        val epText = article.selectFirst("h3")?.text()?.trim() ?: ""
+        val spanText = article.select("div.data span").firstOrNull()?.text()?.trim() ?: ""
+        val epNum = Regex("(?:Episodio|Capítulo)\\s*(\\d+)", RegexOption.IGNORE_CASE).find(epText)
+            ?.groupValues?.get(1)?.toIntOrNull()
+            ?: Regex("S\\d+\\s*E\\s*(\\d+)", RegexOption.IGNORE_CASE).find(spanText)
+                ?.groupValues?.get(1)?.toIntOrNull()
+            ?: Regex("-episodio-(\\d+)").find(href)?.groupValues?.get(1)?.toIntOrNull()
         return newAnimeSearchResponse(title, href) {
             this.posterUrl = poster
-            addDubStatus(DubStatus.Subbed)
+            addDubStatus(DubStatus.Subbed, epNum)
         }
     }
 
@@ -219,13 +344,52 @@ class TioDonghuaProvider : MainAPI() {
                 )
             }
         val poster = doc.selectFirst("meta[property=\"og:image\"]")?.attr("content") ?: ""
-        val description = doc.selectFirst("meta[property=\"og:description\"]")?.attr("content") ?: ""
+
+        // v24: pestaña "info" de Dooplay (div#info) — sinopsis completa +
+        // custom_fields (Original title, TMDb Rating, First air date, ...)
+        val infoDiv = doc.selectFirst("div#info")
+        val description = infoDiv?.selectFirst("div.wp-content")?.text()?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: doc.selectFirst("meta[property=\"og:description\"]")?.attr("content") ?: ""
+
+        // custom_fields: pares <b class="variante">clave</b><span class="valor">valor</span>
+        val infoFields = HashMap<String, String>()
+        infoDiv?.select("div.custom_fields")?.forEach { cf ->
+            val k = cf.selectFirst("b.variante")?.text()?.trim() ?: return@forEach
+            val v = cf.selectFirst("span.valor")?.text()?.trim() ?: return@forEach
+            if (k.isNotBlank() && v.isNotBlank()) infoFields[k] = v
+        }
+        val originalTitle = infoFields["Original title"]?.trim()
+
+        // Año desde "First air date" ("Jan. 01, 2024")
+        val year = Regex("(19|20)\\d{2}").find(
+            infoFields["First air date"] ?: ""
+        )?.value?.toIntOrNull()
+
+        // Rating del sitio (span.dt_rating_vgs, escala 10)
+        val ratingText = doc.selectFirst("span.dt_rating_vgs[itemprop=ratingValue]")?.text()?.trim()
+        val rating = if (!ratingText.isNullOrBlank()) {
+            try { Score.from10(ratingText) } catch (_: Exception) { null }
+        } else null
+
         val genres = doc.select("div.sgeneros a").map { it.text().trim() }.filter { it.isNotBlank() }
+        // Estado de emisión según géneros del sitio (Completado / En emisión)
+        val showStatus = when {
+            genres.any { it.equals("Completado", ignoreCase = true) } -> ShowStatus.Completed
+            genres.any {
+                it.contains("emision", ignoreCase = true) ||
+                    it.contains("emisión", ignoreCase = true) ||
+                    it.contains("curso", ignoreCase = true)
+            } -> ShowStatus.Ongoing
+            else -> null
+        }
 
         // Recomendaciones: primero otras temporadas, luego similares aleatorios (tope 16)
         val recommendations = fetchTdRecommendations(url, title)
 
         // Episodios: ul.episodios con div.numerando "temporada - episodio"
+        // v24: el numerando es la fuente de verdad (algunos slugs traen sufijos
+        // raros tipo "-episodio-10-1sub-" o URLs de la temporada anterior).
         val episodes = ArrayList<Episode>()
         doc.select("ul.episodios li").forEach { li ->
             val a = li.selectFirst("div.episodiotitle a[href]") ?: return@forEach
@@ -246,8 +410,16 @@ class TioDonghuaProvider : MainAPI() {
         // Película con lista de episodios (película por episodio) -> serie
         if (episodes.isEmpty()) {
             if (isMovie) {
+                // MovieLoadResponse no tiene synonyms/showStatus: se añaden al plot
+                val extraInfo = buildString {
+                    append(description)
+                    originalTitle?.let { append("\n\nTítulo original: ").append(it) }
+                    if (showStatus == ShowStatus.Completed) append("\n\nEstado: Completado")
+                    if (showStatus == ShowStatus.Ongoing) append("\n\nEstado: En emisión")
+                }.trim()
                 return newMovieLoadResponse(title, url, TvType.AnimeMovie, url) {
-                    posterUrl = poster; plot = description; tags = genres
+                    posterUrl = poster; this.plot = extraInfo; this.tags = genres
+                    this.year = year; this.score = rating
                     if (recommendations.isNotEmpty()) this.recommendations = recommendations
                 }
             }
@@ -262,7 +434,8 @@ class TioDonghuaProvider : MainAPI() {
             if (episodes.isEmpty()) {
                 // Último recurso: la ficha misma tiene jugador (especiales)
                 return newMovieLoadResponse(title, url, TvType.AnimeMovie, url) {
-                    posterUrl = poster; plot = description; tags = genres
+                    posterUrl = poster; this.plot = description; this.tags = genres
+                    this.year = year; this.score = rating
                     if (recommendations.isNotEmpty()) this.recommendations = recommendations
                 }
             }
@@ -274,7 +447,10 @@ class TioDonghuaProvider : MainAPI() {
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             posterUrl = poster
             addEpisodes(DubStatus.Subbed, episodes)
-            plot = description; tags = genres
+            this.plot = description; this.tags = genres
+            this.year = year; this.score = rating
+            showStatus?.let { this.showStatus = it }
+            originalTitle?.let { this.synonyms = listOf(it) }
             if (recommendations.isNotEmpty()) this.recommendations = recommendations
         }
     }
@@ -436,8 +612,9 @@ class TioDonghuaProvider : MainAPI() {
                     }
                 }.map { it.await() }
             }
-            results.forEach { (embedUrl, label) ->
-                if (embedUrl.startsWith("http")) {
+            results.forEach { (rawEmbed, label) ->
+                val embedUrl = tdNormalizeEmbed(rawEmbed)
+                if (embedUrl != null) {
                     processTdEmbed(embedUrl, data, label, subtitleCallback, cb)
                 }
             }
@@ -473,6 +650,26 @@ class TioDonghuaProvider : MainAPI() {
         return links > 0 || foundLinks
     }
 
+    /**
+     * v24: normaliza el embed_url del AJAX. El tipo "dtshcode" devuelve HTML
+     * (un <iframe ...> o <div><iframe ...></div>); extraer el src. Si es una
+     * URL directa ("iframe") se devuelve tal cual. Devuelve null si no hay URL.
+     */
+    private fun tdNormalizeEmbed(raw: String): String? {
+        // des-escapar JSON (\" -> " y \/ -> /) antes de analizar
+        val t = raw.replace("\\\"", "\"").replace("\\/", "/").trim()
+        if (t.startsWith("http")) {
+            val end = t.indexOfFirst { it == '"' || it == '\\' }
+            return (if (end == -1) t else t.substring(0, end)).trim().ifBlank { null }
+        }
+        if (t.contains("<iframe", ignoreCase = true) || t.contains("<div", ignoreCase = true)) {
+            val src = Regex("""src\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE).find(t)
+                ?.groupValues?.get(1)
+            if (src != null) return src.trim()
+        }
+        return null
+    }
+
     /** Llama al endpoint AJAX de Dooplay y devuelve el embed_url de la opción. */
     private suspend fun fetchTdPlayerEmbed(post: String, nume: String, type: String): String {
         return try {
@@ -488,8 +685,8 @@ class TioDonghuaProvider : MainAPI() {
                 timeout = 20L
             ).text
             // {"embed_url":"https:\/\/...","type":"iframe"}
-            Regex("\"embed_url\"\\s*:\\s*\"([^\"]*)\"").find(resp)
-                ?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
+            Regex("\"embed_url\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").find(resp)
+                ?.groupValues?.get(1) ?: ""
         } catch (_: Exception) {
             ""
         }
@@ -519,6 +716,15 @@ class TioDonghuaProvider : MainAPI() {
         when {
             u.contains("dailymotion.com") ->
                 extractTdDailymotion(u, referer, serverName, cb)
+            // v24: Ok.Ru (servidor "OK" muy común en tiodonghua)
+            u.contains("ok.ru") || u.contains("odnoklassniki") ->
+                extractTdOkRu(u, referer, serverName, cb)
+            // v24: Rumble (servidor "DM" en fichas nuevas)
+            u.contains("rumble.com") ->
+                extractTdRumble(u, referer, serverName, cb)
+            // v24: StreamTape (servidor "ST")
+            u.contains("streamtape") || u.contains("strcloud") ->
+                extractTdStreamTape(u, referer, serverName, cb)
             // modagamers: 302 a publicidad que planta cookie sid, luego challenge con
             // JS redirect (verificado en vivo); seguir la cadena con reintentos.
             u.contains("modagamers") ->
@@ -526,7 +732,8 @@ class TioDonghuaProvider : MainAPI() {
             // Familia streamwish/filelions/vidguard: players con JS empaquetado
             u.contains("wish") || u.contains("sblona") || u.contains("ahvsh") ||
                 u.contains("filelions") || u.contains("luluvdo") ||
-                u.contains("vgembed") || u.contains("vgfplay") || u.contains("vidguard") ->
+                u.contains("vgembed") || u.contains("vgfplay") || u.contains("vidguard") ||
+                u.contains("byse") || u.contains("asnwish") ->
                 extractTdPacked(u, referer, serverName, cb)
             else -> {
                 try { loadExtractor(u, referer, subtitleCallback, cb) } catch (_: Exception) {}
