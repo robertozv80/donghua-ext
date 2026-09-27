@@ -21,66 +21,74 @@ const val TD_USER_AGENT =
  */
 private suspend fun extractTdOkRu(embedUrl: String, referer: String, name: String, callback: (ExtractorLink) -> Unit): Boolean {
     return try {
-        // v24.1: el embed puede llegar protocol-relative (//ok.ru/...) dentro del
+        // v24.2: el embed puede llegar protocol-relative (//ok.ru/...) dentro del
         // HTML dtshcode; sin esquema la petición falla.
         val url = if (embedUrl.startsWith("//")) "https:$embedUrl" else embedUrl
         val html = app.get(url, referer = referer,
             headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L).text
-        // v24.1: decodificar TODOS los escapes del data-options: &quot;, \/ y
+        // v24.2: decodificar TODOS los escapes del data-options: &quot;, / y
         // \uXXXX (\u0026 = '&'). Sin esto la URL del manifiesto llega con
         // '\u0026' literal, el player la descarta y el episodio queda sin
         // enlaces (verificado en logcat 16:49:45, "M3u8 Playlist is not a
         // Master Playlist").
+        val decodeUnicode = { s: String ->
+            Regex("""\\u([0-9a-fA-F]{4})""").replace(s) { m ->
+                m.groupValues[1].toInt(16).toChar().toString()
+            }
+        }
         val options = Regex("data-options=\"([^\"]+)\"").find(html)
             ?.groupValues?.get(1)
-            ?.replace("&quot;", "\"")
-            ?.replace("\\/", "/")
-            ?.let { Regex("""\\u([0-9a-fA-F]{4})""").replace(it) { m ->
-                m.groupValues[1].toInt(16).toChar().toString()
-            } }
+            ?.let { it.replace("&quot;", "\"").replace("\\/", "/").let(decodeUnicode) }
             ?: return false
         var found = false
-        // hlsManifestUrl (mejor opción: adaptable). v24.1: VALIDAR el manifiesto
-        // antes de entregarlo: generateM3u8 no lanza excepción con contenido
-        // inválido y M3u8Helper filtra el link en reproducción => toast "Enlaces
-        // no encontrados". Si no responde #EXTM3U, caer al fallback progresivo.
-        Regex("\"hlsManifestUrl\":\"([^\"]+)\"").find(options)?.let { m ->
+        // hlsManifestUrl (mejor opción: adaptable). v24.2: el campo puede vivir
+        // en el JSON top-level O dentro de flashvars.metadata (embeds nuevos del
+        // agregador player.tiodonghua.com). VALIDAR el manifiesto antes de
+        // entregarlo: generateM3u8 no lanza excepción con contenido inválido y
+        // M3u8Helper filtra el link en reproducción => "Enlaces no encontrados".
+        // v24.2: la clave varia por version del player: "hlsManifestUrl" (clásico)
+        // u "ondemandHls" (embeds nuevos del agregador). El primer match que
+        // valide como #EXTM3U gana.
+        val hlsUrl = Regex("\"(?:[a-zA-Z]*ManifestUrl|ondemandHls)\":\"([^\"]+)\"")
+            .findAll(options).map { it.groupValues[1] }.firstOrNull { candidate ->
+                try {
+                    app.get(candidate, referer = url,
+                        headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L)
+                        .text.trimStart().startsWith("#EXTM3U")
+                } catch (_: Exception) { false }
+            }
+        if (hlsUrl != null) {
             try {
-                val manifest = app.get(m.groupValues[1], referer = url,
-                    headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L).text
-                if (manifest.trimStart().startsWith("#EXTM3U")) {
-                    generateM3u8(name, m.groupValues[1], url).forEach(callback)
-                    found = true
-                }
+                generateM3u8(name, hlsUrl, url).forEach(callback)
+                found = true
             } catch (_: Exception) {}
         }
-        // Fallback: videos[] con urls progresivas por calidad. v24.1: emitir
-        // TODAS las calidades disponibles (antes solo la última, y solo si
-        // generateM3u8 lanzaba excepción, que nunca ocurría con un manifiesto
-        // inválido).
-        if (!found) {
-            Regex("\"name\":\"(mobile|lowest|low|sd|hd|full|super)\",\"url\":\"([^\"]+)\"")
-                .findAll(options).forEach { m ->
-                    val progressive = m.groupValues[2]
-                    if (progressive.startsWith("http")) {
-                        callback(newExtractorLink(source = name, name = name, url = progressive) {
-                            this.referer = url
-                            this.quality = when (m.groupValues[1]) {
-                                "full", "super" -> Qualities.P1080.value
-                                "hd" -> Qualities.P720.value
-                                "sd" -> Qualities.P480.value
-                                else -> Qualities.P360.value
-                            }
-                        })
-                        found = true
-                    }
+        // Fallback: videos[] con urls progresivas por calidad. Puede estar en el
+        // top-level del JSON o anidado en flashvars.metadata (los embeds nuevos
+        // anidan TODO el metadata del player dentro de flashvars).
+        Regex("\"name\":\"(mobile|lowest|low|sd|hd|full|super)\",\"url\":\"([^\"]+)\"")
+            .findAll(options).forEach { m ->
+                val progressive = decodeUnicode(m.groupValues[2])
+                if (progressive.startsWith("http")) {
+                    val full = if (progressive.startsWith("//")) "https:$progressive" else progressive
+                    callback(newExtractorLink(source = name, name = name, url = full) {
+                        this.referer = url
+                        this.quality = when (m.groupValues[1]) {
+                            "full", "super" -> Qualities.P1080.value
+                            "hd" -> Qualities.P720.value
+                            "sd" -> Qualities.P480.value
+                            else -> Qualities.P360.value
+                        }
+                    })
+                    found = true
                 }
-        }
+            }
         found
     } catch (_: Exception) {
         false
     }
 }
+
 
 /**
  * v24: extractor de Rumble. La página del embed incluye el embed JS con
@@ -90,8 +98,29 @@ private suspend fun extractTdRumble(embedUrl: String, referer: String, name: Str
     return try {
         val html = app.get(embedUrl, referer = referer,
             headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L).text
-        // Las URLs vienen con \/ escapado dentro del JSON del embed
+        // Las URLs vienen con / escapado dentro del JSON del embed
         val fixed = html.replace("\\/", "/")
+        // v24.2: el JSON del embed trae un mapa de calidades con dimensiones:
+        // "360":{"url":"...mp4","meta":{...,"w":638,"h":360}}. Emitir cada una.
+        val qualities = Regex("\"(\\d{3,4})\":{\"url\":\"(https://[a-z0-9.]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4)\"")
+            .findAll(fixed).toList()
+        if (qualities.isNotEmpty()) {
+            qualities.distinctBy { it.groupValues[2] }.forEach { m ->
+                val h = m.groupValues[1].toIntOrNull()
+                callback(newExtractorLink(source = name, name = name, url = m.groupValues[2]) {
+                    this.referer = embedUrl
+                    this.quality = when {
+                        h == null -> Qualities.Unknown.value
+                        h >= 1080 -> Qualities.P1080.value
+                        h >= 720 -> Qualities.P720.value
+                        h >= 480 -> Qualities.P480.value
+                        else -> Qualities.P360.value
+                    }
+                })
+            }
+            return true
+        }
+        // Fallback: primer mp4 directo (embeds sin mapa de calidades)
         val url = Regex("https://[a-z0-9.]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4")
             .find(fixed)?.value ?: return false
         callback(newExtractorLink(source = name, name = name, url = url) {
@@ -734,6 +763,35 @@ class TioDonghuaProvider : MainAPI() {
     }
 
     /**
+     * v24.2: la página "MultiPlayer" (player.tiodonghua.com/embed/XX+NN) es un
+     * agregador: lista <li onclick="go_to_player('URL')"> con 7 servidores
+     * (StreamWish, VidGuard, FileMon, Dailymotion, OKRu, VidHide, Rumble) y la
+     * etiqueta visible junto a cada botón. Extraer cada embed y procesarlo con su
+     * nombre real de servidor.
+     */
+    private suspend fun extractTdMultiPlayer(
+        embedUrl: String, referer: String, name: String,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        return try {
+            val html = app.get(embedUrl, referer = referer,
+                headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L).text
+            val embeds = Regex("""go_to_player\\('([^']+)'\\)""").findAll(html).toList()
+            var any = false
+            for (m in embeds) {
+                val child = m.groupValues[1]
+                val processed = try {
+                    processTdEmbed(child, embedUrl, serverLabelFromUrl(child), subtitleCallback, callback)
+                } catch (_: Exception) { false }
+                if (processed) any = true
+            }
+            any
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
      * Enruta cada embed al extractor apropiado. Cuenta ENLACES EMITIDOS, no
      * excepciones (los hosts muertos devuelven 200 con página de error).
      */
@@ -753,6 +811,11 @@ class TioDonghuaProvider : MainAPI() {
             // v24: Rumble (servidor "DM" en fichas nuevas)
             u.contains("rumble.com") ->
                 extractTdRumble(u, referer, serverName, cb)
+            // v24.2: agregador "MultiPlayer" (player.tiodonghua.com/embed/XX+NN):
+            // pagina propia con 7 servidores via go_to_player('URL'). Extraerlos
+            // y procesar CADA embed con su servidor real.
+            u.contains("player.tiodonghua.com") ->
+                extractTdMultiPlayer(u, referer, serverName, subtitleCallback, cb)
             // v24: StreamTape (servidor "ST")
             u.contains("streamtape") || u.contains("strcloud") ->
                 extractTdStreamTape(u, referer, serverName, cb)
@@ -768,6 +831,11 @@ class TioDonghuaProvider : MainAPI() {
                 extractTdPacked(u, referer, serverName, cb)
             else -> {
                 try { loadExtractor(u, referer, subtitleCallback, cb) } catch (_: Exception) {}
+                // v24.2: hosts del agregador MultiPlayer que no tienen rama propia
+                // (iplayerhls.com, tioplayer.com, filemoon.sx, dhtpre.com) son
+                // players con JS empaquetado tipo packer: mismo tratamiento que
+                // la familia streamwish (unpack + buscar hls/file/m3u8/mp4).
+                if (links == 0) extractTdPacked(u, referer, serverName, cb)
                 if (links == 0) extractTdFromPage(u, referer, serverName, cb)
             }
         }
