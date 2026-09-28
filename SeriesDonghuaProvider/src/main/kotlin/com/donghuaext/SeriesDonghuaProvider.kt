@@ -456,24 +456,35 @@ class SeriesDonghuaProvider : MainAPI() {
                 html = r2.text
                 Log.d("SDDBG", "pelicula -> primer ep $episodePage len=${html.length}")
             } else {
-                // v24.4 FIX: las PELICULAS no tienen grid "-episodio-": su pagina de
-                // video es /<slug>-N/ (numerada) y la card "Ver" del propio sitio
-                // enlaza una URL DUPLICADA que da 404 (verificado en vivo:
-                // perfect-world-movie...-perfect-world-movie...-1/). Probar
-                // directamente <slug>-1/.
-                val slug = data.trimEnd('/').substringAfterLast('/')
-                val numbered = "$mainUrl/$slug-1/"
+                // v24.7 FIX: el botón "Ver" de la ficha de película apunta a la
+                // página de video real (la de shrouding-the-heavens enlazaba
+                // <slug>-<slug>-pelicula/ y el propio sitio la devuelve 404, y el
+                // patrón <slug>-1/ de v24.4 también puede dejar de existir): NO
+                // adivinar el patrón — usar el href del a.btn-stream de la ficha y
+                // como último recurso <slug>-1/.
+                val btnHref = Regex("<a[^>]*href=\\\"(/[^\\\"]+)\\\"[^>]*class=\\\"btn-stream[^\\\"]*\\\"").find(html)
+                ?.groupValues?.get(1)
+                ?: Regex("<a[^>]*class=\\\"btn-stream[^\\\"]*\\\"[^>]*href=\\\"(/[^\\\"]+)\\\"").find(html)
+                ?.groupValues?.get(1)
+                val candidates = listOfNotNull(
+                btnHref,
+                "/" + data.trimEnd('/').substringAfterLast('/') + "-1/"
+                )
+                Log.d("SDDBG", "pelicula candidatos: $candidates")
+                for (cand in candidates) {
                 try {
-                    val probe = pageGet(numbered)
-                    if (probe.text.contains("server-tab-btn")) {
-                        episodePage = numbered
-                        pageCookies.putAll(probe.cookies)
-                        html = probe.text
-                        Log.d("SDDBG", "pelicula -> numerada $numbered len=${html.length}")
-                    } else {
-                        Log.d("SDDBG", "pelicula numerada SIN botones len=${probe.text.length}")
-                    }
-                } catch (e: Exception) { Log.d("SDDBG", "pelicula numerada EX: ${e.message}") }
+                val probe = pageGet(mainUrl + cand)
+                if (probe.text.contains("server-tab-btn")) {
+                episodePage = mainUrl + cand
+                pageCookies.putAll(probe.cookies)
+                html = probe.text
+                Log.d("SDDBG", "pelicula -> $episodePage len=${html.length}")
+                break
+                } else {
+                Log.d("SDDBG", "pelicula cand $cand sin botones len=${probe.text.length}")
+                }
+                } catch (e: Exception) { Log.d("SDDBG", "pelicula cand $cand EX: ${e.message}") }
+                }
             }
         }
         // v24.4: continuar si hay botones de servidor (pagina numerada de pelicula);
@@ -539,8 +550,8 @@ class SeriesDonghuaProvider : MainAPI() {
                 }
                 Log.d("SDDBG", "POST v=$videoId s=$serverIndex intents=$attempts ck=${pageCookies.size} len=${resp.length} head=${resp.take(120).replace("\n", " ")}")
                 // {\"success\":true,\"embed_url\":\"https:\\/\\/...\"} (tolerante a espacios)
-                if (resp.contains("\\\"success\\\"") && resp.contains("true")) {
-                    Regex("\\\"embed_url\\\"\\\\s*:\\\\s*\\\"((?:[^\\\"\\\\\\\\]|\\\\\\\\.)*)\\\"").find(resp)
+                if (resp.contains("embed_url")) {
+                    Regex("\"embed_url\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").find(resp)
                         ?.groupValues?.get(1)?.replace("\\\\/", "/")
                 } else null
             } catch (e: Exception) { Log.d("SDDBG", "embed EX: ${e.message}"); null }
@@ -805,6 +816,7 @@ class SeriesDonghuaProvider : MainAPI() {
     }
 
     /** Último recurso: buscar m3u8/mp4 en la página del embed. */
+    /** Último recurso: buscar m3u8/mp4 en la página del embed. */
     private suspend fun extractSdGeneric(
         playerUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
@@ -820,6 +832,20 @@ class SeriesDonghuaProvider : MainAPI() {
                 })
                 return true
             }
+            // v24.7: filemoon/vid-guard ofuscan la url del video con packing JS
+            // (eval(function(p,a,c,k,...)): desempaquetar y buscar de nuevo.
+            try {
+                val unpacked = getAndUnpack(text)
+                for (m in Regex("(https?://[^\"'\\s<>]+\\.m3u8[^\"'\\s<>]*)").findAll(unpacked)) {
+                    try { generateM3u8(serverName, m.value, playerUrl).forEach(callback); return true } catch (_: Exception) {}
+                }
+                for (m in Regex("(https?://[^\"'\\s<>]+\\.mp4[^\"'\\s<>]*)").findAll(unpacked)) {
+                    callback(newExtractorLink(source = serverName, name = serverName, url = m.value) {
+                        this.referer = playerUrl; this.quality = Qualities.Unknown.value
+                    })
+                    return true
+                }
+            } catch (_: Exception) {}
             false
         } catch (_: Exception) {
             false
