@@ -102,14 +102,14 @@
   {
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/SeriesDonghuaProvider.cs3",
     "status": 1,
-    "version": 6,
+    "version": 7,
     "name": "SeriesDonghuaProvider",
     "internalName": "SeriesDonghuaProvider",
     "authors": [
       "robertozv80"
     ],
     "description": "SeriesDonghua - Donghuas y anime chino en espa\u00f1ol",
-    "fileSize": 57048,
+    "fileSize": 59579,
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
     "language": "es",
     "tvTypes": [
@@ -117,7 +117,7 @@
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=seriesdonghua.com&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-31fe3c39b2a6a2ef8a803822c6e39f6a9abfe83b2e3573730d0d2bae6a15c09a"
+    "fileHash": "sha256-e3c2b7ab7a02a8d2ce0866ea25d9026520659741b4d1446d8f655c80bfc100c4"
   },
   {
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/TioDonghuaProvider.cs3",
