@@ -73,6 +73,21 @@ class SeriesDonghuaProvider : MainAPI() {
         }
     }
 
+    /**
+     * v24.3: las imagenes del sitio no cargaban en la app (el loader de
+     * imagenes de CloudStream recibe 403/validaciones de Cloudflare con su UA;
+     * el usuario las reporto sin cargar). Envolver con wsrv.nl (proxy de
+     * imagenes de Discord, mismo dominio que ya usa el repo para el icono):
+     * verificado en vivo que responde 200 image/webp para thumbs y portadas.
+     * El origen va SIN esquema (wsrv.nl exige protocol-relative). Si la url es
+     * relativa se resuelve antes contra mainUrl.
+     */
+    private fun sdProxyImg(url: String): String {
+        val abs = resolveUrl(url)
+        if (abs.isBlank() || !abs.startsWith("http")) return abs
+        return "https://wsrv.nl/?url=" + java.net.URLEncoder.encode(abs.removePrefix("https://"), "UTF-8") + "&w=400"
+    }
+
     private suspend fun pageGet(url: String, timeout: Long = 30L) =
         app.get(url, headers = mapOf("User-Agent" to SD_USER_AGENT), timeout = timeout)
 
@@ -125,7 +140,8 @@ class SeriesDonghuaProvider : MainAPI() {
 
         // v24.2: sin "Subtitulado" en la etiqueta (el sitio no expone puntuacion)
         return newAnimeSearchResponse(title, resolveUrl(href)) {
-            this.posterUrl = resolveUrl(article.selectFirst("img")?.attr("src") ?: "")
+            // v24.3: poster via wsrv.nl
+            this.posterUrl = sdProxyImg(article.selectFirst("img")?.attr("src") ?: "")
         }
     }
 
@@ -139,7 +155,8 @@ class SeriesDonghuaProvider : MainAPI() {
             ?: return null
         val epNum = Regex("-episodio-(\\d+)").find(href)?.groupValues?.get(1)?.toIntOrNull()
         return newAnimeSearchResponse(title, resolveUrl(href)) {
-            this.posterUrl = resolveUrl(article.selectFirst("img")?.attr("src") ?: "")
+            // v24.3: poster via wsrv.nl
+            this.posterUrl = sdProxyImg(article.selectFirst("img")?.attr("src") ?: "")
             // etiqueta de la card: "Subtitulado - N" (numero de episodio)
             addDubStatus(DubStatus.Subbed, epNum)
         }
@@ -175,17 +192,20 @@ class SeriesDonghuaProvider : MainAPI() {
                 }
             ?: seriesUrl.trimEnd('/').substringAfterLast('/')
 
-        // Portada HD: img.hero-poster de la ficha u og:image
-        val poster = doc.selectFirst("img.hero-poster")?.attr("src")?.takeIf { it.isNotBlank() }
-            ?.let { resolveUrl(it) }
-            ?: doc.selectFirst("meta[property=\"og:image\"]")?.attr("content")
-            ?: ""
+        // v24.3: portada via wsrv.nl (proxy) + fallback a og:image
+        val poster = (
+            doc.selectFirst("img.hero-poster")?.attr("src")?.takeIf { it.isNotBlank() }
+                ?: doc.selectFirst("meta[property=\"og:image\"]")?.attr("content")
+                ?: ""
+            ).let { sdProxyImg(resolveUrl(it)) }
 
         // JSON-LD TVSeries: description, genre[], numberOfEpisodes
-        val jsonLd = Regex("<script type=\"application/ld\\+json\">\\s*(\\{.*?})\\s*</script>",
-            RegexOption.DOT_MATCHES_ALL)
-            .findAll(html)
-            .map { it.groupValues[1] }
+        // v24.3 FIX: antes se extraia con Regex("...\\{.*?}...") y el motor regex
+        // de Android (ICU) rechaza el '}' literal sin escapar (la JVM de escritorio
+        // lo tolera: PatternSyntaxException en produccion, load() crasheaba y el
+        // tapping en una card no abria la ficha). JSoup no necesita regex.
+        val jsonLd = doc.select("script[type=\"application/ld+json\"]")
+            .map { it.data() }
             .firstOrNull { it.contains("\"TVSeries\"") }
         val ldDescription = jsonLd
             ?.let { Regex("\"description\":\"((?:[^\"\\\\]|\\\\.)*)\"").find(it)?.groupValues?.get(1) }
@@ -328,7 +348,7 @@ class SeriesDonghuaProvider : MainAPI() {
                         val cSlug = cardSlug(href)
                         if (cSlug == selfSlug || !cSlug.startsWith(baseSlug)) return@mapNotNull null
                         Triple(resolveUrl(href), card.selectFirst("h3.card-title")?.text()?.trim() ?: cSlug,
-                            resolveUrl(card.selectFirst("img")?.attr("src") ?: ""))
+                            sdProxyImg(card.selectFirst("img")?.attr("src") ?: ""))
                     }.distinctBy { it.first }
                     seasons.sortedBy {
                         Regex("(\\d+)$").find(it.first.trimEnd('/').substringAfterLast('/'))
@@ -357,7 +377,7 @@ class SeriesDonghuaProvider : MainAPI() {
                             val full = resolveUrl(href)
                             if (full.trimEnd('/') in seen) return@mapNotNull null
                             Triple(full, card.selectFirst("h3.card-title")?.text()?.trim() ?: return@mapNotNull null,
-                                resolveUrl(card.selectFirst("img")?.attr("src") ?: ""))
+                                sdProxyImg(card.selectFirst("img")?.attr("src") ?: ""))
                         }
                     pool.shuffled().forEach { (u, t, p) ->
                         if (u.trimEnd('/') !in seen && all.size < 16) {
@@ -384,7 +404,7 @@ class SeriesDonghuaProvider : MainAPI() {
                         val t = card.selectFirst("h3.card-title")?.text()?.trim() ?: return@forEach
                         seen.add(full.trimEnd('/'))
                         all.add(newAnimeSearchResponse(t, full) {
-                            this.posterUrl = resolveUrl(card.selectFirst("img")?.attr("src") ?: "")
+                            this.posterUrl = sdProxyImg(card.selectFirst("img")?.attr("src") ?: "")
                         })
                     }
             } catch (_: Exception) {}

@@ -100,6 +100,18 @@ private suspend fun extractTdRumble(embedUrl: String, referer: String, name: Str
             headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L).text
         // Las URLs vienen con / escapado dentro del JSON del embed
         val fixed = html.replace("\\/", "/")
+        // v24.3: el embed nuevo (vip) trae el bloque m.f["VID"]={...}
+        // con rendiciones + "hls":{"url":"https://rumble.com/hls-vod/.../playlist.m3u8"}
+        // (el mapa "360":{"url":...} ya no aparece; el patron viejo solo matcheaba
+        // la "timeline" de 180p). El HLS es VOD valido: master con variantes
+        // 1080/720/480/360 y segmentos TS (verificado en vivo).
+        Regex("\"hls\":\\{\"url\":\"(https://rumble\\.com/hls-vod/[^\"]+)\"")
+            .find(fixed)?.groupValues?.get(1)?.let { hlsUrl ->
+                try {
+                    generateM3u8(name, hlsUrl, embedUrl).forEach(callback)
+                    return true
+                } catch (_: Exception) {}
+            }
         // v24.2: el JSON del embed trae un mapa de calidades con dimensiones:
         // "360":{"url":"...mp4","meta":{...,"w":638,"h":360}}. Emitir cada una.
         val qualities = Regex("\"(\\d{3,4})\":{\"url\":\"(https://[a-z0-9.]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4)\"")
@@ -169,11 +181,12 @@ private suspend fun extractTdStreamTape(embedUrl: String, referer: String, name:
  *   (li.dooplay_player_option data-type/data-post/data-nume ->
  *    POST /wp-admin/admin-ajax.php action=doo_player_ajax ->
  *    {"embed_url": "...", "type": "iframe"}).
- * - Servidores del episodio de prueba (The Demon Hunter ep1): DM (Dailymotion),
- *   TP (player.modagamers.com, challenge JS), TP2 (playercuyplay.cuyplay.com),
- *   VG (vgembed.com), SSB (sblona.com), SH (ahvsh.com), FL (filelions.to).
- *   Los servidores "is-vip-server" (Drive Vip / Rumble VIP) responden
- *   {"embed_url":"","type":false} sin cuenta VIP: se excluyen.
+ * v24.3: los episodios nuevos solo exponen servidores "is-vip-server" SIN
+ *   data-attrs (el sitio los resuelve por JS). El mismo admin-ajax funciona
+ *   usando el postid-N del body class + el N de cada player-option: nume 1..N
+ *   devuelve el embed de cada servidor (Drive Vip = Google Drive MP4 directo,
+ *   Rumble Vip = HLS 1080p, y en Inversion Marcial un agregador "XX+NN vip"
+ *   con mas servidores). Todos los servidores se procesan ahora.
  */
 class TioDonghuaProvider : MainAPI() {
 
@@ -655,20 +668,33 @@ class TioDonghuaProvider : MainAPI() {
         var links = 0
         val cb: (ExtractorLink) -> Unit = { links++; callback(it) }
 
-        // Opciones de servidor Dooplay (AJAX), excluyendo VIP
-        val options = doc.select("li.dooplay_player_option").filter { li ->
-            !li.hasClass("is-vip-server") && li.attr("data-post").isNotBlank() && li.attr("data-nume").isNotBlank()
+        // Opciones de servidor Dooplay (AJAX).
+        // v24.3: los episodios nuevos solo exponen <li class="... is-vip-server">
+        // SIN data-attrs (el sitio los resuelve por JS). Verificado en vivo que el
+        // MISMO admin-ajax funciona usando el postid-N del body class de la pagina
+        // + el numero de opcion (player-option-N): nume 1..N devuelve el embed de
+        // cada servidor, VIP incluidos (Drive Vip, Rumble Vip, y en Inversion
+        // Marcial un agregador "XX+NN vip" con 7 servidores mas).
+        val liOptions = doc.select("li.dooplay_player_option")
+        val bodyPostId = Regex("postid-(\\d+)")
+            .find(doc.body()?.className() ?: "")?.groupValues?.get(1)
+        val requests = LinkedHashMap<String, Array<String>>() // key -> [post, nume, type, label]
+        liOptions.forEachIndexed { idx, li ->
+            val isVip = li.hasClass("is-vip-server")
+            val nume = li.attr("id").removePrefix("player-option-")
+                .takeIf { it.isNotBlank() && it.toIntOrNull() != null } ?: (idx + 1).toString()
+            val post = if (!isVip && li.attr("data-post").isNotBlank()) li.attr("data-post")
+                else bodyPostId ?: return@forEachIndexed
+            val type = if (!isVip) li.attr("data-type").ifBlank { "tv" } else "tv"
+            val label = li.selectFirst("span.title")?.text()?.trim()?.ifBlank { null }
+                ?: "Server $nume"
+            requests["${post}_${nume}_$type"] = arrayOf(post, nume, type, label)
         }
-        if (options.isNotEmpty()) {
+        if (requests.isNotEmpty()) {
             val results = coroutineScope {
-                options.map { li ->
-                    val post = li.attr("data-post")
-                    val nume = li.attr("data-nume")
-                    val type = li.attr("data-type").ifBlank { "tv" }
-                    val label = li.selectFirst("span.title")?.text()?.trim()?.ifBlank { null }
-                        ?: "Server $nume"
+                requests.values.map { r ->
                     async {
-                        try { fetchTdPlayerEmbed(post, nume, type) to label } catch (_: Exception) { "" to label }
+                        try { fetchTdPlayerEmbed(r[0], r[1], r[2]) to r[3] } catch (_: Exception) { "" to r[3] }
                     }
                 }.map { it.await() }
             }
@@ -763,7 +789,29 @@ class TioDonghuaProvider : MainAPI() {
     }
 
     /**
-     * v24.2: la página "MultiPlayer" (player.tiodonghua.com/embed/XX+NN) es un
+     * v24.3: Google Drive (servidor "Drive Vip" del AJAX de tiodonghua).
+     * drive.google.com/file/d/ID/preview -> drive.usercontent.google.com/download
+     * ?id=ID&export=download&confirm=t: sirve el MP4 DIRECTO (verificado en vivo
+     * con 3 archivos: 200 video/mp4, 325-586 MB, sin cookies ni JS). Es una
+     * transform pura de URL: sin peticiones de red en el extractor.
+     */
+    private suspend fun extractTdGoogleDrive(
+        embedUrl: String, serverName: String, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val id = Regex("drive\\.google\\.com/(?:file/d/|open\\?id=)([a-zA-Z0-9_-]{10,})")
+            .find(embedUrl)?.groupValues?.get(1) ?: return false
+        callback(
+            newExtractorLink(source = "Drive", name = "Drive", url =
+                "https://drive.usercontent.google.com/download?id=$id&export=download&confirm=t") {
+                this.referer = "https://drive.google.com/"
+                this.quality = Qualities.Unknown.value
+            }
+        )
+        return true
+    }
+
+    /**
+     * v24.3: la página "MultiPlayer" (player.tiodonghua.com/embed/XX+NN) es un
      * agregador: lista <li onclick="go_to_player('URL')"> con 7 servidores
      * (StreamWish, VidGuard, FileMon, Dailymotion, OKRu, VidHide, Rumble) y la
      * etiqueta visible junto a cada botón. Extraer cada embed y procesarlo con su
@@ -776,14 +824,39 @@ class TioDonghuaProvider : MainAPI() {
         return try {
             val html = app.get(embedUrl, referer = referer,
                 headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L).text
-            val embeds = Regex("""go_to_player\\('([^']+)'\\)""").findAll(html).toList()
+            // v24.3 FIX: el raw string con \\( tenia backslash literal + '(' ->
+            // 0 matches en Android (la doble barra no es escape en raw strings).
+            // Un solo backslash en raw string = escape regex real.
+            val embeds = (Regex("""go_to_player\('([^']+)'\)""").findAll(html).map { it.groupValues[1].trim() }
+                    + html.split("go_to_player").drop(1).mapNotNull { seg ->
+                        // v24.3 fallback tolerante: host + ruta hasta la comilla,
+                        // para onclick con formato distinto (comillas dobles, etc.)
+                        Regex("""[\(]\s*['\"]?([a-z0-9.-]+\.[a-z]{2,}[^'\"]\s*)['\"]?[\)]""", RegexOption.IGNORE_CASE)
+                            .find(seg)?.groupValues?.get(1)?.trim()
+                    })
+                .filter { it.startsWith("http") }.distinct().toList()
             var any = false
-            for (m in embeds) {
-                val child = m.groupValues[1]
+            for (child in embeds) {
                 val processed = try {
                     processTdEmbed(child, embedUrl, serverLabelFromUrl(child), subtitleCallback, callback)
                 } catch (_: Exception) { false }
                 if (processed) any = true
+            }
+            // v24.3: el agregador VIP (embed "XX+NN vip" del AJAX, ej. "MI+001 vip")
+            // usa botones is-vip-server SIN go_to_player: hosts absolutos en atributos
+            // data-* (verificado en vivo). Extraerlos también.
+            if (!any) {
+                for (m in Regex("""(https?://[a-zA-Z0-9.-]+/[a-zA-Z0-9/._+?=&-]+)""").findAll(html)) {
+                    val cand = m.groupValues[1]
+                    if (cand.contains("tiodonghua") || cand.contains("googletagmanager") ||
+                        cand.contains("google-analytics") || cand.contains("gstatic") ||
+                        cand.contains("fontawesome") || cand.contains("cloudflare") ||
+                        cand.contains("yandex") || cand.contains("jquery")) continue
+                    val processed = try {
+                        processTdEmbed(cand, embedUrl, serverLabelFromUrl(cand), subtitleCallback, callback)
+                    } catch (_: Exception) { false }
+                    if (processed) any = true
+                }
             }
             any
         } catch (_: Exception) {
@@ -803,6 +876,9 @@ class TioDonghuaProvider : MainAPI() {
         val cb: (ExtractorLink) -> Unit = { links++; callback(it) }
         val u = embedUrl.trim()
         when {
+            // v24.3: streaming P2P/WebRTC (API JSON con token, peers y MSE);
+            // ExoPlayer no puede reproducirlo: no gastar peticiones.
+            u.contains("playerp2p.online") -> {}
             u.contains("dailymotion.com") ->
                 extractTdDailymotion(u, referer, serverName, cb)
             // v24: Ok.Ru (servidor "OK" muy común en tiodonghua)
@@ -829,6 +905,10 @@ class TioDonghuaProvider : MainAPI() {
                 u.contains("vgembed") || u.contains("vgfplay") || u.contains("vidguard") ||
                 u.contains("byse") || u.contains("asnwish") ->
                 extractTdPacked(u, referer, serverName, cb)
+            // v24.3: Google Drive (servidor "Drive Vip" del AJAX):
+            // transform pura de URL a la descarga directa (MP4 sin cookies).
+            u.contains("drive.google.com") ->
+                extractTdGoogleDrive(u, serverName, cb)
             else -> {
                 try { loadExtractor(u, referer, subtitleCallback, cb) } catch (_: Exception) {}
                 // v24.2: hosts del agregador MultiPlayer que no tienen rama propia
@@ -928,8 +1008,10 @@ class TioDonghuaProvider : MainAPI() {
     private suspend fun extractTdDailymotion(
         embedUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val videoId = Regex("dailymotion\\.com/(?:embed/)?video/([a-zA-Z0-9]+)")
-            .find(embedUrl)?.groupValues?.get(1) ?: return false
+        // v24.3: tambien geo.dailymotion.com/player.html?video=ID (variante
+        // servida en algunos embeds del agregador, ya cubierta en SeriesDonghua)
+        val videoId = Regex("dailymotion\\.com/(?:embed/)?video/([a-zA-Z0-9]+)|geo\\.dailymotion\\.com/player\\.html\\?video=([a-zA-Z0-9]+)")
+            .find(embedUrl)?.let { it.groupValues[1].ifBlank { it.groupValues[2] } } ?: return false
         try { app.get(embedUrl, referer = referer, timeout = 15L) } catch (_: Exception) {}
         try {
             val json = app.get(
