@@ -1,6 +1,5 @@
 package com.donghuaext
 
-import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
@@ -427,22 +426,13 @@ class SeriesDonghuaProvider : MainAPI() {
         val cb: (ExtractorLink) -> Unit = { links++; callback(it) }
 
         // data = URL del episodio (serie) o de la ficha (pelicula)
-        val pageResp = try { pageGet(data) } catch (e: Exception) {
-            Log.d("SDDBG", "pageGet($data) EX: ${e.message}"); null
-        }
+        val pageResp = try { pageGet(data) } catch (_: Exception) { null }
         var html = pageResp?.text ?: ""
-        Log.d("SDDBG", "pageGet($data) len=${html.length} btn=${html.contains("server-tab-btn")}")
-        // v24.6 FIX CAUSA RAIZ (logcat SDDBG 23:05): pageGet OK (80KB, btn=true,
-        // csrf ok len=40) pero TODOS los POST get-server responden 419 "CSRF token
-        // mismatch" (13KB, pagina de debug de Laravel) INCLUSO en el reintento con
-        // la cookie que NiceHttp ya habia plantado. La simulacion server-side con
-        // el mismo UA y flujo funciona 5/5: la diferencia es que el cliente HTTP
-        // del app NO acompana las cookies de sesion al POST (sin cookie de sesion
-        // Laravel rechaza siempre, con token correcto o no). Capturar las
-        // Set-Cookie de la respuesta del GET y reenviarlas EXPLICITAS en el header
-        // Cookie del POST, como hacen los navegadores (verificado en sim).
+        // v24.6 FIX (logcat 23:05): el cliente HTTP del app NO acompana las
+        // cookies de sesion al POST (Laravel rechaza todo POST sin sesion aunque
+        // el X-CSRF-TOKEN sea correcto): capturar las Set-Cookie del GET y
+        // reenviarlas EXPLICITAS en el header Cookie del POST, como un navegador.
         val pageCookies = pageResp?.cookies?.toMutableMap() ?: mutableMapOf()
-        Log.d("SDDBG", "cookies sesion: ${pageCookies.keys}")
         var episodePage = data
 
         // Ficha (pelicula): resolver el primer episodio del grid
@@ -454,50 +444,42 @@ class SeriesDonghuaProvider : MainAPI() {
                 val r2 = pageGet(episodePage)
                 pageCookies.putAll(r2.cookies)
                 html = r2.text
-                Log.d("SDDBG", "pelicula -> primer ep $episodePage len=${html.length}")
             } else {
-                // v24.7 FIX: el botón "Ver" de la ficha de película apunta a la
-                // página de video real (la de shrouding-the-heavens enlazaba
-                // <slug>-<slug>-pelicula/ y el propio sitio la devuelve 404, y el
-                // patrón <slug>-1/ de v24.4 también puede dejar de existir): NO
-                // adivinar el patrón — usar el href del a.btn-stream de la ficha y
-                // como último recurso <slug>-1/.
+                // v24.7 FIX: el boton "Ver" de la ficha de pelicula apunta a la
+                // pagina de video real (el propio sitio enlazo <slug>-<slug>-
+                // pelicula/ que el mismo devuelve 404, y el <slug>-1/ de v24.4
+                // puede dejar de existir): NO adivinar el patron — usar el href
+                // del a.btn-stream de la ficha y como ultimo recurso <slug>-1/.
                 val btnHref = Regex("<a[^>]*href=\\\"(/[^\\\"]+)\\\"[^>]*class=\\\"btn-stream[^\\\"]*\\\"").find(html)
-                ?.groupValues?.get(1)
-                ?: Regex("<a[^>]*class=\\\"btn-stream[^\\\"]*\\\"[^>]*href=\\\"(/[^\\\"]+)\\\"").find(html)
-                ?.groupValues?.get(1)
+                    ?.groupValues?.get(1)
+                    ?: Regex("<a[^>]*class=\\\"btn-stream[^\\\"]*\\\"[^>]*href=\\\"(/[^\\\"]+)\\\"").find(html)
+                        ?.groupValues?.get(1)
                 val candidates = listOfNotNull(
-                btnHref,
-                "/" + data.trimEnd('/').substringAfterLast('/') + "-1/"
+                    btnHref,
+                    "/" + data.trimEnd('/').substringAfterLast('/') + "-1/"
                 )
-                Log.d("SDDBG", "pelicula candidatos: $candidates")
                 for (cand in candidates) {
-                try {
-                val probe = pageGet(mainUrl + cand)
-                if (probe.text.contains("server-tab-btn")) {
-                episodePage = mainUrl + cand
-                pageCookies.putAll(probe.cookies)
-                html = probe.text
-                Log.d("SDDBG", "pelicula -> $episodePage len=${html.length}")
-                break
-                } else {
-                Log.d("SDDBG", "pelicula cand $cand sin botones len=${probe.text.length}")
-                }
-                } catch (e: Exception) { Log.d("SDDBG", "pelicula cand $cand EX: ${e.message}") }
+                    try {
+                        val probe = pageGet(mainUrl + cand)
+                        if (probe.text.contains("server-tab-btn")) {
+                            episodePage = mainUrl + cand
+                            pageCookies.putAll(probe.cookies)
+                            html = probe.text
+                            break
+                        }
+                    } catch (_: Exception) {}
                 }
             }
         }
         // v24.4: continuar si hay botones de servidor (pagina numerada de pelicula);
         // early-return solo si no hay episodios NI servidores resolubles.
         if (!episodePage.contains("-episodio-") && !html.contains("server-tab-btn")) {
-            Log.d("SDDBG", "early-return sin botones -> embeds sueltos")
             // Sin episodios resolubles; ultimo recurso: embeds sueltos en el HTML
             return extractSdEmbedsFromHtml(html, data, cb) > 0
         }
 
         val csrf = Regex("<meta name=\\\"csrf-token\\\" content=\\\"([^\\\"]+)\\\"").find(html)
             ?.groupValues?.get(1) ?: ""
-        Log.d("SDDBG", "csrf=${if (csrf.isBlank()) "VACIO" else "ok(len=${csrf.length})"}")
 
         // Botones de servidor: data-video-id + data-server-index + etiqueta
         val btnPattern = Regex(
@@ -513,22 +495,15 @@ class SeriesDonghuaProvider : MainAPI() {
 
             val embedUrl = try {
                 var resp = ""
-                var attempts = 0
                 // v24.5: repetir mientras NO llegue embed_url (el 419 de Laravel
                 // trae cuerpo NO vacio y el retry por cuerpo en blanco de v24.4
                 // nunca se disparaba). v24.6: en el reintento RE-PLANTAR sesion con
-                // un GET a la pagina (la cookie puede rotar tras el 419) y enviar
-                // SIEMPRE las cookies explicitas en el header Cookie.
+                // un GET a la pagina y enviar SIEMPRE las cookies explicitas.
                 repeat(2) {
-                    attempts++
                     if (!resp.contains("embed_url")) {
-                        if (attempts > 1) {
+                        if (resp.isNotEmpty()) {
                             kotlinx.coroutines.delay(150L)
-                            try {
-                                val rr = pageGet(episodePage, 20L)
-                                pageCookies.putAll(rr.cookies)
-                                Log.d("SDDBG", "resesion cookies=${pageCookies.keys}")
-                            } catch (e: Exception) { Log.d("SDDBG", "resesion EX: ${e.message}") }
+                            try { pageCookies.putAll(pageGet(episodePage, 20L).cookies) } catch (_: Exception) {}
                         }
                         val ck = pageCookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
                         resp = try {
@@ -545,31 +520,31 @@ class SeriesDonghuaProvider : MainAPI() {
                                 referer = episodePage,
                                 timeout = 20L
                             ).text
-                        } catch (e: Exception) { Log.d("SDDBG", "POST EX: ${e.message}"); "" }
+                        } catch (_: Exception) { "" }
                     }
                 }
-                Log.d("SDDBG", "POST v=$videoId s=$serverIndex intents=$attempts ck=${pageCookies.size} len=${resp.length} head=${resp.take(120).replace("\n", " ")}")
-                // {\"success\":true,\"embed_url\":\"https:\\/\\/...\"} (tolerante a espacios)
+                // {"success":true,"embed_url":"https:\/\/..."} (tolerante a espacios)
+                // v24.8 FIX: la unescape de \/ tenia 4 backslashes (backslash
+                // LITERAL) y el embed llegaba con las barras escapadas al
+                // extractor: el regex del videoId de Dailymotion no matcheaba y
+                // devolvia links=0 en la app pese a que la metadata funciona
+                // (verificado en sim). Dos backslashes = \/ real del JSON.
                 if (resp.contains("embed_url")) {
                     Regex("\"embed_url\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").find(resp)
-                        ?.groupValues?.get(1)?.replace("\\\\/", "/")
+                        ?.groupValues?.get(1)?.replace("\\/", "/")
                 } else null
-            } catch (e: Exception) { Log.d("SDDBG", "embed EX: ${e.message}"); null }
+            } catch (_: Exception) { null }
 
             val embed = embedUrl ?: continue
-            Log.d("SDDBG", "embed -> $serverName $embed")
             try {
-                val before = links
                 if (processSdEmbed(embed, episodePage, serverName, subtitleCallback, cb)) processed = true
-                Log.d("SDDBG", "extractor $serverName -> links=${links - before}")
-            } catch (e: Exception) { Log.d("SDDBG", "extractor EX: ${e.message}") }
+            } catch (_: Exception) {}
         }
 
         // Respaldo: embeds sueltos en el HTML del episodio
         if (!processed) {
             if (extractSdEmbedsFromHtml(html, episodePage, cb) > 0) processed = true
         }
-        Log.d("SDDBG", "fin data=$data links=$links processed=$processed")
         // v24.4: processed ya implica enlaces emitidos; no exigir la doble
         // condicion (un servidor que emite via callback directo cuenta igual).
         return processed || links > 0
