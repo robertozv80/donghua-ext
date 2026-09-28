@@ -432,6 +432,17 @@ class SeriesDonghuaProvider : MainAPI() {
         }
         var html = pageResp?.text ?: ""
         Log.d("SDDBG", "pageGet($data) len=${html.length} btn=${html.contains("server-tab-btn")}")
+        // v24.6 FIX CAUSA RAIZ (logcat SDDBG 23:05): pageGet OK (80KB, btn=true,
+        // csrf ok len=40) pero TODOS los POST get-server responden 419 "CSRF token
+        // mismatch" (13KB, pagina de debug de Laravel) INCLUSO en el reintento con
+        // la cookie que NiceHttp ya habia plantado. La simulacion server-side con
+        // el mismo UA y flujo funciona 5/5: la diferencia es que el cliente HTTP
+        // del app NO acompana las cookies de sesion al POST (sin cookie de sesion
+        // Laravel rechaza siempre, con token correcto o no). Capturar las
+        // Set-Cookie de la respuesta del GET y reenviarlas EXPLICITAS en el header
+        // Cookie del POST, como hacen los navegadores (verificado en sim).
+        val pageCookies = pageResp?.cookies?.toMutableMap() ?: mutableMapOf()
+        Log.d("SDDBG", "cookies sesion: ${pageCookies.keys}")
         var episodePage = data
 
         // Ficha (pelicula): resolver el primer episodio del grid
@@ -440,7 +451,9 @@ class SeriesDonghuaProvider : MainAPI() {
                 ?.groupValues?.get(1)
             if (firstEp != null) {
                 episodePage = mainUrl + firstEp
-                html = pageGet(episodePage).text
+                val r2 = pageGet(episodePage)
+                pageCookies.putAll(r2.cookies)
+                html = r2.text
                 Log.d("SDDBG", "pelicula -> primer ep $episodePage len=${html.length}")
             } else {
                 // v24.4 FIX: las PELICULAS no tienen grid "-episodio-": su pagina de
@@ -454,6 +467,7 @@ class SeriesDonghuaProvider : MainAPI() {
                     val probe = pageGet(numbered)
                     if (probe.text.contains("server-tab-btn")) {
                         episodePage = numbered
+                        pageCookies.putAll(probe.cookies)
                         html = probe.text
                         Log.d("SDDBG", "pelicula -> numerada $numbered len=${html.length}")
                     } else {
@@ -489,32 +503,41 @@ class SeriesDonghuaProvider : MainAPI() {
             val embedUrl = try {
                 var resp = ""
                 var attempts = 0
-                // v24.5 FIX: el retry anterior solo reintentaba con cuerpo VACIO,
-                // pero el 419 de Laravel responde {"message":"CSRF token mismatch."}
-                // (cuerpo no vacio): nunca reintentaba. Reintentar mientras NO llegue
-                // embed_url; la cookie de sesion que NiceHttp planta con la primera
-                // respuesta hace pasar el segundo intento.
+                // v24.5: repetir mientras NO llegue embed_url (el 419 de Laravel
+                // trae cuerpo NO vacio y el retry por cuerpo en blanco de v24.4
+                // nunca se disparaba). v24.6: en el reintento RE-PLANTAR sesion con
+                // un GET a la pagina (la cookie puede rotar tras el 419) y enviar
+                // SIEMPRE las cookies explicitas en el header Cookie.
                 repeat(2) {
                     attempts++
                     if (!resp.contains("embed_url")) {
-                        if (attempts > 1) kotlinx.coroutines.delay(150L)
+                        if (attempts > 1) {
+                            kotlinx.coroutines.delay(150L)
+                            try {
+                                val rr = pageGet(episodePage, 20L)
+                                pageCookies.putAll(rr.cookies)
+                                Log.d("SDDBG", "resesion cookies=${pageCookies.keys}")
+                            } catch (e: Exception) { Log.d("SDDBG", "resesion EX: ${e.message}") }
+                        }
+                        val ck = pageCookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
                         resp = try {
                             app.post(
                                 "$mainUrl/api/player/get-server",
                                 data = mapOf("video_id" to videoId, "server_index" to serverIndex),
-                                headers = mapOf(
-                                    "User-Agent" to SD_USER_AGENT,
-                                    "X-CSRF-TOKEN" to csrf,
-                                    "X-Requested-With" to "XMLHttpRequest",
-                                    "Accept" to "application/json",
-                                ),
+                                headers = buildMap {
+                                    put("User-Agent", SD_USER_AGENT)
+                                    put("X-CSRF-TOKEN", csrf)
+                                    put("X-Requested-With", "XMLHttpRequest")
+                                    put("Accept", "application/json")
+                                    if (ck.isNotBlank()) put("Cookie", ck)
+                                },
                                 referer = episodePage,
                                 timeout = 20L
                             ).text
                         } catch (e: Exception) { Log.d("SDDBG", "POST EX: ${e.message}"); "" }
                     }
                 }
-                Log.d("SDDBG", "POST v=$videoId s=$serverIndex intents=$attempts len=${resp.length} head=${resp.take(120).replace("\n", " ")}")
+                Log.d("SDDBG", "POST v=$videoId s=$serverIndex intents=$attempts ck=${pageCookies.size} len=${resp.length} head=${resp.take(120).replace("\n", " ")}")
                 // {\"success\":true,\"embed_url\":\"https:\\/\\/...\"} (tolerante a espacios)
                 if (resp.contains("\\\"success\\\"") && resp.contains("true")) {
                     Regex("\\\"embed_url\\\"\\\\s*:\\\\s*\\\"((?:[^\\\"\\\\\\\\]|\\\\\\\\.)*)\\\"").find(resp)
