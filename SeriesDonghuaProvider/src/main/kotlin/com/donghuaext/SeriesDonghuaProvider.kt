@@ -1,5 +1,6 @@
 package com.donghuaext
 
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
@@ -426,16 +427,21 @@ class SeriesDonghuaProvider : MainAPI() {
         val cb: (ExtractorLink) -> Unit = { links++; callback(it) }
 
         // data = URL del episodio (serie) o de la ficha (pelicula)
-        var html = pageGet(data).text
+        val pageResp = try { pageGet(data) } catch (e: Exception) {
+            Log.d("SDDBG", "pageGet($data) EX: ${e.message}"); null
+        }
+        var html = pageResp?.text ?: ""
+        Log.d("SDDBG", "pageGet($data) len=${html.length} btn=${html.contains("server-tab-btn")}")
         var episodePage = data
 
         // Ficha (pelicula): resolver el primer episodio del grid
         if (!data.contains("-episodio-")) {
-            val firstEp = Regex("href=\"(/[a-z0-9-]+-episodio-\\d+/)\"").find(html)
+            val firstEp = Regex("href=\\\"(/[a-z0-9-]+-episodio-\\d+/)\\\"").find(html)
                 ?.groupValues?.get(1)
             if (firstEp != null) {
                 episodePage = mainUrl + firstEp
                 html = pageGet(episodePage).text
+                Log.d("SDDBG", "pelicula -> primer ep $episodePage len=${html.length}")
             } else {
                 // v24.4 FIX: las PELICULAS no tienen grid "-episodio-": su pagina de
                 // video es /<slug>-N/ (numerada) y la card "Ver" del propio sitio
@@ -449,40 +455,49 @@ class SeriesDonghuaProvider : MainAPI() {
                     if (probe.text.contains("server-tab-btn")) {
                         episodePage = numbered
                         html = probe.text
+                        Log.d("SDDBG", "pelicula -> numerada $numbered len=${html.length}")
+                    } else {
+                        Log.d("SDDBG", "pelicula numerada SIN botones len=${probe.text.length}")
                     }
-                } catch (_: Exception) {}
+                } catch (e: Exception) { Log.d("SDDBG", "pelicula numerada EX: ${e.message}") }
             }
         }
         // v24.4: continuar si hay botones de servidor (pagina numerada de pelicula);
         // early-return solo si no hay episodios NI servidores resolubles.
         if (!episodePage.contains("-episodio-") && !html.contains("server-tab-btn")) {
+            Log.d("SDDBG", "early-return sin botones -> embeds sueltos")
             // Sin episodios resolubles; ultimo recurso: embeds sueltos en el HTML
             return extractSdEmbedsFromHtml(html, data, cb) > 0
         }
 
-        val csrf = Regex("<meta name=\"csrf-token\" content=\"([^\"]+)\"").find(html)
+        val csrf = Regex("<meta name=\\\"csrf-token\\\" content=\\\"([^\\\"]+)\\\"").find(html)
             ?.groupValues?.get(1) ?: ""
+        Log.d("SDDBG", "csrf=${if (csrf.isBlank()) "VACIO" else "ok(len=${csrf.length})"}")
 
         // Botones de servidor: data-video-id + data-server-index + etiqueta
         val btnPattern = Regex(
-            "<button[^>]*class=\"server-tab-btn[^\"]*\"[^>]*>",
+            "<button[^>]*class=\\\"server-tab-btn[^\\\"]*\\\"[^>]*>",
             RegexOption.DOT_MATCHES_ALL
         )
         var processed = false
         for (btnMatch in btnPattern.findAll(html)) {
             val tag = btnMatch.value
-            val videoId = Regex("data-video-id=\"(\\d+)\"").find(tag)?.groupValues?.get(1) ?: continue
-            val serverIndex = Regex("data-server-index=\"(\\d+)\"").find(tag)?.groupValues?.get(1) ?: continue
+            val videoId = Regex("data-video-id=\\\"(\\d+)\\\"").find(tag)?.groupValues?.get(1) ?: continue
+            val serverIndex = Regex("data-server-index=\\\"(\\d+)\\\"").find(tag)?.groupValues?.get(1) ?: continue
             val serverName = serverLabelFromBtn(html, btnMatch.range.first)
 
             val embedUrl = try {
                 var resp = ""
-                // v24.4: la API exige la cookie de sesion junto al CSRF (sin ella
-                // responde 419 "CSRF token mismatch", verificado en vivo). Si la
-                // sesion aún no está plantada, repetir la MISMA peticion la
-                // recupera con la cookie que NiceHttp ya guardó.
+                var attempts = 0
+                // v24.5 FIX: el retry anterior solo reintentaba con cuerpo VACIO,
+                // pero el 419 de Laravel responde {"message":"CSRF token mismatch."}
+                // (cuerpo no vacio): nunca reintentaba. Reintentar mientras NO llegue
+                // embed_url; la cookie de sesion que NiceHttp planta con la primera
+                // respuesta hace pasar el segundo intento.
                 repeat(2) {
-                    if (resp.isBlank()) {
+                    attempts++
+                    if (!resp.contains("embed_url")) {
+                        if (attempts > 1) kotlinx.coroutines.delay(150L)
                         resp = try {
                             app.post(
                                 "$mainUrl/api/player/get-server",
@@ -496,27 +511,31 @@ class SeriesDonghuaProvider : MainAPI() {
                                 referer = episodePage,
                                 timeout = 20L
                             ).text
-                        } catch (_: Exception) { "" }
-                        if (resp.isBlank()) kotlinx.coroutines.delay(150L)
+                        } catch (e: Exception) { Log.d("SDDBG", "POST EX: ${e.message}"); "" }
                     }
                 }
-                // {"success":true,"embed_url":"https:\/\/..."} (tolerante a espacios)
-                if (resp.contains("\"success\"") && resp.contains("true")) {
-                    Regex("\"embed_url\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").find(resp)
-                        ?.groupValues?.get(1)?.replace("\\/", "/")
+                Log.d("SDDBG", "POST v=$videoId s=$serverIndex intents=$attempts len=${resp.length} head=${resp.take(120).replace("\n", " ")}")
+                // {\"success\":true,\"embed_url\":\"https:\\/\\/...\"} (tolerante a espacios)
+                if (resp.contains("\\\"success\\\"") && resp.contains("true")) {
+                    Regex("\\\"embed_url\\\"\\\\s*:\\\\s*\\\"((?:[^\\\"\\\\\\\\]|\\\\\\\\.)*)\\\"").find(resp)
+                        ?.groupValues?.get(1)?.replace("\\\\/", "/")
                 } else null
-            } catch (_: Exception) { null }
+            } catch (e: Exception) { Log.d("SDDBG", "embed EX: ${e.message}"); null }
 
             val embed = embedUrl ?: continue
+            Log.d("SDDBG", "embed -> $serverName $embed")
             try {
+                val before = links
                 if (processSdEmbed(embed, episodePage, serverName, subtitleCallback, cb)) processed = true
-            } catch (_: Exception) {}
+                Log.d("SDDBG", "extractor $serverName -> links=${links - before}")
+            } catch (e: Exception) { Log.d("SDDBG", "extractor EX: ${e.message}") }
         }
 
         // Respaldo: embeds sueltos en el HTML del episodio
         if (!processed) {
             if (extractSdEmbedsFromHtml(html, episodePage, cb) > 0) processed = true
         }
+        Log.d("SDDBG", "fin data=$data links=$links processed=$processed")
         // v24.4: processed ya implica enlaces emitidos; no exigir la doble
         // condicion (un servidor que emite via callback directo cuenta igual).
         return processed || links > 0
