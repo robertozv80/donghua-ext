@@ -436,9 +436,26 @@ class SeriesDonghuaProvider : MainAPI() {
             if (firstEp != null) {
                 episodePage = mainUrl + firstEp
                 html = pageGet(episodePage).text
+            } else {
+                // v24.4 FIX: las PELICULAS no tienen grid "-episodio-": su pagina de
+                // video es /<slug>-N/ (numerada) y la card "Ver" del propio sitio
+                // enlaza una URL DUPLICADA que da 404 (verificado en vivo:
+                // perfect-world-movie...-perfect-world-movie...-1/). Probar
+                // directamente <slug>-1/.
+                val slug = data.trimEnd('/').substringAfterLast('/')
+                val numbered = "$mainUrl/$slug-1/"
+                try {
+                    val probe = pageGet(numbered)
+                    if (probe.text.contains("server-tab-btn")) {
+                        episodePage = numbered
+                        html = probe.text
+                    }
+                } catch (_: Exception) {}
             }
         }
-        if (!episodePage.contains("-episodio-")) {
+        // v24.4: continuar si hay botones de servidor (pagina numerada de pelicula);
+        // early-return solo si no hay episodios NI servidores resolubles.
+        if (!episodePage.contains("-episodio-") && !html.contains("server-tab-btn")) {
             // Sin episodios resolubles; ultimo recurso: embeds sueltos en el HTML
             return extractSdEmbedsFromHtml(html, data, cb) > 0
         }
@@ -459,20 +476,32 @@ class SeriesDonghuaProvider : MainAPI() {
             val serverName = serverLabelFromBtn(html, btnMatch.range.first)
 
             val embedUrl = try {
-                val resp = app.post(
-                    "$mainUrl/api/player/get-server",
-                    data = mapOf("video_id" to videoId, "server_index" to serverIndex),
-                    headers = mapOf(
-                        "User-Agent" to SD_USER_AGENT,
-                        "X-CSRF-TOKEN" to csrf,
-                        "X-Requested-With" to "XMLHttpRequest",
-                        "Accept" to "application/json",
-                    ),
-                    referer = episodePage,
-                    timeout = 20L
-                ).text
-                // {"success":true,"embed_url":"https:\/\/..."}
-                if (resp.contains("\"success\":true")) {
+                var resp = ""
+                // v24.4: la API exige la cookie de sesion junto al CSRF (sin ella
+                // responde 419 "CSRF token mismatch", verificado en vivo). Si la
+                // sesion aún no está plantada, repetir la MISMA peticion la
+                // recupera con la cookie que NiceHttp ya guardó.
+                repeat(2) {
+                    if (resp.isBlank()) {
+                        resp = try {
+                            app.post(
+                                "$mainUrl/api/player/get-server",
+                                data = mapOf("video_id" to videoId, "server_index" to serverIndex),
+                                headers = mapOf(
+                                    "User-Agent" to SD_USER_AGENT,
+                                    "X-CSRF-TOKEN" to csrf,
+                                    "X-Requested-With" to "XMLHttpRequest",
+                                    "Accept" to "application/json",
+                                ),
+                                referer = episodePage,
+                                timeout = 20L
+                            ).text
+                        } catch (_: Exception) { "" }
+                        if (resp.isBlank()) kotlinx.coroutines.delay(150L)
+                    }
+                }
+                // {"success":true,"embed_url":"https:\/\/..."} (tolerante a espacios)
+                if (resp.contains("\"success\"") && resp.contains("true")) {
                     Regex("\"embed_url\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").find(resp)
                         ?.groupValues?.get(1)?.replace("\\/", "/")
                 } else null
@@ -488,7 +517,9 @@ class SeriesDonghuaProvider : MainAPI() {
         if (!processed) {
             if (extractSdEmbedsFromHtml(html, episodePage, cb) > 0) processed = true
         }
-        return processed && links > 0
+        // v24.4: processed ya implica enlaces emitidos; no exigir la doble
+        // condicion (un servidor que emite via callback directo cuenta igual).
+        return processed || links > 0
     }
 
     /** Etiqueta visible del boton (span sin clase server-badge). */
@@ -656,6 +687,17 @@ class SeriesDonghuaProvider : MainAPI() {
             val html = app.get(embedUrl, referer = referer,
                 headers = mapOf("User-Agent" to SD_USER_AGENT), timeout = 20L).text
             val fixed = html.replace("\\/", "/")
+            // v24.4: los embeds nuevos traen "hls":{"url":"https://rumble.com/
+            // hls-vod/..."} en el bloque m.f["VID"] (el mapa "360":{...} ya no
+            // aparece; el patron viejo solo matcheaba la timeline de 180p).
+            // HLS VOD valido con variantes 1080/720/480/360 (verificado en vivo).
+            Regex("\"hls\":[{]\"url\":\"(https://rumble[.]com/hls-vod/[^\"]+)\")")
+                .find(fixed)?.groupValues?.get(1)?.let { hlsUrl ->
+                    try {
+                        generateM3u8(name, hlsUrl, embedUrl).forEach(callback)
+                        return true
+                    } catch (_: Exception) {}
+                }
             val qualities = Regex("\"(\\d{3,4})\":\\{\"url\":\"(https://[a-z0-9.]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4)\"")
                 .findAll(fixed).toList()
             if (qualities.isNotEmpty()) {
@@ -690,8 +732,21 @@ class SeriesDonghuaProvider : MainAPI() {
     /** Voe.sx: m3u8/mp4 en el HTML del player. */
     private suspend fun extractSdVoe(videoUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit): Boolean {
         return try {
-            val html = app.get(videoUrl, referer = referer,
+            var html = app.get(videoUrl, referer = referer,
                 headers = mapOf("User-Agent" to SD_USER_AGENT), timeout = 20L).text
+            // v24.4 FIX: voe.sx ya NO sirve el player: devuelve una pagina de 769
+            // bytes que redirige por JS a otro dominio (verificado en vivo:
+            // window.location.href='https://jeremyparticipantanything.com/e/ID').
+            // app.get no ejecuta JS: seguir el redirect manualmente.
+            if (html.length < 1200 && html.contains("window.location.href")) {
+                Regex("""window.location.href\s*=\s*'(https://[^']+)'""").find(html)
+                    ?.groupValues?.get(1)?.let { dest ->
+                        try {
+                            html = app.get(dest, referer = videoUrl,
+                                headers = mapOf("User-Agent" to SD_USER_AGENT), timeout = 20L).text
+                        } catch (_: Exception) {}
+                    }
+            }
             for (m in Regex("(https?://[^\"'\\s<>]+\\.m3u8[^\\s\"'<>]*)").findAll(html)) {
                 try { generateM3u8(serverName, m.value, videoUrl).forEach(callback); return true } catch (_: Exception) {}
             }
@@ -700,19 +755,6 @@ class SeriesDonghuaProvider : MainAPI() {
                     this.referer = videoUrl; this.quality = Qualities.Unknown.value
                 })
                 return true
-            }
-            // sources JS ("sources": [{"file":"https://...m3u8"...}])
-            val unpacked = try { getAndUnpack(html) } catch (_: Exception) { html }
-            if (unpacked !== html) {
-                for (m in Regex("(https?://[^\"'\\s<>]+\\.m3u8[^\\s\"'<>]*)").findAll(unpacked)) {
-                    try { generateM3u8(serverName, m.value, videoUrl).forEach(callback); return true } catch (_: Exception) {}
-                }
-                for (m in Regex("(https?://[^\"'\\s<>]+\\.mp4[^\\s\"'<>]*)").findAll(unpacked)) {
-                    callback(newExtractorLink(source = serverName, name = serverName, url = m.value) {
-                        this.referer = videoUrl; this.quality = Qualities.Unknown.value
-                    })
-                    return true
-                }
             }
             false
         } catch (_: Exception) {
