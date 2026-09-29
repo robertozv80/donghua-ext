@@ -499,6 +499,7 @@ class DonghuaLifeProvider : MainAPI() {
         if (jsonLdStudio.isNotBlank() && jsonLdStudio !in genres) genres.add(jsonLdStudio)
 
         var showStatus: ShowStatus? = null
+        var statusText = ""
         var releaseDateStr = ""
         var durationMinutes = 0
 
@@ -509,13 +510,17 @@ class DonghuaLifeProvider : MainAPI() {
             when {
                 text.contains("En Emisión", ignoreCase = true) ||
                 text.contains("En Emision", ignoreCase = true) ||
+                text.contains("Emisión", ignoreCase = true) ||
+                text.contains("Emision", ignoreCase = true) ||
                 text.contains("Pausa", ignoreCase = true) ||
                 text.contains("Ongoing", ignoreCase = true) -> {
                     showStatus = ShowStatus.Ongoing
+                    statusText = text
                 }
                 text.contains("Finalizado", ignoreCase = true) ||
                 text.contains("Completed", ignoreCase = true) -> {
                     showStatus = ShowStatus.Completed
+                    statusText = text
                 }
                 Regex("""\d+\s+de?\s*[A-Za-záéíóú]+,?\s+\d{4}""").matches(text) ||
                 Regex("""\d+\s+[A-Za-záéíóú]+,?\s+\d{4}""").matches(text) -> {
@@ -558,7 +563,7 @@ class DonghuaLifeProvider : MainAPI() {
             return newMovieLoadResponse(title, dataUrl, TvType.AnimeMovie, dataUrl) {
                 posterUrl = poster
                 plot = fullPlot
-                tags = genres
+                tags = if (statusText.isNotBlank()) listOf(statusText) + genres else genres
                 year = yearInt
                 if (durationMinutes > 0) this.duration = durationMinutes
                 this.score = Score.from10(score)
@@ -647,7 +652,7 @@ class DonghuaLifeProvider : MainAPI() {
             if (seasonNames.isNotEmpty()) addSeasonNames(seasonNames)
             showStatus = showStatus
             plot = fullPlot
-            tags = genres
+            tags = if (statusText.isNotBlank()) listOf(statusText) + genres else genres
             year = yearInt
             if (durationMinutes > 0) this.duration = durationMinutes
             this.score = Score.from10(score)
@@ -1496,6 +1501,96 @@ class DonghuaLifeProvider : MainAPI() {
         return servers
     }
 
+    // ========== ODYSEE EXTRACTOR (v12) ==========
+    // donghualife.com resuelve odysee via POST /api/player/source -> embed firmado:
+    //   https://odysee.com/$/embed/@dlife:3/Ir-157:7?r=<repr>&signature=<sig>&signature_ts=<ts>
+    // El player de odysee hace JSON-RPC a api.na-backend.odysee.com:
+    //   1) m=resolve {urls:["lbry://@canal:N/claim:M"]} -> claim_id
+    //   2) m=get {uri:"lbry://claim#claim_id", signature:<sig>, signature_ts:<ts>} -> streaming_url
+    // La firma del embed es OBLIGATORIA para m=get ("missing required signature param").
+    // streaming_url = MP4 progresivo en secure.odycdn.com, verificado 206 + magic ftyp.
+    private suspend fun extractOdysee(
+        embedUrl: String,
+        referer: String,
+        serverName: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        try {
+            Log.i(TAG, "extractOdysee: embed=$embedUrl (referer=$referer)")
+            // uri lbry = path del embed (@canal:N/claim:M), URL-encoded
+            val path = Regex("/embed/([^?]+)").find(embedUrl)?.groupValues?.get(1) ?: ""
+            if (path.isBlank()) {
+                Log.w(TAG, "extractOdysee: sin /embed/ en la URL")
+                return false
+            }
+            val decodedPath = java.net.URLDecoder.decode(path, "UTF-8")
+            val claimUri = "lbry://" + decodedPath
+            // nombre del claim = ultimo segmento del path antes de ":" ("Ir-157:7" -> "Ir-157")
+            val claimName = decodedPath.substringAfterLast('/').substringBeforeLast(':')
+            val sig = Regex("[?&]signature=([A-Za-z0-9]+)").find(embedUrl)?.groupValues?.get(1) ?: ""
+            val sigTs = Regex("""[?&]signature_ts=(\d+)""").find(embedUrl)?.groupValues?.get(1) ?: ""
+            Log.i(TAG, "extractOdysee: claimUri=$claimUri sig=${sig.take(12)}... ts=$sigTs")
+            val rpcHeaders = mapOf(
+                "User-Agent" to browserUA,
+                "Accept" to "*/*",
+                "Content-Type" to "application/json",
+                "Origin" to "https://odysee.com",
+                "Referer" to "https://odysee.com/",
+            )
+            // 1) resolve -> claim_id
+            val resolveResp = app.post(
+                "https://api.na-backend.odysee.com/api/v1/proxy?m=resolve",
+                json = mapOf<String, Any>(
+                    "jsonrpc" to "2.0", "method" to "resolve",
+                    "params" to mapOf<String, Any>("urls" to listOf(claimUri)),
+                ),
+                headers = rpcHeaders, timeout = 25L
+            ).text
+            val claimId = Regex("""\"claim_id\"\s*:\s*\"([0-9a-f]{40})\"""").find(resolveResp)?.groupValues?.get(1) ?: ""
+            if (claimId.isBlank() || claimName.isBlank()) {
+                Log.w(TAG, "extractOdysee: resolve sin claim (resp=${resolveResp.take(160)})")
+                return false
+            }
+            Log.i(TAG, "extractOdysee: claim=$claimName id=$claimId")
+            // 2) get firmado -> streaming_url (probado: uri+signature+signature_ts bastan)
+            val getResp = app.post(
+                "https://api.na-backend.odysee.com/api/v1/proxy?m=get",
+                json = mapOf<String, Any>(
+                    "jsonrpc" to "2.0", "method" to "get",
+                    "params" to mapOf<String, Any>(
+                        "uri" to "lbry://$claimName#$claimId",
+                        "signature" to sig,
+                        "signature_ts" to sigTs,
+                    ),
+                ),
+                headers = rpcHeaders, timeout = 25L
+            ).text
+            val streamingUrl = Regex("""\"streaming_url\"\s*:\s*\"([^\"]+)\"""").find(getResp)?.groupValues?.get(1)
+                ?.replace("\\u002F", "/")?.replace("\\/", "/") ?: ""
+            if (streamingUrl.isBlank()) {
+                Log.w(TAG, "extractOdysee: get sin streaming_url (resp=${getResp.take(200)})")
+                return false
+            }
+            Log.i(TAG, "extractOdysee: streaming_url=${streamingUrl.take(100)}")
+            callback(
+                newExtractorLink(
+                    source = serverName,
+                    name = serverName,
+                    url = streamingUrl,
+                    type = ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = "https://odysee.com/"
+                    this.quality = Qualities.Unknown.value
+                    this.headers = mapOf("User-Agent" to browserUA)
+                }
+            )
+            return true
+        } catch (e: Exception) {
+            Log.w(TAG, "extractOdysee failed: ${e.message}")
+        }
+        return false
+    }
+
     // ========== API REAL DEL SITIO (v17) ==========
     // POST /api/player/source con {"token": ...} → {"url": "...", "exp": ...}
     // Verificado en vivo: funciona con tokens de episodios (OK/Rumble/etc.) y de películas.
@@ -1621,6 +1716,12 @@ class DonghuaLifeProvider : MainAPI() {
                             if (!anyEmitted) {
                                 try { extractOkRuDirect(serverUrlFixed, referer, name, trackingCallback) } catch (_: Exception) {}
                             }
+                        }
+                    }
+                    serverUrlFixed.contains("odysee.com") -> {
+                        // v12: Odysee - resolve + get firmado en api.na-backend.odysee.com
+                        if (!extractOdysee(serverUrlFixed, referer, name, trackingCallback)) {
+                            try { loadExtractor(serverUrlFixed, referer, subtitleCallback, trackingCallback) } catch (_: Exception) {}
                         }
                     }
                     serverUrlFixed.endsWith(".mp4") || serverUrlFixed.endsWith(".m3u8") ||
