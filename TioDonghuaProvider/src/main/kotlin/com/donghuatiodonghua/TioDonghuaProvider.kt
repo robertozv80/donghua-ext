@@ -93,9 +93,66 @@ private suspend fun extractTdOkRu(embedUrl: String, referer: String, name: Strin
 /**
  * v24: extractor de Rumble. La página del embed incluye el embed JS con
  * los mp4 directos por calidad (hugh.cdn.rumble.cloud).
+ *
+ * v24.12: el embed estándar (rumble.com/embed/VID) ya NO sirve el video en el
+ * HTML: el player lo resuelve por API (verificado en vivo: embed de 165KB de JS
+ * sin una sola url de video; los videos viejos sí traían el data JSON). La API
+ * pública embedJS exige el parámetro embed= (o referrer=) o responde 403:
+ *   https://rumble.com/embedJS/u3/?request=video&v=VID&embed=<embedUrl>
+ * Devuelve "ua": {"240":[url,...],"360":[...],...,"1080":[...]} con MP4 directos
+ * en hugh.cdn.rumble.cloud (validado en vivo: 206 video/mp4, Range OK, 301MB).
+ * Estrategia: 1) API embedJS (embeds nuevos y viejos); 2) HTML del embed como
+ * fallback para videos antiguos que aún traen hls-vod o mapa de calidades.
  */
 private suspend fun extractTdRumble(embedUrl: String, referer: String, name: String, callback: (ExtractorLink) -> Unit): Boolean {
     return try {
+        // 1) API embedJS: vid = /embed/VID (o watch /VID). embed= es OBLIGATORIO
+        // (verificado: sin el parámetro la API responde 403 Forbidden).
+        val vid = Regex("rumble\\.com/(?:embed/)?(v[a-zA-Z0-9]+)").find(embedUrl)?.groupValues?.get(1)
+        if (vid != null) {
+            val api = "https://rumble.com/embedJS/u3/?request=video&v=$vid" +
+                "&embed=" + java.net.URLEncoder.encode(embedUrl, "UTF-8")
+            val uaMap = Regex("\"(\\d{3,4})\":\\[\"(https://[a-z0-9.]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4)\"")
+            suspend fun emit(json: String): Int {
+                val fixed = json.replace("\\/", "/")
+                var n = 0
+                uaMap.findAll(fixed).forEach { m ->
+                    val h = m.groupValues[1].toIntOrNull()
+                    callback(newExtractorLink(source = name, name = name, url = m.groupValues[2]) {
+                        this.referer = "https://rumble.com/"
+                        this.quality = when {
+                            h == null -> Qualities.Unknown.value
+                            h >= 1080 -> Qualities.P1080.value
+                            h >= 720 -> Qualities.P720.value
+                            h >= 480 -> Qualities.P480.value
+                            else -> Qualities.P360.value
+                        }
+                    })
+                    n++
+                }
+                return n
+            }
+            var json = try {
+                app.get(api, referer = "https://rumble.com/",
+                    headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L).text
+            } catch (_: Exception) { "" }
+            var count = if (json.isNotBlank()) emit(json) else 0
+            if (count == 0) {
+                // WAF de Cloudflare: la API responde 403 sin cookie __cf_bm.
+                // Visitar el embed primero (la sesión conserva la cookie) y reintentar.
+                try {
+                    app.get(embedUrl, referer = referer,
+                        headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L)
+                } catch (_: Exception) {}
+                json = try {
+                    app.get(api, referer = embedUrl,
+                        headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L).text
+                } catch (_: Exception) { "" }
+                if (json.isNotBlank()) count = emit(json)
+            }
+            if (count > 0) return true
+        }
+        // 2) Fallback: HTML del embed (videos antiguos con el data JSON embebido)
         val html = app.get(embedUrl, referer = referer,
             headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L).text
         // Las URLs vienen con / escapado dentro del JSON del embed
@@ -114,7 +171,7 @@ private suspend fun extractTdRumble(embedUrl: String, referer: String, name: Str
             }
         // v24.2: el JSON del embed trae un mapa de calidades con dimensiones:
         // "360":{"url":"...mp4","meta":{...,"w":638,"h":360}}. Emitir cada una.
-        val qualities = Regex("\"(\\d{3,4})\":{\"url\":\"(https://[a-z0-9.]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4)\"")
+        val qualities = Regex("\"(\\d{3,4})\":\\{\"url\":\"(https://[a-z0-9.]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4)\"")
             .findAll(fixed).toList()
         if (qualities.isNotEmpty()) {
             qualities.distinctBy { it.groupValues[2] }.forEach { m ->
@@ -144,7 +201,6 @@ private suspend fun extractTdRumble(embedUrl: String, referer: String, name: Str
         false
     }
 }
-
 /**
  * v24: extractor de StreamTape. El HTML del player trae el enlace directo
  * `//<host>.streamtape.<tld>/get_video?id=...&expires=...&ip=...&token=...`

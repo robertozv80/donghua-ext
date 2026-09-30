@@ -498,12 +498,34 @@ class DonghuaLifeProvider : MainAPI() {
         val genres = ArrayList<String>(jsonLdGenres)
         if (jsonLdStudio.isNotBlank() && jsonLdStudio !in genres) genres.add(jsonLdStudio)
 
-        var showStatus: ShowStatus? = null
+        var parsedShowStatus: ShowStatus? = null
         var statusText = ""
         var releaseDateStr = ""
         var durationMinutes = 0
 
         val pillSpans = doc.select("span.text-xs.font-black.uppercase.tracking-widest")
+        // v24.12 FALLBACK RSC: el badge de estado no siempre llega en el HTML
+        // estatico (render client-side). En el payload RSC el badge aparece como
+        // ..."text-xs font-black uppercase tracking-widest","children":"<texto>".
+        if (statusText.isBlank()) {
+            val rscStatus = Regex(
+                "\"text-xs font-black uppercase tracking-widest\",\"children\":\"([^\"]+)\""
+            ).find(rscPayload)?.groupValues?.get(1)?.trim().orEmpty()
+            if (rscStatus.isNotBlank()) {
+                statusText = rscStatus
+                when {
+                    rscStatus.contains("Finalizado", ignoreCase = true) ||
+                        rscStatus.contains("Completed", ignoreCase = true) ->
+                        parsedShowStatus = ShowStatus.Completed
+                    rscStatus.contains("Emisión", ignoreCase = true) ||
+                        rscStatus.contains("Emision", ignoreCase = true) ||
+                        rscStatus.contains("Pausa", ignoreCase = true) ||
+                        rscStatus.contains("Ongoing", ignoreCase = true) ->
+                        parsedShowStatus = ShowStatus.Ongoing
+                    else -> {}
+                }
+            }
+        }
         for (span in pillSpans) {
             val text = span.text().trim()
             if (text.isBlank()) continue
@@ -514,12 +536,12 @@ class DonghuaLifeProvider : MainAPI() {
                 text.contains("Emision", ignoreCase = true) ||
                 text.contains("Pausa", ignoreCase = true) ||
                 text.contains("Ongoing", ignoreCase = true) -> {
-                    showStatus = ShowStatus.Ongoing
+                    parsedShowStatus = ShowStatus.Ongoing
                     statusText = text
                 }
                 text.contains("Finalizado", ignoreCase = true) ||
                 text.contains("Completed", ignoreCase = true) -> {
-                    showStatus = ShowStatus.Completed
+                    parsedShowStatus = ShowStatus.Completed
                     statusText = text
                 }
                 Regex("""\d+\s+de?\s*[A-Za-záéíóú]+,?\s+\d{4}""").matches(text) ||
@@ -650,7 +672,7 @@ class DonghuaLifeProvider : MainAPI() {
             posterUrl = poster
             addEpisodes(DubStatus.Subbed, episodes.sortedWith(compareBy({ it.season }, { it.episode })))
             if (seasonNames.isNotEmpty()) addSeasonNames(seasonNames)
-            showStatus = showStatus
+            showStatus = parsedShowStatus
             plot = fullPlot
             tags = if (statusText.isNotBlank()) listOf(statusText) + genres else genres
             year = yearInt
