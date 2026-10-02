@@ -709,9 +709,65 @@ class SeriesDonghuaProvider : MainAPI() {
     /**
      * Rumble (v24.2): el embed JS trae un mapa de calidades
      * "360":{"url":"...mp4","meta":{...,"h":360}}; emitir cada una.
+     *
+     * v24.13 (port del fix de TioDonghua v24.12): el embed estandar
+     * (rumble.com/embed/VID) puede NO traer el video en el HTML; la API
+     * publica embedJS exige el parametro embed= o responde 403. Estrategia:
+     * 1) API embedJS con MP4 directos de hugh.cdn.rumble.cloud; 2) HTML del
+     * embed como fallback. Las subidas nuevas sirven rendiciones ".tar" (TAR
+     * de segmentos TS, NO reproducibles como MP4 directo): no se emiten; el
+     * HTML de esas trae hls-vod valido y el fallback HLS las cubre.
      */
     private suspend fun extractSdRumble(embedUrl: String, referer: String, name: String, callback: (ExtractorLink) -> Unit): Boolean {
         return try {
+            // 1) API embedJS: embed= es OBLIGATORIO (verificado: sin el
+            // parametro la API responde 403 Forbidden).
+            val vid = Regex("rumble\\.com/(?:embed/)?(v[a-zA-Z0-9]+)").find(embedUrl)?.groupValues?.get(1)
+            if (vid != null) {
+                val api = "https://rumble.com/embedJS/u3/?request=video&v=$vid" +
+                    "&embed=" + java.net.URLEncoder.encode(embedUrl, "UTF-8")
+                val uaMap = Regex("\"(\\d{3,4})\":\\[\"(https://[a-z0-9.]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4)\"")
+                suspend fun emit(json: String): Int {
+                    val fixed = json.replace("\\/", "/")
+                    var n = 0
+                    uaMap.findAll(fixed).forEach { m ->
+                        val h = m.groupValues[1].toIntOrNull()
+                        callback(newExtractorLink(source = name, name = name, url = m.groupValues[2]) {
+                            this.referer = "https://rumble.com/"
+                            this.quality = when {
+                                h == null -> Qualities.Unknown.value
+                                h >= 1080 -> Qualities.P1080.value
+                                h >= 720 -> Qualities.P720.value
+                                h >= 480 -> Qualities.P480.value
+                                else -> Qualities.P360.value
+                            }
+                        })
+                        n++
+                    }
+                    return n
+                }
+                var json = try {
+                    app.get(api, referer = "https://rumble.com/",
+                        headers = mapOf("User-Agent" to SD_USER_AGENT), timeout = 20L).text
+                } catch (_: Exception) { "" }
+                var count = if (json.isNotBlank()) emit(json) else 0
+                if (count == 0) {
+                    // WAF de Cloudflare: la API responde 403 sin cookie __cf_bm.
+                    // Visitar el embed primero (la sesion conserva la cookie) y reintentar.
+                    try {
+                        app.get(embedUrl, referer = referer,
+                            headers = mapOf("User-Agent" to SD_USER_AGENT), timeout = 20L)
+                    } catch (_: Exception) {}
+                    json = try {
+                        app.get(api, referer = embedUrl,
+                            headers = mapOf("User-Agent" to SD_USER_AGENT), timeout = 20L).text
+                    } catch (_: Exception) { "" }
+                    if (json.isNotBlank()) count = emit(json)
+                }
+                if (count > 0) return true
+            }
+            // 2) Fallback: HTML del embed (hls-vod de las subidas nuevas .tar,
+            // mapa de calidades y primer mp4 de videos antiguos).
             val html = app.get(embedUrl, referer = referer,
                 headers = mapOf("User-Agent" to SD_USER_AGENT), timeout = 20L).text
             val fixed = html.replace("\\/", "/")

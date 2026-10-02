@@ -754,7 +754,16 @@ class TioDonghuaProvider : MainAPI() {
                     }
                 }.map { it.await() }
             }
-            results.forEach { (rawEmbed, label) ->
+            // v24.13: auditoria de servidores (12 episodios x 8 opciones AJAX):
+            // vivos Dailymotion 7/7 y Rumble 5/6 (calidades directas), Drive 3/3
+            // y OK 2/4; muertos de forma estable VOE/Filemon/StreamTape/Terabox/
+            // SW/DS (0 de N). Emitir los vivos primero (sortedByDescending es
+            // estable: dentro de cada grupo se conserva el orden del sitio) para
+            // que la reproduccion por defecto caiga en un servidor que responde.
+            val ordered = results.sortedByDescending { (raw, _) ->
+                tdServerPriority(tdNormalizeEmbed(raw) ?: "")
+            }
+            ordered.forEach { (rawEmbed, label) ->
                 val embedUrl = tdNormalizeEmbed(rawEmbed)
                 if (embedUrl != null) {
                     processTdEmbed(embedUrl, data, label, subtitleCallback, cb)
@@ -841,6 +850,21 @@ class TioDonghuaProvider : MainAPI() {
             host.removePrefix("www.").substringBefore(".").replaceFirstChar { it.uppercase() }
         } catch (_: Exception) {
             "Server"
+        }
+    }
+
+    /**
+     * v24.13: prioridad del servidor por host para ordenar la emision de
+     * enlaces (ver auditoria en loadLinks). Mas alto = emite antes.
+     */
+    private fun tdServerPriority(embedUrl: String): Int {
+        val u = embedUrl.lowercase()
+        return when {
+            u.contains("rumble.com") -> 3
+            u.contains("dailymotion.com") || u.contains("dai.ly") -> 3
+            u.contains("drive.google.com") -> 2
+            u.contains("ok.ru") || u.contains("odnoklassniki") -> 1
+            else -> 0
         }
     }
 
@@ -935,6 +959,16 @@ class TioDonghuaProvider : MainAPI() {
             // v24.3: streaming P2P/WebRTC (API JSON con token, peers y MSE);
             // ExoPlayer no puede reproducirlo: no gastar peticiones.
             u.contains("playerp2p.online") -> {}
+            // v24.13: Terabox (servidor "TB"): reproductor propio sin fuente
+            // estatica en el HTML (476KB de SPA) y SIN API publica anonima:
+            // share/list devuelve los metadatos (errno 0) pero sin dlink,
+            // shorturlinfo responde errno 0 con shareid/uk/sign pero dlink
+            // VACIO, /share/download esta envuelto en check-login en el JS del
+            // propio sitio (errno 2 anonimo) y /share/streaming responde errno
+            // 130 (y aunque funcionara, el player anonimo recibe chunks
+            // aleatorios de ~4 min por request, inservible en ExoPlayer).
+            // No extraible: saltar (ahorra 2 requests muertas por episodio).
+            u.contains("terabox") -> {}
             u.contains("dailymotion.com") ->
                 extractTdDailymotion(u, referer, serverName, cb)
             // v24: Ok.Ru (servidor "OK" muy común en tiodonghua)
