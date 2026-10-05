@@ -8,6 +8,12 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.getAndUnpack
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.extractors.StreamWishExtractor
+import com.lagradost.cloudstream3.utils.AppUtils.parseJson
+import android.util.Base64
+import java.util.UUID
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import kotlin.collections.ArrayList
 
 // v22.2: extractores propios para servidores que CloudStream no trae integrados
@@ -22,6 +28,226 @@ private val mdVgExtractor = object : StreamWishExtractor() {
 private val mdFmoonExtractor = object : StreamWishExtractor() {
     override var name = "Fmoon"
     override var mainUrl = "https://bysekoze.com"
+}
+
+// v24.14: extractor para el servidor "Fm" (tab fmoon) de MundoDonghua.
+// bysekoze.com dejó de servir un player clásico: ahora es una SPA ("Byse Frontend")
+// que consume una API propia con gate de Proof-of-Work y playback cifrado con AES-GCM:
+//   1) POST /api/videos/{code}/embed/captcha -> {pow_nonce, pow_difficulty, pow_token}
+//   2) PoW: hallar N tal que el hash custom de "nonce:N" tenga >= dificultad bits en
+//      cero a la izquierda (dificultad observada: 16 bits; solución típica ~15-30k)
+//   3) POST /api/videos/{code}/embed/captcha/verify {pow_token, solution} -> {token}
+//   4) POST /api/videos/{code}/embed/playback {fingerprint} + X-Captcha-Token
+//      -> {playback:{algorithm, iv, payload, key_parts[], version}}
+//   5) key = b64url(key_parts[version-1]) + b64url(key_parts[30-version]) y
+//      AES-256-GCM(iv, payload) -> {sources:[{url, mime_type, label, height}]}
+// La API valida el dominio del embed (Origin/Referer/X-Embed-* de mundodonghua.com);
+// el fingerprint solo necesita existir como objeto (no valida attestation).
+private object mdFmoonByseExtractor {
+    private const val API_BASE = "https://bysekoze.com"
+    private const val EMBED_ORIGIN = "https://www.mundodonghua.com"
+    private const val EMBED_REFERER = "https://www.mundodonghua.com/"
+    private const val PLAYER_REFERER = "https://bysekoze.com/"
+
+    private fun b64UrlDecode(s: String): ByteArray {
+        var t = s.trim().replace('-', '+').replace('_', '/')
+        while (t.length % 4 != 0) t += "="
+        return Base64.decode(t, Base64.DEFAULT)
+    }
+
+    // ===== port del hash custom del PoW (bundle JS de bysekoze) =====
+    private fun rotl32(x: Int, n: Int): Int = (x shl n) or (x ushr (32 - n))
+
+    private fun mixRound(t: IntArray) {
+        t[0] += t[1]; t[3] = rotl32(t[3] xor t[0], 16)
+        t[2] += t[3]; t[1] = rotl32(t[1] xor t[2], 12)
+        t[0] += t[1]; t[3] = rotl32(t[3] xor t[0], 8)
+        t[2] += t[3]; t[1] = rotl32(t[1] xor t[2], 7)
+    }
+
+    private fun powHash(data: ByteArray): IntArray {
+        val e = intArrayOf(1779033703, 3144134277L.toInt(), 1013904242, 2773480762L.toInt())
+        for (b in data) {
+            e[0] += b.toInt() and 0xFF
+            e[0] = rotl32(e[0], 7)
+            mixRound(e)
+        }
+        repeat(8) { mixRound(e) }
+        val size = 512
+        val mask = size - 1
+        // 2654435761 y 2246822519 no caben en Int: toInt() da el mismo patrón de bits
+        // que el uint32 del JS, y la multiplicación de Int ya envuelve mod 2^32.
+        val lr = 2654435761L.toInt()
+        val hr = 2246822519L.toInt()
+        val table = IntArray(size)
+        for (i in 0 until size) {
+            mixRound(e)
+            table[i] = e[0] xor e[2]
+        }
+        repeat(2) {
+            for (s in 0 until size) {
+                var c = table[s] + table[table[s] and mask]
+                c = rotl32(c, 13)
+                c = c xor (table[(s + 1) and mask] * lr)
+                table[s] = c
+                e[0] = e[0] xor c
+                mixRound(e)
+            }
+        }
+        val out = IntArray(8)
+        val group = size / 8
+        for (i in 0 until 8) {
+            mixRound(e)
+            var acc = e[0]
+            val base = i * group
+            for (j in 0 until group) {
+                val d = table[base + j]
+                acc += d
+                acc = rotl32(acc, 5)
+                acc = acc xor (d * hr)
+            }
+            out[i] = acc xor e[2]
+        }
+        return out
+    }
+
+    private fun leadingZeroBits(words: IntArray): Int {
+        var total = 0
+        for (w in words) {
+            if (w == 0) { total += 32; continue }
+            total += Integer.numberOfLeadingZeros(w)
+            break
+        }
+        return total
+    }
+
+    private fun solvePow(nonce: String, difficulty: Int): String? {
+        if (difficulty <= 0) return "0"
+        val prefix = "$nonce:".toByteArray()
+        val startedAt = System.currentTimeMillis()
+        var counter = 0L
+        while (true) {
+            val input = prefix + counter.toString().toByteArray()
+            if (leadingZeroBits(powHash(input)) >= difficulty) return counter.toString()
+            counter++
+            if (counter % 2048L == 0L && System.currentTimeMillis() - startedAt > 45_000L) return null
+        }
+    }
+
+    // DTOs del playback cifrado (mismo estilo que SsrInit en AnimeGratis)
+    private data class BysePlaybackEnc(
+        val algorithm: String? = null,
+        val iv: String? = null,
+        val payload: String? = null,
+        val key_parts: List<String>? = null,
+        val version: Any? = null,
+    ) {
+        val versionNumber: Int? get() = when (val v = version) {
+            is Number -> v.toInt()
+            is String -> Regex("\\d+").find(v)?.value?.toIntOrNull()
+            else -> null
+        }
+    }
+
+    private data class BysePlaybackResp(val playback: BysePlaybackEnc? = null)
+
+    private data class ByseSource(
+        val url: String? = null,
+        val mime_type: String? = null,
+        val label: String? = null,
+        val height: Int? = null,
+    )
+
+    private data class BysePlaybackDec(val sources: List<ByseSource>? = null)
+
+    suspend fun getUrl(embedUrl: String, callback: (ExtractorLink) -> Unit) {
+        val code = Regex("bysekoze\\.com/[ev]/([a-zA-Z0-9]+)").find(embedUrl)?.groupValues?.get(1) ?: return
+        val headers = mapOf(
+            "User-Agent" to USER_AGENT,
+            "Accept" to "application/json",
+            "Origin" to EMBED_ORIGIN,
+            "Referer" to EMBED_REFERER,
+            "X-Embed-Origin" to EMBED_ORIGIN,
+            "X-Embed-Referer" to EMBED_REFERER,
+            "X-Embed-Parent" to EMBED_REFERER,
+        )
+
+        // 1) captcha con challenge de PoW
+        val captchaResp = app.post(
+            "$API_BASE/api/videos/$code/embed/captcha",
+            json = mapOf<String, Any>(), headers = headers, timeout = 20L
+        ).text
+        val nonce = Regex("\"pow_nonce\"\\s*:\\s*\"([^\"]+)\"").find(captchaResp)?.groupValues?.get(1) ?: return
+        val difficulty = Regex("\"pow_difficulty\"\\s*:\\s*(\\d+)").find(captchaResp)?.groupValues?.get(1)?.toIntOrNull() ?: return
+        val powToken = Regex("\"pow_token\"\\s*:\\s*\"([^\"]+)\"").find(captchaResp)?.groupValues?.get(1) ?: return
+
+        // 2) resolver el PoW
+        val solution = solvePow(nonce, difficulty) ?: return
+
+        // 3) verificar y obtener el captcha token
+        val verifyResp = app.post(
+            "$API_BASE/api/videos/$code/embed/captcha/verify",
+            json = mapOf<String, Any>("pow_token" to powToken, "solution" to solution),
+            headers = headers, timeout = 20L
+        ).text
+        val captchaToken = Regex("\"token\"\\s*:\\s*\"([^\"]+)\"").find(verifyResp)?.groupValues?.get(1) ?: return
+
+        // 4) playback cifrado (el fingerprint solo necesita existir como objeto)
+        val fingerprint = mapOf<String, Any>(
+            "token" to captchaToken,
+            "viewer_id" to UUID.randomUUID().toString(),
+            "device_id" to UUID.randomUUID().toString(),
+            "confidence" to 0.9,
+        )
+        val pbResp = app.post(
+            "$API_BASE/api/videos/$code/embed/playback",
+            json = mapOf<String, Any>("fingerprint" to fingerprint),
+            headers = headers + mapOf("X-Captcha-Token" to captchaToken),
+            timeout = 30L
+        ).text
+        val enc = parseJson<BysePlaybackResp>(pbResp)?.playback ?: return
+
+        // 5) clave AES: key_parts según la versión (port de ws() del bundle)
+        val keyParts = enc.key_parts ?: return
+        val version = enc.versionNumber ?: return
+        val selected = ArrayList<String>()
+        for (idx in intArrayOf(version, 31 - version)) {
+            val part = if (idx in 1..keyParts.size) keyParts[idx - 1] else null
+            if (!part.isNullOrBlank()) selected.add(part)
+        }
+        if (selected.isEmpty()) selected.addAll(keyParts)
+        val key = selected.map { b64UrlDecode(it) }.reduce { acc, bytes -> acc + bytes }
+        if (key.size !in intArrayOf(16, 24, 32)) return
+        val iv = b64UrlDecode(enc.iv ?: return)
+        val payload = b64UrlDecode(enc.payload ?: return)
+
+        val plain = try {
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+            cipher.doFinal(payload)
+        } catch (_: Exception) { return }
+        val dec = parseJson<BysePlaybackDec>(String(plain, Charsets.UTF_8)) ?: return
+
+        // 6) emitir enlaces
+        for (src in dec.sources.orEmpty()) {
+            val url = src.url?.trim() ?: continue
+            if (url.isBlank()) continue
+            val height = src.height ?: 0
+            if (src.mime_type?.contains("mpegurl", ignoreCase = true) == true || url.contains(".m3u8")) {
+                try { generateM3u8("Fm", url, PLAYER_REFERER).forEach(callback) } catch (_: Exception) {}
+            } else {
+                callback(newExtractorLink(source = "Fm", name = "Fm", url = url) {
+                    this.referer = PLAYER_REFERER
+                    this.quality = when {
+                        height >= 1080 -> Qualities.P1080.value
+                        height >= 720 -> Qualities.P720.value
+                        height >= 480 -> Qualities.P480.value
+                        else -> Qualities.Unknown.value
+                    }
+                })
+            }
+        }
+    }
 }
 
 /**
@@ -41,7 +267,10 @@ private suspend fun mdHandleEmbed(
     try {
         when {
             embedUrl.contains("vgembed.com") -> mdVgExtractor.getUrl(embedUrl, referer, subtitleCallback, callback)
-            embedUrl.contains("bysekoze.com") || embedUrl.contains("filemoon") ->
+            // v24.14: bysekoze.com es una SPA con API propia (PoW + AES-GCM): extractor
+            // dedicado. Solo filemoon.to sigue perteneciendo a la familia StreamWish.
+            embedUrl.contains("bysekoze.com") -> mdFmoonByseExtractor.getUrl(embedUrl, callback)
+            embedUrl.contains("filemoon") ->
                 mdFmoonExtractor.getUrl(embedUrl, referer, subtitleCallback, callback)
             else -> loadExtractor(embedUrl, referer, subtitleCallback, callback)
         }

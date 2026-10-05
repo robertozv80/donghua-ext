@@ -29,10 +29,13 @@ class AnimeGratisProvider : MainAPI() {
 
     override val mainPage = mainPageOf(
         "$mainUrl/" to "Nuevos Episodios",
+        // v24.14: secciones del catálogo /donghua + géneros (el sitio mueve los
+        // géneros de donghua a /donghua/genero/{slug}, no a ?genre=)
         "$mainUrl/donghua" to "Donghuas",
-        // v22: nuevas secciones del Home (filtros del catálogo /donghua)
-        "$mainUrl/donghua?q=&status=En+emisi%C3%B3n&genre=&year=&sort=year" to "En Emisión",
-        "$mainUrl/donghua?q=&status=Finalizado&genre=&year=&sort=year" to "Finalizados",
+        "$mainUrl/donghua?status=En+emisi%C3%B3n" to "En Emisión",
+        "$mainUrl/donghua?status=Finalizado" to "Finalizados",
+        "$mainUrl/donghua/genero/accion" to "Acción",
+        "$mainUrl/donghua/genero/artes-marciales" to "Artes Marciales",
         "$mainUrl/directorio" to "Directorio Anime",
     )
 
@@ -115,12 +118,13 @@ class AnimeGratisProvider : MainAPI() {
     // ========== getMainPage ==========
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val isHomePage = request.data == "$mainUrl/"
-        val isDonghua = request.data == "$mainUrl/donghua"
-        val isFiltered = request.data.contains("/donghua?") // v22: En Emisión / Finalizados
+        // v24.14: todo el catálogo /donghua (base, filtros ?status= y géneros
+        // /donghua/genero/X) se parsea igual; /directorio mantiene su parseo.
+        val isDonghuaSection = request.data.contains("/donghua")
         val url = when {
-            // Los filtros del catálogo ya traen query propio; paginar con &page=N
-            isFiltered && page > 1 -> "${request.data}&page=$page"
-            page > 1 -> "${request.data}?page=$page"
+            // Paginación: con query propio usar &page=N, sin query usar ?page=N
+            !isHomePage && page > 1 ->
+                "${request.data}${if (request.data.contains("?")) "&" else "?"}page=$page"
             else -> request.data
         }
 
@@ -130,7 +134,7 @@ class AnimeGratisProvider : MainAPI() {
             isHomePage -> {
                 parseHomePageCards(doc)
             }
-            isDonghua || isFiltered -> {
+            isDonghuaSection -> {
                 parseDonghuaCards(doc)
             }
             else -> {
@@ -177,20 +181,36 @@ class AnimeGratisProvider : MainAPI() {
         return results
     }
 
+    // v24.14 FIX: el sitio rediseñó las cards del catálogo: ya no hay <h3> con el
+    // título dentro del <a>; el título vive en el atributo alt del <img>
+    // ("Portada de X"). Sin esto, Donghuas / En Emisión / Finalizados / géneros
+    // y la búsqueda devolvían 0 resultados.
     private fun parseDonghuaCards(doc: org.jsoup.nodes.Document): List<SearchResponse> {
         return doc.select("a[href^=\"/donghua/\"]").mapNotNull { link ->
             val href = link.attr("href")
-            if (href.contains("episodio")) return@mapNotNull null
-            val title = link.selectFirst("h3")?.text()?.trim()
-                ?: link.selectFirst("h2")?.text()?.trim()
-                ?: link.selectFirst("[class*=\"title\"]")?.text()?.trim()
-                ?: return@mapNotNull null
+            // Saltar episodios y links de navegación de géneros
+            if (href.contains("episodio") || href.contains("/genero/")) return@mapNotNull null
+            val title = extractCardTitle(link) ?: return@mapNotNull null
             val poster = link.selectFirst("img").bestImageUrl()
             newAnimeSearchResponse(title, resolveUrl(href)) {
                 this.posterUrl = resolveUrl(poster)
                 addDubStatus(DubStatus.Subbed)
             }
+        }.distinctBy { it.url }
+    }
+
+    /** v24.14: título de una card: alt del img (sin "Portada de ") con fallback
+     * a h3/h2/[class*=title] por si el sitio vuelve a la estructura antigua. */
+    private fun extractCardTitle(link: org.jsoup.nodes.Element): String? {
+        val alt = link.selectFirst("img")?.attr("alt")?.trim()
+        if (!alt.isNullOrBlank()) {
+            val clean = alt.replace(Regex("^Portada de\\s*", RegexOption.IGNORE_CASE), "").trim()
+            if (clean.isNotBlank()) return clean
         }
+        return link.selectFirst("h3")?.text()?.trim()
+            ?: link.selectFirst("h2")?.text()?.trim()
+            ?: link.selectFirst("[class*=\"title\"]")?.text()?.trim()
+            ?.takeIf { it.isNotBlank() }
     }
 
     private fun parseDirectorioCards(doc: org.jsoup.nodes.Document): List<SearchResponse> {
@@ -358,16 +378,9 @@ class AnimeGratisProvider : MainAPI() {
         try {
             val donghuaUrl = "$mainUrl/donghua?q=${java.net.URLEncoder.encode(query, "UTF-8")}"
             val doc = app.get(donghuaUrl, headers = headers, timeout = 30L).document
-            doc.select("a[href^=\"/donghua/\"]").mapNotNull { link ->
-                val href = link.attr("href")
-                if (href.contains("episodio")) return@mapNotNull null
-                val title = link.selectFirst("h3")?.text()?.trim() ?: return@mapNotNull null
-                val poster = link.selectFirst("img").bestImageUrl()
-                results.add(newAnimeSearchResponse(title, resolveUrl(href), TvType.Anime) {
-                    this.posterUrl = resolveUrl(poster)
-                    addDubStatus(DubStatus.Subbed)
-                })
-            }
+            // v24.14 FIX: usar el parseo de cards nuevo (título en alt del img);
+            // el select con h3 ya no encuentra nada y la búsqueda quedaba vacía.
+            parseDonghuaCards(doc).forEach { results.add(it) }
         } catch (_: Exception) {}
 
         // 3) Fallback HTML si ssr-init no funcionó
@@ -696,6 +709,7 @@ class AnimeGratisProvider : MainAPI() {
                         if (!slug.startsWith(baseSlug)) return@forEach
                         val t = link.selectFirst("h3")?.text()?.trim()
                             ?: link.selectFirst("img")?.attr("alt")?.trim()
+                                ?.replace(Regex("^Portada de\\s*", RegexOption.IGNORE_CASE), "")
                             ?: return@forEach
                         if (agNormalize(t) == norm) return@forEach // la propia serie
                         if (full == selfUrl) return@forEach
