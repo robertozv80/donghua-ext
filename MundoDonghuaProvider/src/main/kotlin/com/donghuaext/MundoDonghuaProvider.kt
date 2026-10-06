@@ -149,7 +149,21 @@ private object mdFmoonByseExtractor {
         }
     }
 
-    private data class BysePlaybackResp(val playback: BysePlaybackEnc? = null)
+    // v24.15: la API publica GET /api/videos/{code} devuelve el MISMO playback
+    // cifrado (con key_parts y version) SIN captcha ni PoW, por lo que el camino
+    // normal ya no necesita resolver el reto (la dificultad subia: 16 bits en
+    // septiembre, 17-19 en la auditoria de octubre). El flujo con PoW queda como
+    // respaldo por si el sitio vuelve a cerrar el endpoint publico.
+    private data class ByseTrack(
+        val lang: String? = null,
+        val language: String? = null,
+        val label: String? = null,
+        val name: String? = null,
+        val url: String? = null,
+        val src: String? = null,
+    ) {
+        val fileUrl: String? get() = (url ?: src)?.trim()?.takeIf { it.isNotBlank() }
+    }
 
     private data class ByseSource(
         val url: String? = null,
@@ -160,39 +174,47 @@ private object mdFmoonByseExtractor {
 
     private data class BysePlaybackDec(val sources: List<ByseSource>? = null)
 
-    suspend fun getUrl(embedUrl: String, callback: (ExtractorLink) -> Unit) {
-        val code = Regex("bysekoze\\.com/[ev]/([a-zA-Z0-9]+)").find(embedUrl)?.groupValues?.get(1) ?: return
-        val headers = mapOf(
-            "User-Agent" to USER_AGENT,
-            "Accept" to "application/json",
-            "Origin" to EMBED_ORIGIN,
-            "Referer" to EMBED_REFERER,
-            "X-Embed-Origin" to EMBED_ORIGIN,
-            "X-Embed-Referer" to EMBED_REFERER,
-            "X-Embed-Parent" to EMBED_REFERER,
-        )
+    private data class ByseVideo(
+        val playback: BysePlaybackEnc? = null,
+        val tracks: List<ByseTrack>? = null,
+    )
 
-        // 1) captcha con challenge de PoW
+    private fun apiHeaders(): Map<String, String> = mapOf(
+        "User-Agent" to USER_AGENT,
+        "Accept" to "application/json",
+        "Origin" to EMBED_ORIGIN,
+        "Referer" to EMBED_REFERER,
+        "X-Embed-Origin" to EMBED_ORIGIN,
+        "X-Embed-Referer" to EMBED_REFERER,
+        "X-Embed-Parent" to EMBED_REFERER,
+    )
+
+    // Camino 1: API publica (1 sola peticion).
+    private suspend fun fetchPublicVideo(code: String): ByseVideo? = try {
+        val txt = app.get(
+            "$API_BASE/api/videos/$code",
+            headers = apiHeaders(), timeout = 15L
+        ).text
+        if (txt.contains("\"playback\"")) parseJson<ByseVideo>(txt) else null
+    } catch (_: Exception) { null }
+
+    // Camino 2 (respaldo): captcha + PoW + playback, como en v24.14.
+    private suspend fun fetchViaCaptcha(code: String): ByseVideo? = try {
+        val headers = apiHeaders() + mapOf("Content-Type" to "application/json")
         val captchaResp = app.post(
             "$API_BASE/api/videos/$code/embed/captcha",
             json = mapOf<String, Any>(), headers = headers, timeout = 20L
         ).text
-        val nonce = Regex("\"pow_nonce\"\\s*:\\s*\"([^\"]+)\"").find(captchaResp)?.groupValues?.get(1) ?: return
-        val difficulty = Regex("\"pow_difficulty\"\\s*:\\s*(\\d+)").find(captchaResp)?.groupValues?.get(1)?.toIntOrNull() ?: return
-        val powToken = Regex("\"pow_token\"\\s*:\\s*\"([^\"]+)\"").find(captchaResp)?.groupValues?.get(1) ?: return
-
-        // 2) resolver el PoW
-        val solution = solvePow(nonce, difficulty) ?: return
-
-        // 3) verificar y obtener el captcha token
+        val nonce = Regex("\"pow_nonce\"\\s*:\\s*\"([^\"]+)\"").find(captchaResp)?.groupValues?.get(1) ?: return null
+        val difficulty = Regex("\"pow_difficulty\"\\s*:\\s*(\\d+)").find(captchaResp)?.groupValues?.get(1)?.toIntOrNull() ?: return null
+        val powToken = Regex("\"pow_token\"\\s*:\\s*\"([^\"]+)\"").find(captchaResp)?.groupValues?.get(1) ?: return null
+        val solution = solvePow(nonce, difficulty) ?: return null
         val verifyResp = app.post(
             "$API_BASE/api/videos/$code/embed/captcha/verify",
             json = mapOf<String, Any>("pow_token" to powToken, "solution" to solution),
             headers = headers, timeout = 20L
         ).text
-        val captchaToken = Regex("\"token\"\\s*:\\s*\"([^\"]+)\"").find(verifyResp)?.groupValues?.get(1) ?: return
-
-        // 4) playback cifrado (el fingerprint solo necesita existir como objeto)
+        val captchaToken = Regex("\"token\"\\s*:\\s*\"([^\"]+)\"").find(verifyResp)?.groupValues?.get(1) ?: return null
         val fingerprint = mapOf<String, Any>(
             "token" to captchaToken,
             "viewer_id" to UUID.randomUUID().toString(),
@@ -205,11 +227,20 @@ private object mdFmoonByseExtractor {
             headers = headers + mapOf("X-Captcha-Token" to captchaToken),
             timeout = 30L
         ).text
-        val enc = parseJson<BysePlaybackResp>(pbResp)?.playback ?: return
+        parseJson<ByseVideo>(pbResp)
+    } catch (_: Exception) { null }
 
-        // 5) clave AES: key_parts según la versión (port de ws() del bundle)
-        val keyParts = enc.key_parts ?: return
-        val version = enc.versionNumber ?: return
+    /**
+     * v24.15: descifrado AES-256-GCM del playback. El payload trae la etiqueta
+     * GCM pegada al final (16 ultimos bytes); se separa y se pasa explicita a
+     * doFinal, que en JCE es exactamente lo mismo que enviarlo entero pero deja
+     * el paso a la vista y evita depender del reparto interno del provider.
+     */
+    private fun decryptPayload(enc: BysePlaybackEnc): BysePlaybackDec? {
+        val keyParts = enc.key_parts ?: return null
+        val version = enc.versionNumber ?: return null
+        // port de ws() del bundle: indices [version, 31-version] (base 1) y, si
+        // alguno no existe, TODAS las partes concatenadas
         val selected = ArrayList<String>()
         for (idx in intArrayOf(version, 31 - version)) {
             val part = if (idx in 1..keyParts.size) keyParts[idx - 1] else null
@@ -217,23 +248,106 @@ private object mdFmoonByseExtractor {
         }
         if (selected.isEmpty()) selected.addAll(keyParts)
         val key = selected.map { b64UrlDecode(it) }.reduce { acc, bytes -> acc + bytes }
-        if (key.size !in intArrayOf(16, 24, 32)) return
-        val iv = b64UrlDecode(enc.iv ?: return)
-        val payload = b64UrlDecode(enc.payload ?: return)
-
+        if (key.size !in intArrayOf(16, 24, 32)) return null
+        val iv = b64UrlDecode(enc.iv ?: return null)
+        val payload = b64UrlDecode(enc.payload ?: return null)
+        if (payload.size <= 16) return null
+        val tag = payload.copyOfRange(payload.size - 16, payload.size)
+        val body = payload.copyOfRange(0, payload.size - 16)
         val plain = try {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
-            cipher.doFinal(payload)
-        } catch (_: Exception) { return }
-        val dec = parseJson<BysePlaybackDec>(String(plain, Charsets.UTF_8)) ?: return
+            cipher.doFinal(body + tag)
+        } catch (_: Exception) { null }
+        return plain?.let { parseJson<BysePlaybackDec>(String(it, Charsets.UTF_8)) }
+    }
 
-        // 6) emitir enlaces
+    /** Quita cabecera WEBVTT, NOTE y numeracion de un segmento para poder concatenarlo. */
+    private fun mergeVttSegment(raw: String): String {
+        var v = raw.replace("\r", "")
+        v = Regex("^WEBVTT[^\n]*\n").replace(v, "")
+        v = Regex("^NOTE[^\n]*\n", RegexOption.MULTILINE).replace(v, "")
+        v = Regex("^\\d+[ \\t]*\n", RegexOption.MULTILINE).replace(v, "")
+        return v.trim() + "\n"
+    }
+
+    /**
+     * v24.15: CloudStream solo puede reproducir un subtitulo como FICHERO UNICO
+     * (lo envuelve en un SingleSampleMediaSource), asi que una pista de
+     * subtitulos HLS segmentada hay que fusionarla. Se descarga el playlist,
+     * se concatenan los .vtt y se entrega como data-URI (DefaultDataSource
+     * enruta el esquema data: a DataSchemeDataSource).
+     */
+    private suspend fun emitMergedSubtitle(
+        playlistUrl: String, lang: String, subtitleCallback: (SubtitleFile) -> Unit
+    ) {
+        val playlist = try {
+            app.get(playlistUrl, referer = PLAYER_REFERER, timeout = 15L).text
+        } catch (_: Exception) { return }
+        val segments = Regex("""^(?!#)([^\r\n]+)$""", RegexOption.MULTILINE)
+            .findAll(playlist).map { it.groupValues[1].trim() }.filter { it.isNotBlank() }
+            .take(80).toList()
+        if (segments.isEmpty()) return
+        val sb = StringBuilder("WEBVTT\n\n")
+        var merged = 0
+        for (seg in segments) {
+            val abs = try {
+                java.net.URI(playlistUrl).resolve(seg).toString()
+            } catch (_: Exception) { continue }
+            val body = try {
+                app.get(abs, referer = PLAYER_REFERER, timeout = 10L).text
+            } catch (_: Exception) { continue }
+            if (body.isBlank()) continue
+            sb.append(mergeVttSegment(body))
+            merged++
+        }
+        if (merged == 0) return
+        val dataUri = "data:text/vtt;base64," +
+            Base64.encodeToString(sb.toString().toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+        subtitleCallback(SubtitleFile(lang, dataUri))
+    }
+
+    private suspend fun emitSubtitles(
+        tracks: List<ByseTrack>?, masterUrl: String?, subtitleCallback: (SubtitleFile) -> Unit
+    ) {
+        val emitted = HashSet<String>()
+        for (t in tracks.orEmpty()) {
+            val u = t.fileUrl ?: continue
+            if (!emitted.add(u)) continue
+            val raw = (t.lang ?: t.language ?: t.label ?: t.name ?: "es")
+            val lang = if (raw.contains("es", ignoreCase = true)) "Spanish" else raw
+            subtitleCallback(SubtitleFile(lang, u))
+        }
+        val m = masterUrl ?: return
+        val master = try {
+            app.get(m, referer = PLAYER_REFERER, timeout = 12L).text
+        } catch (_: Exception) { return }
+        if (!master.contains("#EXT-X-MEDIA")) return
+        for (line in Regex("""#EXT-X-MEDIA:TYPE=SUBTITLES[^\n]*""").findAll(master).map { it.value }) {
+            val uri = Regex("""URI="([^"]+)"""").find(line)?.groupValues?.get(1) ?: continue
+            val name = Regex("""NAME="([^"]*)"""").find(line)?.groupValues?.get(1) ?: ""
+            val lang = if (name.contains("es", ignoreCase = true)) "Spanish" else name.ifBlank { "Spanish" }
+            val abs = try { java.net.URI(m).resolve(uri).toString() } catch (_: Exception) { continue }
+            if (!emitted.add(abs)) continue
+            emitMergedSubtitle(abs, lang, subtitleCallback)
+        }
+    }
+
+    suspend fun getUrl(embedUrl: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        val code = Regex("bysekoze\\.com/[ev]/([a-zA-Z0-9]+)").find(embedUrl)?.groupValues?.get(1) ?: return
+        val video = fetchPublicVideo(code) ?: fetchViaCaptcha(code) ?: return
+        val enc = video.playback ?: return
+        val dec = decryptPayload(enc) ?: return
+
+        var masterForSubs: String? = null
         for (src in dec.sources.orEmpty()) {
             val url = src.url?.trim() ?: continue
             if (url.isBlank()) continue
             val height = src.height ?: 0
-            if (src.mime_type?.contains("mpegurl", ignoreCase = true) == true || url.contains(".m3u8")) {
+            val isHls = src.mime_type?.contains("mpegurl", ignoreCase = true) == true || url.contains(".m3u8")
+            if (isHls) {
+                // ojo: la URL del master lleva token (?t=...&s=...), hay que cortar la query
+                if (masterForSubs == null && url.substringBefore("?").endsWith("master.m3u8")) masterForSubs = url
                 try { generateM3u8("Fm", url, PLAYER_REFERER).forEach(callback) } catch (_: Exception) {}
             } else {
                 callback(newExtractorLink(source = "Fm", name = "Fm", url = url) {
@@ -247,6 +361,9 @@ private object mdFmoonByseExtractor {
                 })
             }
         }
+        // v24.15: pistas de subtitulos declaradas en la API o en el master HLS
+        if (video.tracks.isNullOrEmpty() && masterForSubs == null) return
+        emitSubtitles(video.tracks, masterForSubs, subtitleCallback)
     }
 }
 
@@ -269,7 +386,8 @@ private suspend fun mdHandleEmbed(
             embedUrl.contains("vgembed.com") -> mdVgExtractor.getUrl(embedUrl, referer, subtitleCallback, callback)
             // v24.14: bysekoze.com es una SPA con API propia (PoW + AES-GCM): extractor
             // dedicado. Solo filemoon.to sigue perteneciendo a la familia StreamWish.
-            embedUrl.contains("bysekoze.com") -> mdFmoonByseExtractor.getUrl(embedUrl, callback)
+            embedUrl.contains("bysekoze.com") ->
+                mdFmoonByseExtractor.getUrl(embedUrl, subtitleCallback, callback)
             embedUrl.contains("filemoon") ->
                 mdFmoonExtractor.getUrl(embedUrl, referer, subtitleCallback, callback)
             else -> loadExtractor(embedUrl, referer, subtitleCallback, callback)
@@ -308,6 +426,21 @@ class MundoDonghuaProvider : MainAPI() {
         "$mainUrl/lista-donghuas-emision" to "En Emisión",
         "$mainUrl/lista-donghuas-finalizados" to "Finalizados",
     )
+
+    /**
+     * v24.15: prioridad de emision por servidor (auditoria en vivo, loadLinks).
+     * Mas alto = se emite antes. Los servidores muertos se conservan (pueden
+     * revivir y no todas las series usan los mismos), solo van al final.
+     */
+    private fun mdServerPriority(embedUrl: String): Int {
+        val u = embedUrl.lowercase()
+        return when {
+            u.contains("bysekoze.com") -> 4
+            u.contains("embedwish.com") || u.contains("streamwish.to") -> 3
+            u.contains("vidhidepro.com") -> 2
+            else -> 0
+        }
+    }
 
     private fun resolveUrl(url: String): String {
         return when {
@@ -650,6 +783,12 @@ class MundoDonghuaProvider : MainAPI() {
         // v22.1: recolectar embeds (dedup) y cargarlos AL FINAL en paralelo; antes
         // cada extractor corría en serie y el total tardaba mucho.
         val seenEmbeds = LinkedHashSet<String>()
+        // v24.15: los embeds se RECOLECTAN primero y se procesan al final ordenados
+        // por prioridad de servidor (auditoria en vivo, ver mdServerPriority), y
+        // los enlaces directos de los servidores caidos (Asura/Tamamo, que
+        // dependen de www.mdnemonicplayer.xyz) se emiten en el ultimo lugar.
+        val embedsFound = LinkedHashSet<String>()
+        val deadLinks = ArrayList<ExtractorLink>()
 
         val reqHEAD = mapOf(
             "User-Agent" to USER_AGENT,
@@ -709,12 +848,12 @@ class MundoDonghuaProvider : MainAPI() {
                                 // devuelve un M3U8 válido; el viejo responde basura de 25 bytes).
                                 try {
                                     val m3u8Url = "https://www.mdnemonicplayer.xyz/nemonicplayer/redirector.php?slug=$asuraSlug"
-                                    generateM3u8("Asura", m3u8Url, datafix).forEach(callback)
+                                    deadLinks.addAll(generateM3u8("Asura", m3u8Url, datafix))
                                 } catch (_: Exception) {
                                     // Fallback: intentar generar M3U8 sin verificar
                                     try {
                                         val m3u8Url = "https://www.mdnemonicplayer.xyz/nemonicplayer/redirector.php?slug=$asuraSlug"
-                                        generateM3u8("Asura", m3u8Url, datafix).forEach(callback)
+                                        deadLinks.addAll(generateM3u8("Asura", m3u8Url, datafix))
                                     } catch (_: Exception) {}
                                 }
                             }
@@ -724,7 +863,7 @@ class MundoDonghuaProvider : MainAPI() {
                             val fileUrl = fileRegex.find(unpack)?.destructured?.component1()
                             if (!fileUrl.isNullOrEmpty()) {
                                 try {
-                                    generateM3u8("Asura", fileUrl, datafix).forEach(callback)
+                                    deadLinks.addAll(generateM3u8("Asura", fileUrl, datafix))
                                 } catch (_: Exception) {}
                             }
                         }
@@ -766,7 +905,7 @@ class MundoDonghuaProvider : MainAPI() {
                                                             headers = mapOf("User-Agent" to USER_AGENT, "Accept" to "application/json"),
                                                             timeout = 15L).text
                                                         for (m in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(jsonText)) {
-                                                            try { generateM3u8("Tamamo", m.value, "https://www.dailymotion.com").forEach(callback); break } catch (_: Exception) {}
+                                                            try { deadLinks.addAll(generateM3u8("Tamamo", m.value, "https://www.dailymotion.com")); break } catch (_: Exception) {}
                                                         }
                                                         val mp4Urls = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(jsonText).map { it.value }.distinct().toList()
                                                         if (mp4Urls.isNotEmpty()) {
@@ -777,7 +916,7 @@ class MundoDonghuaProvider : MainAPI() {
                                                                     mp4Url.contains("480") -> Qualities.P480.value
                                                                     else -> Qualities.Unknown.value
                                                                 }
-                                                                callback(newExtractorLink(source = "Tamamo", name = "Tamamo ${q/1000}p", url = mp4Url) {
+                                                                deadLinks.add(newExtractorLink(source = "Tamamo", name = "Tamamo ${q/1000}p", url = mp4Url) {
                                                                     this.referer = "https://www.dailymotion.com"
                                                                     this.quality = q
                                                                 })
@@ -811,7 +950,7 @@ class MundoDonghuaProvider : MainAPI() {
                                 } else {
                                     "https://bysekoze.com/e/${fmMatch.destructured.component1()}"
                                 }
-                                mdHandleEmbed(fmUrl, seenEmbeds, data, subtitleCallback, callback)
+                                embedsFound.add(fmUrl)
                                 break
                             }
                         }
@@ -820,7 +959,7 @@ class MundoDonghuaProvider : MainAPI() {
                         val voeRegex = Regex("voe\\.sx/e/([a-zA-Z0-9]+)")
                         val voeId = voeRegex.find(unpack)?.destructured?.component1()
                         if (!voeId.isNullOrEmpty()) {
-                            mdHandleEmbed("https://voe.sx/e/$voeId", seenEmbeds, data, subtitleCallback, callback)
+                            embedsFound.add("https://voe.sx/e/$voeId")
                         }
 
                         // ===== Vhide / VidHide (vidhidepro.com) =====
@@ -832,7 +971,7 @@ class MundoDonghuaProvider : MainAPI() {
                             val vhId = vhPattern.find(unpack)?.destructured?.component1()
                             if (!vhId.isNullOrEmpty()) {
                                 val prefix = if (vhPattern.pattern.contains("/v/")) "v" else "e"
-                                mdHandleEmbed("https://vidhidepro.com/$prefix/$vhId", seenEmbeds, data, subtitleCallback, callback)
+                                embedsFound.add("https://vidhidepro.com/$prefix/$vhId")
                                 break
                             }
                         }
@@ -845,7 +984,7 @@ class MundoDonghuaProvider : MainAPI() {
                         for (kagaPattern in kagaPatterns) {
                             val kagaId = kagaPattern.find(unpack)?.destructured?.component1()
                             if (!kagaId.isNullOrEmpty()) {
-                                mdHandleEmbed("https://vgembed.com/e/$kagaId", seenEmbeds, data, subtitleCallback, callback)
+                                embedsFound.add("https://vgembed.com/e/$kagaId")
                                 break
                             }
                         }
@@ -858,7 +997,7 @@ class MundoDonghuaProvider : MainAPI() {
                         for (swPattern in swPatterns) {
                             val swId = swPattern.find(unpack)?.destructured?.component1()
                             if (!swId.isNullOrEmpty()) {
-                                mdHandleEmbed("https://embedwish.com/e/$swId", seenEmbeds, data, subtitleCallback, callback)
+                                embedsFound.add("https://embedwish.com/e/$swId")
                                 break
                             }
                         }
@@ -869,9 +1008,9 @@ class MundoDonghuaProvider : MainAPI() {
                             val foundUrl = match.value
                             try {
                                 if (foundUrl.contains(".m3u8")) {
-                                    generateM3u8("Server", foundUrl, datafix).forEach(callback)
+                                    deadLinks.addAll(generateM3u8("Server", foundUrl, datafix))
                                 } else {
-                                    callback(newExtractorLink(source = "Server", name = "Server", url = foundUrl) {
+                                    deadLinks.add(newExtractorLink(source = "Server", name = "Server", url = foundUrl) {
                                         this.referer = datafix
                                         this.quality = Qualities.Unknown.value
                                     })
@@ -891,7 +1030,7 @@ class MundoDonghuaProvider : MainAPI() {
                         )
                         for (regex in iframeRegexes) {
                             for (match in regex.findAll(unpack)) {
-                                mdHandleEmbed(match.value, seenEmbeds, data, subtitleCallback, callback)
+                                embedsFound.add(match.value)
                             }
                         }
 
@@ -904,9 +1043,23 @@ class MundoDonghuaProvider : MainAPI() {
         // deja de empaquetar los players). Los ya procesados no se repiten.
         for (regex in MD_RAW_EMBED_REGEXES) {
             for (match in regex.findAll(rawHtml)) {
-                mdHandleEmbed(match.value, seenEmbeds, data, subtitleCallback, callback)
+                embedsFound.add(match.value)
             }
         }
+
+        // v24.15: AUDITORIA DE SERVIDORES en vivo (20 series x 1 episodio, tools/_md_audit7.log):
+        //   Fm/bysekoze  20/20 vivos (ademas solo hay 1 fuente y trae subtitulos)
+        //   Sw/embedwish  5/12 vivos (los otros responden 200 con 426 B "no longer available")
+        //   Vh/vidhidepro 7/17 vivos (los otros 200 con 419 B "no longer available")
+        //   Vg/vgembed   0/7  (404 "no longer available")   -> no se elimina, puede revivir
+        //   Voe          0/17 (404)                          -> no se elimina
+        //   Asura/Tamamo 0/12 -> ambos cuelgan de www.mdnemonicplayer.xyz, que
+        //     responde HTTP 522 (Cloudflare sin origen) -> se emiten los ultimos.
+        // sortedByDescending es estable: dentro de cada grupo se conserva el
+        // orden del propio sitio.
+        embedsFound.sortedByDescending { mdServerPriority(it) }
+            .forEach { mdHandleEmbed(it, seenEmbeds, data, subtitleCallback, callback) }
+        deadLinks.forEach(callback)
 
         return true
     }
