@@ -132,6 +132,51 @@ private fun acDecrypt(b64: String, keyMaterial: String): String? {
 }
 
 private data class AcSourceEntry(val platform: String, val videoId: String, val quality: String)
+/** Item del catalogo del home (payload RSC): slug, titulo, poster y generos. */
+private data class AcCatalogItem(
+    val slug: String,
+    val title: String,
+    val poster: String,
+    val genres: List<String>
+)
+
+/** Convierte un slug en titulo legible (equivalente top-level del miembro de la clase). */
+private fun acTitleFromSlug(slug: String): String =
+    slug.replace("-", " ").replace(Regex("\\b[a-z]")) { it.value.uppercase() }
+
+/**
+ * Extrae el catalogo del home desde el flight payload embebido en el HTML.
+ * Las cadenas vienen escapadas (\" y \u0026); se desescapan primero.
+ * Regex validada en vivo (2026-10): 56 items, con generos y metadatos completos
+ * (Action 47, Adventure 29, Fantasy 43, Martial Arts 7).
+ */
+private fun acCatalog(html: String): List<AcCatalogItem> {
+    val un = html.replace("\\\"", "\"").replace("\\u0026", "&")
+    val merged = LinkedHashMap<String, AcCatalogItem>()
+
+    // Metadatos: poster + slug + titulo (las claves del payload vienen alfabeticas).
+    val metaRe = Regex(
+        "\"coverImage\":\"([^\"]+)\"[^}]*?\"genres\":\\[[^\\]]*\\][^}]*?\"slug\":\"([a-z0-9-]+)\"[^}]*?\"title\":\"((?:[^\"\\\\]|\\\\.)*)\""
+    )
+    metaRe.findAll(un).forEach { m ->
+        val poster = m.groupValues[1]
+        val slug = m.groupValues[2]
+        val title = acUnescJson(m.groupValues[3])
+        merged[slug] = AcCatalogItem(slug, if (title.isBlank()) acTitleFromSlug(slug) else title, poster, emptyList())
+    }
+
+    // Generos por slug.
+    val genreRe = Regex("\"genres\":\\[([^\\]]*)\\][^}]*?\"slug\":\"([a-z0-9-]+)\"")
+    genreRe.findAll(un).forEach { m ->
+        val slug = m.groupValues[2]
+        val genres = m.groupValues[1].split(",").map { it.trim().trim('"') }.filter { it.isNotEmpty() }
+        val prev = merged[slug]
+        merged[slug] = if (prev != null) prev.copy(genres = genres)
+        else AcCatalogItem(slug, acTitleFromSlug(slug), "", genres)
+    }
+
+    return merged.values.toList()
+}
 
 class AnimeCubeProvider : MainAPI() {
     override var mainUrl = "https://animecube.live"
@@ -149,11 +194,33 @@ class AnimeCubeProvider : MainAPI() {
     // ==================== MAIN PAGE ====================
 
     override val mainPage = mainPageOf(
-        "$mainUrl/##foryou" to "For You"
+        "$mainUrl/##foryou" to "For You",
+        "$mainUrl/##genre:Action" to "Action",
+        "$mainUrl/##genre:Adventure" to "Adventure",
+        "$mainUrl/##genre:Fantasy" to "Fantasy",
+        "$mainUrl/##genre:Martial Arts" to "Martial Arts"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val html = app.get("$mainUrl/", headers = mapOf("User-Agent" to UA)).text
+        val catalog = acCatalog(html)
+        val bySlug = catalog.associateBy { it.slug }
+
+        // Secciones de genero: el sitio no expone paginas de genero, pero el payload del home
+        // trae el campo "genres" de cada serie; se filtra el catalogo por genero.
+        if (request.data.contains("##genre:")) {
+            val want = request.data.substringAfter("##genre:").lowercase()
+            val items = catalog
+                .filter { it.genres.any { g -> g.lowercase() == want } }
+                .sortedBy { it.title.lowercase() }
+                .map { c ->
+                    newAnimeSearchResponse(c.title.ifBlank { acTitleFromSlug(c.slug) }, "$mainUrl/anime/${c.slug}") {
+                        this.posterUrl = c.poster
+                    }
+                }
+            return newHomePageResponse(listOf(HomePageList(request.name, items)), hasNext = false)
+        }
+
         val items = mutableListOf<SearchResponse>()
         val seen = mutableSetOf<String>()
 
@@ -163,8 +230,9 @@ class AnimeCubeProvider : MainAPI() {
             .forEach { m ->
                 val (label, slug) = m.destructured
                 if (seen.add(slug)) {
-                    items.add(newAnimeSearchResponse(label.trim(), "$mainUrl/anime/$slug") {
-                        this.posterUrl = ""
+                    val c = bySlug[slug]
+                    items.add(newAnimeSearchResponse(c?.title?.takeIf { it.isNotBlank() } ?: label.trim(), "$mainUrl/anime/$slug") {
+                        this.posterUrl = c?.poster ?: ""
                     })
                 }
             }
@@ -174,9 +242,10 @@ class AnimeCubeProvider : MainAPI() {
             Regex("""<loc>$mainUrl/anime/([a-z0-9-]+)</loc>""").findAll(sm).forEach { m ->
                 val slug = m.groupValues[1]
                 if (seen.add(slug)) {
+                    val c = bySlug[slug]
                     items.add(
-                        newAnimeSearchResponse(acSlugToTitle(slug), "$mainUrl/anime/$slug") {
-                            this.posterUrl = ""
+                        newAnimeSearchResponse(c?.title?.takeIf { it.isNotBlank() } ?: acSlugToTitle(slug), "$mainUrl/anime/$slug") {
+                            this.posterUrl = c?.poster ?: ""
                         }
                     )
                 }
