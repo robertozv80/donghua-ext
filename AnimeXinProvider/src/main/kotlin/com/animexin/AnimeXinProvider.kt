@@ -87,6 +87,8 @@ class AnimeXinProvider : MainAPI() {
 
         return newAnimeSearchResponse(cleanTitle, url) {
             this.posterUrl = img
+            // FIX v2: animexin.dev exige Referer para servir sus imagenes (403 sin el)
+            this.posterHeaders = mapOf("Referer" to "$mainUrl/")
             addDubStatus(DubStatus.Subbed, epNum)
         }
     }
@@ -116,6 +118,7 @@ class AnimeXinProvider : MainAPI() {
         val poster = document.selectFirst(".thumb img")?.let { getImgSrc(it) }
             ?: document.selectFirst(".bigcontent .ts-post-image")?.let { getImgSrc(it) }
             ?: document.selectFirst(".ts-post-image")?.let { getImgSrc(it) }
+            ?: document.selectFirst("meta[property=og:image]")?.attr("content")
             ?: ""
 
         val description = run {
@@ -127,17 +130,24 @@ class AnimeXinProvider : MainAPI() {
 
         val genres = document.select(".genxed a, .series-gen a").mapNotNull { it.text().trim() }
 
-        val showStatus = document.selectFirst(".spe span:contains(Status)")?.nextElementSibling()?.text()?.trim()
-            ?.let { stat ->
-                when {
-                    stat.contains("Ongoing", ignoreCase = true) -> ShowStatus.Ongoing
-                    stat.contains("Completed", ignoreCase = true) -> ShowStatus.Completed
-                    else -> null
-                }
+        val showStatus = speValue(document, "Status")?.let { stat ->
+            when {
+                stat.contains("Ongoing", ignoreCase = true) -> ShowStatus.Ongoing
+                stat.contains("Completed", ignoreCase = true) -> ShowStatus.Completed
+                else -> null
             }
+        }
 
-        val year = document.selectFirst(".spe span:contains(Released)")?.nextElementSibling()?.text()?.trim()
-            ?.take(4)?.toIntOrNull()
+        // "Released: 2020" / "Apr 04, 2026" -> primer año de 4 cifras
+        val year = speValue(document, "Released")?.let { Regex("\\d{4}").find(it)?.value?.toIntOrNull() }
+
+        // "Duration: 20 min. per ep." -> minutos
+        val durationMin = speValue(document, "Duration")?.let { parseDurationMinutes(it) }
+
+        // Rating: <div class="numscore">8.5</div> o meta[itemprop=ratingValue]
+        val scoreRaw = document.selectFirst(".numscore")?.text()?.trim()
+            ?: document.selectFirst("meta[itemprop=ratingValue]")?.attr("content")?.trim()
+        val scoreVal = scoreRaw?.toDoubleOrNull()?.takeIf { it > 0.0 }
 
         val episodes = mutableListOf<Episode>()
         val seenUrls = mutableSetOf<String>()
@@ -168,8 +178,27 @@ class AnimeXinProvider : MainAPI() {
             this.tags = genres
             this.showStatus = showStatus
             this.year = year
+            if (scoreVal != null) this.score = Score.from10(scoreVal)
+            if (durationMin != null && durationMin > 0) this.duration = durationMin
+            this.posterHeaders = mapOf("Referer" to "$mainUrl/")
             this.episodes = mutableMapOf(DubStatus.Subbed to sortedEpisodes)
         }
+    }
+
+    /** Valor de un campo del bloque .spe del tema: "Status: Ongoing" -> "Ongoing". */
+    private fun speValue(document: org.jsoup.nodes.Document, key: String): String? {
+        return document.select(".spe span").firstOrNull { it.text().startsWith("$key:", ignoreCase = true) }
+            ?.text()?.substringAfter(":")?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    /** "20 min. per ep." / "7 minute" / "1 h 20 min" -> minutos. */
+    private fun parseDurationMinutes(text: String): Int? {
+        Regex("(\\d+)\\s*(?:h|hr|hour)", RegexOption.IGNORE_CASE).find(text)?.groupValues?.get(1)
+            ?.toIntOrNull()?.let { hours ->
+                val mins = Regex("(\\d+)\\s*min", RegexOption.IGNORE_CASE).find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                return hours * 60 + mins
+            }
+        return Regex("(\\d+)\\s*min", RegexOption.IGNORE_CASE).find(text)?.groupValues?.get(1)?.toIntOrNull()
     }
 
     private suspend fun resolveSeriesUrlFromEpisode(episodeUrl: String): String {
@@ -189,7 +218,11 @@ class AnimeXinProvider : MainAPI() {
     private fun getImgSrc(imgEl: Element): String {
         val dataSrc = imgEl.attr("data-src").trim()
         if (dataSrc.isNotEmpty() && !dataSrc.startsWith("data:")) return dataSrc
-        return imgEl.attr("src").trim()
+        val lazy = imgEl.attr("data-lazy-src").trim()
+        if (lazy.isNotEmpty() && !lazy.startsWith("data:")) return lazy
+        val src = imgEl.attr("src").trim()
+        if (src.startsWith("data:")) return ""
+        return src
     }
 
     // ==================== VIDEO EXTRACTION ====================
@@ -318,7 +351,10 @@ class AnimeXinProvider : MainAPI() {
         return try {
             val metaUrl = "https://www.dailymotion.com/player/metadata/video/$vid" +
                 "?embedder=" + java.net.URLEncoder.encode(referer, "UTF-8") + "&integration=inline"
-            val json = app.get(metaUrl, referer = referer, headers = mapOf("User-Agent" to UA), timeout = 20L).text
+            // FIX v2: DM ahora escapa las barras en el JSON (https:\/\/...) -> desescapar
+            // antes de aplicar regex, si no ni el HLS ni los subs salen.
+            val json = app.get(metaUrl, referer = referer, headers = mapOf("User-Agent" to UA), timeout = 20L)
+                .text.replace("\\/", "/").replace("\\u0026", "&")
 
             dmSubtitlesBlock(json)?.let { block ->
                 Regex(""""(es[a-z-]*|en[a-z-]*)":\s*\{[^{}]*?"urls":\["([^"]+)"""")

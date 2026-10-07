@@ -267,9 +267,17 @@ class AnimeCubeProvider : MainAPI() {
             .map { it.groupValues[1] }
             .filter { it.contains(q) }
             .toList()
+        // FIX v3: posters/titulos desde el catalogo del home (payload RSC)
+        val bySlug = try {
+            val html = app.get("$mainUrl/", headers = mapOf("User-Agent" to UA)).text
+            acCatalog(html).associateBy { it.slug }
+        } catch (_: Exception) {
+            emptyMap()
+        }
         return slugs.map { slug ->
-            newAnimeSearchResponse(acSlugToTitle(slug), "$mainUrl/anime/$slug") {
-                this.posterUrl = ""
+            val c = bySlug[slug]
+            newAnimeSearchResponse(c?.title?.takeIf { it.isNotBlank() } ?: acSlugToTitle(slug), "$mainUrl/anime/$slug") {
+                this.posterUrl = c?.poster ?: ""
             }
         }
     }
@@ -284,7 +292,10 @@ class AnimeCubeProvider : MainAPI() {
      * las temporadas en orden de aparicion.
      */
     private fun parseRscSeasons(flight: String, slug: String): List<AcSeason> {
-        val seasonHead = Regex("""\{"id":"(tab-[\w-]+)"(?>[^{}]*?)"title":"((?:[^"\\]|\\.)*)"""")
+        // FIX v3: el grupo atomico con cuantificador perezoso (?>[^{}]*?) se congelaba
+        // con 0 caracteres y el regex nunca hacia match -> 0 episodios y ficha vacia.
+        // [^{}]*? plano es suficiente: entre id y title no hay llaves anidadas.
+        val seasonHead = Regex("""\{"id":"(tab-[\w-]+)"[^{}]*?"title":"((?:[^"\\]|\\.)*)"""")
         val epPattern = Regex(
             """\{"id":"([\w-]+)","number":(\d+),"numberDisplay":"((?:[^"\\]|\\.)*)","title":"((?:[^"\\]|\\.)*)""""
         )
@@ -350,9 +361,16 @@ class AnimeCubeProvider : MainAPI() {
 
         val episodes = mutableListOf<Episode>()
         val seen = mutableSetOf<String>()
+        val seenNums = mutableSetOf<Int>()
         for (season in seasons) {
+            // Pseudo-temporada "latest" (titulo vacio, 1 ep): suele duplicar el ultimo
+            // episodio de la temporada real y NO aparece en el registro de sources ->
+            // si el numero ya salio, se omite para no dejar un episodio muerto.
+            val isPseudo = season.title.isBlank() && season.episodes.size <= 1
             for (ep in season.episodes) {
                 if (!seen.add(ep.id)) continue
+                if (isPseudo && seenNums.contains(ep.number)) continue
+                seenNums.add(ep.number)
                 episodes.add(
                     newEpisode(ep.id) {
                         this.name = buildString {
@@ -366,9 +384,30 @@ class AnimeCubeProvider : MainAPI() {
         }
         val sorted = episodes.sortedBy { it.episode ?: 0 }
 
+        // FIX v3: objeto principal de la serie en el flight (poster/rating/status/year/genres)
+        val main = acMainAnimeObject(flight, slug)
+        val cover = main?.let { Regex("\"coverImage\":\"([^\"]+)\"").find(it)?.groupValues?.get(1) } ?: ""
+        val rating = main?.let { Regex("\"rating\":([0-9.]+)").find(it)?.groupValues?.get(1)?.toDoubleOrNull() }
+        val acStatus = main?.let { Regex("\"status\":\"([\\w-]+)\"").find(it)?.groupValues?.get(1) }
+        val acYear = main?.let { Regex("\"year\":(\\d{4})").find(it)?.groupValues?.get(1)?.toIntOrNull() }
+        val acGenres = main?.let { m ->
+            Regex("\"genres\":\\[([^\\]]*)\\]").find(m)?.groupValues?.get(1)
+                ?.split(",")?.map { it.trim().trim('"') }?.filter { it.isNotEmpty() }
+        } ?: emptyList()
+        val durationMin = Regex("\"duration\":(\\d+)").find(flight)?.groupValues?.get(1)?.toIntOrNull()
+
         return newAnimeLoadResponse(title, "$mainUrl/anime/$slug", TvType.Anime) {
             this.plot = description
-            this.posterUrl = "" // el sitio no expone og:image estable
+            if (cover.isNotBlank()) this.posterUrl = cover
+            if (acGenres.isNotEmpty()) this.tags = acGenres
+            this.showStatus = when (acStatus) {
+                "ongoing" -> ShowStatus.Ongoing
+                "season-completed", "completed" -> ShowStatus.Completed
+                else -> null
+            }
+            if (acYear != null) this.year = acYear
+            if (rating != null && rating > 0.0) this.score = Score.from10(rating)
+            if (durationMin != null && durationMin > 0) this.duration = durationMin
             this.episodes = mutableMapOf(DubStatus.Subbed to sorted)
         }
     }
@@ -376,6 +415,20 @@ class AnimeCubeProvider : MainAPI() {
     // ==================== VERSIONES / SOURCES ====================
 
     private data class AcVersionEntry(val primaryTabId: String, val seasonId: String, val version: String)
+
+    /**
+     * Objeto principal de la serie dentro del flight (contiene aliases, coverImage,
+     * genres, rating, slug, status, title, year, ...). Se busca la clave "slug" y
+     * se retrocede hasta la llave de apertura del objeto.
+     */
+    private fun acMainAnimeObject(flight: String, slug: String): String? {
+        val key = "\"slug\":\"$slug\""
+        val i = flight.indexOf(key)
+        if (i < 0) return null
+        val start = flight.lastIndexOf('{', i)
+        if (start < 0) return null
+        return acBalancedObject(flight, start)
+    }
 
     /** Registro de versiones: soporta respuesta plana y cifrada (con X-Obf propio). */
     private suspend fun fetchRegistry(): List<AcVersionEntry> {
@@ -532,7 +585,8 @@ class AnimeCubeProvider : MainAPI() {
         return try {
             val metaUrl = "https://www.dailymotion.com/player/metadata/video/$vid" +
                 "?embedder=" + java.net.URLEncoder.encode(referer, "UTF-8") + "&integration=inline"
-            val json = app.get(metaUrl, referer = referer, headers = mapOf("User-Agent" to UA), timeout = 20L).text
+            val json = app.get(metaUrl, referer = referer, headers = mapOf("User-Agent" to UA), timeout = 20L)
+                .text.replace("\\/", "/").replace("\\u0026", "&")
 
             dmSubtitlesBlock(json)?.let { block ->
                 Regex(""""(es[a-z-]*|en[a-z-]*)":\s*\{[^{}]*?"urls":\["([^"]+)"""")

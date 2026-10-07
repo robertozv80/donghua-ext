@@ -62,6 +62,9 @@ class DonghuaZoneProvider : MainAPI() {
             "Super Power", "Supernatural", "Thriller", "Vampire", "Isekai",
             "Erotica", "Hentai", "Danger", "Hot", "Sub", "Episode", "Eps. Donghua"
         )
+
+        /** Labels meta que NO son generos reales (se excluyen de los tags de la ficha). */
+        private val META_LABELS = setOf("Danger", "Hot", "Sub", "Episode", "Eps. Donghua")
     }
 
     // ==================== MAIN PAGE ====================
@@ -108,7 +111,7 @@ class DonghuaZoneProvider : MainAPI() {
             .find(title)?.groupValues?.get(1)?.substringBefore("-")?.toIntOrNull()
         val cleanTitle = title
             .replace(Regex("""\s*Episode\s+\d+(?:-\d+)?[^|]*$""", RegexOption.IGNORE_CASE), "")
-            .replace(Regex("""\s*[[(].*?[\])]\s*$"""), "")
+            .replace(Regex("""\s*[\[(].*?[\])]\s*$"""), "")
             .trim()
 
         return newAnimeSearchResponse(cleanTitle, url) {
@@ -210,6 +213,19 @@ class DonghuaZoneProvider : MainAPI() {
         val episodes = mutableListOf<Episode>()
         val seen = mutableSetOf<String>()
         var startIndex = 1
+        // Datos de la ficha: poster/plot/año del post de serie + generos de los labels
+        var seriesThumb = ""
+        var seriesPlot = ""
+        var seriesYear: Int? = null
+        val genreLabels = LinkedHashSet<String>()
+        val stripHtml = { html: String ->
+            html.replace(Regex("(?is)<(script|style)[\\s\\S]*?</\\1>"), " ")
+                .replace(Regex("<[^>]+>"), " ")
+                .replace("&nbsp;", " ").replace("&amp;", "&")
+                .replace("&quot;", "\"").replace("&#39;", "'")
+                .replace("&lt;", "<").replace("&gt;", ">")
+                .replace(Regex("\\s+"), " ").trim()
+        }
         // Hasta 4 paginas de 25 entradas (100 episodios) — suficiente para la mayoria
         for (p in 1..4) {
             val feed = fetchFeed(
@@ -220,7 +236,28 @@ class DonghuaZoneProvider : MainAPI() {
                 val title = entry.optJSONObject("title")?.optString("\$t") ?: continue
                 val link = entryLink(entry) ?: continue
                 if (!seen.add(link)) continue
-                if (!title.contains(Regex("""Episode\s+\d+""", RegexOption.IGNORE_CASE))) continue
+
+                val isEpisodeEntry = title.contains(Regex("""Episode\s+\d+""", RegexOption.IGNORE_CASE))
+                val thumb = entry.optJSONObject("media\$thumbnail")?.optString("url")
+                    ?.replace(Regex("/s\\d+(-c)?/"), "/s0/") ?: ""
+                val cats = entry.optJSONArray("category")
+                (0 until (cats?.length() ?: 0)).forEach { i ->
+                    cats?.optJSONObject(i)?.optString("term")?.let { t ->
+                        if (isGenreLabel(t) && t !in META_LABELS) genreLabels.add(t)
+                    }
+                }
+
+                if (!isEpisodeEntry && seriesThumb.isEmpty()) {
+                    // Post de la serie: poster, sinopsis y año de publicacion
+                    seriesThumb = thumb
+                    val content = entry.optJSONObject("content")?.optString("\$t") ?: ""
+                    val plain = stripHtml(content)
+                    if (plain.length > 40) seriesPlot = plain.take(1200)
+                    seriesYear = entry.optString("published")?.take(4)?.toIntOrNull()
+                }
+                if (seriesThumb.isEmpty() && thumb.isNotEmpty()) seriesThumb = thumb
+
+                if (!isEpisodeEntry) continue
                 val num = Regex("""Episode\s+(\d+(?:-\d+)?)""", RegexOption.IGNORE_CASE)
                     .find(title)?.groupValues?.get(1)?.substringBefore("-")?.toIntOrNull()
                 episodes.add(newEpisode(link) {
@@ -236,7 +273,11 @@ class DonghuaZoneProvider : MainAPI() {
         val displayName = seriesLabel.replace(Regex("""\b[a-z]""")) { it.value.uppercase() }
 
         return newAnimeLoadResponse(displayName, if (isEpisode) url else "$mainUrl/search/label/$labelEnc", TvType.Anime) {
-            this.plot = "Donghua 4K con subtitulos (Indonesia/English). Servidor: Dailymotion (Multi Sub)."
+            this.plot = if (seriesPlot.isNotBlank()) seriesPlot
+            else "Donghua 4K con subtitulos (Indonesia/English). Servidor: Dailymotion (Multi Sub)."
+            if (seriesThumb.isNotBlank()) this.posterUrl = seriesThumb
+            if (genreLabels.isNotEmpty()) this.tags = genreLabels.toList()
+            if (seriesYear != null && seriesYear in 1900..2100) this.year = seriesYear
             this.episodes = mutableMapOf(DubStatus.Subbed to sorted)
         }
     }
@@ -356,7 +397,8 @@ class DonghuaZoneProvider : MainAPI() {
         return try {
             val metaUrl = "https://www.dailymotion.com/player/metadata/video/$vid" +
                 "?embedder=" + java.net.URLEncoder.encode(referer, "UTF-8") + "&integration=inline"
-            val json = app.get(metaUrl, referer = referer, headers = mapOf("User-Agent" to UA), timeout = 20L).text
+            val json = app.get(metaUrl, referer = referer, headers = mapOf("User-Agent" to UA), timeout = 20L)
+                .text.replace("\\/", "/").replace("\\u0026", "&")
 
             dmSubtitlesBlock(json)?.let { block ->
                 Regex(""""(es[a-z-]*|en[a-z-]*)":\s*\{[^{}]*?"urls":\["([^"]+)"""")
