@@ -6,6 +6,9 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import org.jsoup.nodes.Element
 
 /**
@@ -44,6 +47,9 @@ class LmAnimeProvider : MainAPI() {
 
         /** Regex para numeros de episodio tipo "Episode 263" o "Episode 254-255". */
         private val EPISODE_NUM_REGEX = Regex("""Episode\s+(\d+(?:-\d+)?)""", RegexOption.IGNORE_CASE)
+
+        /** Cache slug -> rating (el listado no trae nota; hay que pedir la ficha). */
+        private val ratingCache = java.util.concurrent.ConcurrentHashMap<String, Double>()
     }
 
     // ==================== MAIN PAGE ====================
@@ -68,20 +74,49 @@ class LmAnimeProvider : MainAPI() {
         }
 
         val document = app.get(url, headers = mapOf("User-Agent" to UA)).document
-        val selector = if (sectionName == "Latest Release") ".listupd.normal article" else "article"
-        val items = document.select(selector).mapNotNull { parseArticleCard(it) }
+        val isLatest = sectionName == "Latest Release"
+        val selector = if (isLatest) ".listupd.normal article" else "article"
+        val items = document.select(selector).mapNotNull { parseArticleCard(it, withDubStatus = isLatest) }
             .distinctBy { it.url }
 
+        // v4: en las secciones que NO son "Latest Release" se muestra la
+        // CALIFICACION sobre el poster en lugar de la etiqueta "Sub".
+        val finalItems = if (isLatest) items else withRatings(items)
+
         val hasNext = when {
-            sectionName == "Latest Release" -> items.isNotEmpty()
+            isLatest -> items.isNotEmpty()
             sectionName == "Completed Series" -> items.size >= 20
             else -> items.size >= 10
         }
-        return newHomePageResponse(listOf(HomePageList(sectionName, items)), hasNext)
+        return newHomePageResponse(listOf(HomePageList(sectionName, finalItems)), hasNext)
+    }
+
+    /** Anade la nota (Score) a cada card consultando su ficha; cachea por slug. */
+    private suspend fun withRatings(items: List<SearchResponse>): List<SearchResponse> = coroutineScope {
+        items.map { sr ->
+            async {
+                try {
+                    val slug = sr.url.trimEnd('/').substringAfterLast('/')
+                    val rating = ratingCache[slug] ?: fetchRating(sr.url)?.also { ratingCache[slug] = it }
+                    if (rating != null) sr.score = Score.from10(rating)
+                } catch (_: Exception) {}
+                sr
+            }
+        }.awaitAll()
+    }
+
+    /** Nota de la ficha: .numscore o meta[itemprop=ratingValue]. */
+    private suspend fun fetchRating(seriesUrl: String): Double? = try {
+        val doc = app.get(seriesUrl, headers = mapOf("User-Agent" to UA), timeout = 15L).document
+        (doc.selectFirst(".numscore")?.text()?.trim()
+            ?: doc.selectFirst("meta[itemprop=ratingValue]")?.attr("content")?.trim())
+            ?.toDoubleOrNull()?.takeIf { it > 0.0 }
+    } catch (_: Exception) {
+        null
     }
 
     /** Parsea un card de listado (puede ser ficha de serie o pagina de episodio). */
-    private fun parseArticleCard(article: Element): SearchResponse? {
+    private fun parseArticleCard(article: Element, withDubStatus: Boolean = true): SearchResponse? {
         val linkEl = article.selectFirst("a[href]") ?: return null
         val url = linkEl.attr("abs:href")
         if (url.isEmpty()) return null
@@ -100,7 +135,8 @@ class LmAnimeProvider : MainAPI() {
 
         return newAnimeSearchResponse(cleanTitle, url) {
             this.posterUrl = img
-            addDubStatus(DubStatus.Subbed, epNum)
+            // v4: en las secciones de genero/Completed no se marca "Subbed"; ahi manda la nota.
+            if (withDubStatus) addDubStatus(DubStatus.Subbed, epNum)
         }
     }
 
@@ -271,10 +307,17 @@ class LmAnimeProvider : MainAPI() {
 
     private data class MirrorOption(val label: String, val url: String)
 
-    /** 0 = espanol, 1 = ingles, 2 = resto de idiomas. */
+    /**
+     * 0 = espanol / multisub, 1 = ingles, 2 = resto de idiomas.
+     *
+     * FIX v4: "Multisub" traia pistas de subtitulos en varios idiomas
+     * (incluido espanol) pero caia en el grupo 2 y se descartaba en cuanto
+     * "English" funcionaba -> el servidor no aparecia. Ahora va primero.
+     */
     private fun langPrio(label: String): Int {
         val l = label.lowercase()
         return when {
+            l.contains("multi") -> 0
             l.contains("espa") || l.contains("spanish") || l.contains("latino") -> 0
             l.contains("english") || l.contains("ingles") || l.contains("ingl") -> 1
             else -> 2
@@ -296,9 +339,11 @@ class LmAnimeProvider : MainAPI() {
                 .filter { it.contains("dailymotion", ignoreCase = true) || it.contains("ok.ru", ignoreCase = true) }
             if (iframes.isEmpty()) return false
 
-            val langTag = when (langPrio(mirror.label)) {
-                0 -> "Español"
-                1 -> "English"
+            // v4: "Multisub" se etiqueta como tal (antes salia como "Español").
+            val langTag = when {
+                mirror.label.contains("multi", ignoreCase = true) -> "Multisub"
+                langPrio(mirror.label) == 0 -> "Español"
+                langPrio(mirror.label) == 1 -> "English"
                 else -> mirror.label
             }
             var found = false

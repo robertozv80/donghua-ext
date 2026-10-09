@@ -132,12 +132,13 @@ private fun acDecrypt(b64: String, keyMaterial: String): String? {
 }
 
 private data class AcSourceEntry(val platform: String, val videoId: String, val quality: String)
-/** Item del catalogo del home (payload RSC): slug, titulo, poster y generos. */
+/** Item del catalogo del home (payload RSC): slug, titulo, poster, generos y rating. */
 private data class AcCatalogItem(
     val slug: String,
     val title: String,
     val poster: String,
-    val genres: List<String>
+    val genres: List<String>,
+    val rating: Double? = null
 )
 
 /** Convierte un slug en titulo legible (equivalente top-level del miembro de la clase). */
@@ -151,12 +152,21 @@ private fun acTitleFromSlug(slug: String): String =
  * (Action 47, Adventure 29, Fantasy 43, Martial Arts 7).
  */
 private fun acCatalog(html: String): List<AcCatalogItem> {
-    val un = html.replace("\\\"", "\"").replace("\\u0026", "&")
+    // FIX v4 (2026-10): el flight de Next.js reparte el payload en chunks
+    // (self.__next_f.push) y una cadena larga puede quedar partida a media URL:
+    //   ..."coverImage":"https://images.animecube.live/assets/images/dongh"
+    //   ])</script><script>self.__next_f.push([1,"ua/series/perfect-world/...
+    // El poster quedaba truncado (grid "For You": Perfect World, Soul Land 2...).
+    // Se unen los chunks ANTES de desescapar y parsear.
+    val joined = html.replace("\"]</script><script>self.__next_f.push([1,\"", "")
+    val un = joined.replace("\\\"", "\"").replace("\\u0026", "&")
     val merged = LinkedHashMap<String, AcCatalogItem>()
 
-    // Metadatos: poster + slug + titulo (las claves del payload vienen alfabeticas).
+    // Metadatos: poster + slug + titulo. NO se exige "genres" entre medias: hay
+    // series sin generos en el payload (p.ej. soul-land-2-the-peerless-tang-clan)
+    // y el poster quedaba sin recoger -> imagen vacia en el grid.
     val metaRe = Regex(
-        "\"coverImage\":\"([^\"]+)\"[^}]*?\"genres\":\\[[^\\]]*\\][^}]*?\"slug\":\"([a-z0-9-]+)\"[^}]*?\"title\":\"((?:[^\"\\\\]|\\\\.)*)\""
+        "\"coverImage\":\"([^\"]+)\"[^}]*?\"slug\":\"([a-z0-9-]+)\"[^}]*?\"title\":\"((?:[^\"\\\\]|\\\\.)*)\""
     )
     metaRe.findAll(un).forEach { m ->
         val poster = m.groupValues[1]
@@ -173,6 +183,16 @@ private fun acCatalog(html: String): List<AcCatalogItem> {
         val prev = merged[slug]
         merged[slug] = if (prev != null) prev.copy(genres = genres)
         else AcCatalogItem(slug, acTitleFromSlug(slug), "", genres)
+    }
+
+    // Rating por slug ("rating":9.2, ... "slug":...). Se usa para la etiqueta
+    // de calificacion sobre el poster en el grid.
+    Regex("\"rating\":([0-9.]+)[^}]*?\"slug\":\"([a-z0-9-]+)\"").findAll(un).forEach { m ->
+        val slug = m.groupValues[2]
+        val rating = m.groupValues[1].toDoubleOrNull()?.takeIf { it > 0.0 } ?: return@forEach
+        val prev = merged[slug]
+        merged[slug] = if (prev != null) prev.copy(rating = rating)
+        else AcCatalogItem(slug, acTitleFromSlug(slug), "", emptyList(), rating)
     }
 
     return merged.values.toList()
@@ -216,6 +236,8 @@ class AnimeCubeProvider : MainAPI() {
                 .map { c ->
                     newAnimeSearchResponse(c.title.ifBlank { acTitleFromSlug(c.slug) }, "$mainUrl/anime/${c.slug}") {
                         this.posterUrl = c.poster
+                        // v4: etiqueta de calificacion sobre el poster (en vez de "Subbed")
+                        if (c.rating != null) this.score = Score.from10(c.rating)
                     }
                 }
             return newHomePageResponse(listOf(HomePageList(request.name, items)), hasNext = false)
@@ -233,6 +255,7 @@ class AnimeCubeProvider : MainAPI() {
                     val c = bySlug[slug]
                     items.add(newAnimeSearchResponse(c?.title?.takeIf { it.isNotBlank() } ?: label.trim(), "$mainUrl/anime/$slug") {
                         this.posterUrl = c?.poster ?: ""
+                        if (c?.rating != null) this.score = Score.from10(c.rating)
                     })
                 }
             }
@@ -246,6 +269,7 @@ class AnimeCubeProvider : MainAPI() {
                     items.add(
                         newAnimeSearchResponse(c?.title?.takeIf { it.isNotBlank() } ?: acSlugToTitle(slug), "$mainUrl/anime/$slug") {
                             this.posterUrl = c?.poster ?: ""
+                            if (c?.rating != null) this.score = Score.from10(c.rating)
                         }
                     )
                 }
@@ -278,6 +302,7 @@ class AnimeCubeProvider : MainAPI() {
             val c = bySlug[slug]
             newAnimeSearchResponse(c?.title?.takeIf { it.isNotBlank() } ?: acSlugToTitle(slug), "$mainUrl/anime/$slug") {
                 this.posterUrl = c?.poster ?: ""
+                if (c?.rating != null) this.score = Score.from10(c.rating)
             }
         }
     }
@@ -414,7 +439,12 @@ class AnimeCubeProvider : MainAPI() {
 
     // ==================== VERSIONES / SOURCES ====================
 
-    private data class AcVersionEntry(val primaryTabId: String, val seasonId: String, val version: String)
+    private data class AcVersionEntry(
+        val slug: String,
+        val primaryTabId: String,
+        val seasonId: String,
+        val version: String
+    )
 
     /**
      * Objeto principal de la serie dentro del flight (contiene aliases, coverImage,
@@ -470,7 +500,9 @@ class AnimeCubeProvider : MainAPI() {
                 val ptObj = acBalancedObject(slugObj, ptM.range.last)
                 if (ptObj != null) {
                     Regex(""""(tab-[\w-]+)":\s*"([^"]+)"""").findAll(ptObj).forEach { m ->
-                        out.add(AcVersionEntry(ptM.groupValues[1], m.groupValues[1], m.groupValues[2]))
+                        out.add(
+                            AcVersionEntry(slugM.groupValues[1], ptM.groupValues[1], m.groupValues[1], m.groupValues[2])
+                        )
                     }
                 }
                 j = ptM.range.last + (ptObj?.length ?: 1)
@@ -502,9 +534,19 @@ class AnimeCubeProvider : MainAPI() {
             }
             if (payload.isEmpty()) return emptyList()
 
-            Regex(""""platform":"([\w-]+)"\s*,\s*(?:"privateId":"[^"]*"\s*,\s*)?"quality":"([^"]*)"\s*,\s*"videoId":"([\w-]+)"""")
+            // FIX v4 (2026-10): la API de metadata de Dailymotion necesita el id LARGO
+            // (privateId, p.ej. "k5Vsp1UXQ2vIA2HSWyi") para los videos no listados del
+            // sitio; el videoId corto ("xaq348m") responde error -> 0 HLS/0 subs y la
+            // ficha mostraba "No se encontraron enlaces". Preferir privateId.
+            Regex(""""platform":"([\w-]+)"\s*,\s*(?:"privateId":"([^"]*)"\s*,\s*)?"quality":"([^"]*)"\s*,\s*"videoId":"([\w-]+)"""")
                 .findAll(payload)
-                .map { AcSourceEntry(it.groupValues[1], it.groupValues[3], it.groupValues[2]) }
+                .map { m ->
+                    val platform = m.groupValues[1]
+                    val privateId = m.groupValues[2]
+                    val quality = m.groupValues[3]
+                    val videoId = m.groupValues[4]
+                    AcSourceEntry(platform, privateId.ifBlank { videoId }, quality)
+                }
                 .toList()
         } catch (_: Exception) {
             emptyList()
@@ -523,9 +565,11 @@ class AnimeCubeProvider : MainAPI() {
         val slug = m.groupValues[1]
         val seId = m.groupValues[2]
 
+        // v4: emparejar por slug+seasonId. El fallback anterior (registry.firstOrNull())
+        // tomaba una version de OTRA serie y las fuentes fallaban en silencio.
         val registry = fetchRegistry()
-        val entry = registry.firstOrNull { it.seasonId == seId }
-            ?: registry.firstOrNull()
+        val entry = registry.firstOrNull { it.slug == slug && it.seasonId == seId }
+            ?: registry.firstOrNull { it.slug == slug && it.version.isNotBlank() }
             ?: return false
 
         val sources = fetchSources(slug, data, entry.primaryTabId, entry.seasonId, entry.version)

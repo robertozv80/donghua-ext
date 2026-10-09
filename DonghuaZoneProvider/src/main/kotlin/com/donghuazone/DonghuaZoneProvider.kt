@@ -42,13 +42,6 @@ class DonghuaZoneProvider : MainAPI() {
         private const val UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
 
-        /** Labels de genero que el sitio realmente usa (podemos ampliar). */
-        private val GENRE_LABELS = mapOf(
-            "Action" to "Action",
-            "Adventure" to "Adventure",
-            "Martial Arts" to "q:martial"
-        )
-
         private const val FEED = "/feeds/posts/default"
         private const val PAGE_SIZE = 25
 
@@ -69,11 +62,11 @@ class DonghuaZoneProvider : MainAPI() {
 
     // ==================== MAIN PAGE ====================
 
+    // v3: se eliminan las secciones Action / Adventure / Martial Arts y se
+    // anade "Movies" (label Movie del feed de Blogger, 8 entradas en 2026-10).
     override val mainPage = mainPageOf(
         "$mainUrl$FEED?alt=json" to "Latest Episode",
-        "label:Action" to "Action",
-        "label:Adventure" to "Adventure",
-        "q:martial" to "Martial Arts"
+        "label:Movie" to "Movies"
     )
 
     /** Resultado de una peticion al feed: lista de entradas + flag hasNext. */

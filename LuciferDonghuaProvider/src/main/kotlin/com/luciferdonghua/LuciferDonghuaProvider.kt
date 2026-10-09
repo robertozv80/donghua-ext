@@ -5,6 +5,9 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import org.jsoup.nodes.Element
 
 /**
@@ -43,6 +46,9 @@ class LuciferDonghuaProvider : MainAPI() {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
 
         private val EPISODE_NUM_REGEX = Regex("""Episode\s+(\d+(?:-\d+)?)""", RegexOption.IGNORE_CASE)
+
+        /** Cache slug -> rating (el listado no trae nota; hay que pedir la ficha). */
+        private val ratingCache = java.util.concurrent.ConcurrentHashMap<String, Double>()
     }
 
     // ==================== MAIN PAGE ====================
@@ -65,14 +71,43 @@ class LuciferDonghuaProvider : MainAPI() {
         }
 
         val document = app.get(url, headers = mapOf("User-Agent" to UA)).document
-        val items = document.select("article").mapNotNull { parseArticleCard(it) }
+        val isLatest = sectionName == "Latest Release"
+        val items = document.select("article").mapNotNull { parseArticleCard(it, withDubStatus = isLatest) }
             .distinctBy { it.url }
 
-        val hasNext = if (sectionName == "Latest Release") items.isNotEmpty() else items.size >= 15
-        return newHomePageResponse(listOf(HomePageList(sectionName, items)), hasNext)
+        // v4: en las secciones que NO son "Latest Release" se muestra la
+        // CALIFICACION sobre el poster en lugar de la etiqueta "Sub".
+        val finalItems = if (isLatest) items else withRatings(items)
+
+        val hasNext = if (isLatest) items.isNotEmpty() else items.size >= 15
+        return newHomePageResponse(listOf(HomePageList(sectionName, finalItems)), hasNext)
     }
 
-    private fun parseArticleCard(article: Element): SearchResponse? {
+    /** Anade la nota (Score) a cada card consultando su ficha; cachea por slug. */
+    private suspend fun withRatings(items: List<SearchResponse>): List<SearchResponse> = coroutineScope {
+        items.map { sr ->
+            async {
+                try {
+                    val slug = sr.url.trimEnd('/').substringAfterLast('/')
+                    val rating = ratingCache[slug] ?: fetchRating(sr.url)?.also { ratingCache[slug] = it }
+                    if (rating != null) sr.score = Score.from10(rating)
+                } catch (_: Exception) {}
+                sr
+            }
+        }.awaitAll()
+    }
+
+    /** Nota de la ficha: .numscore o meta[itemprop=ratingValue]. */
+    private suspend fun fetchRating(seriesUrl: String): Double? = try {
+        val doc = app.get(seriesUrl, headers = mapOf("User-Agent" to UA), timeout = 15L).document
+        (doc.selectFirst(".numscore")?.text()?.trim()
+            ?: doc.selectFirst("meta[itemprop=ratingValue]")?.attr("content")?.trim())
+            ?.toDoubleOrNull()?.takeIf { it > 0.0 }
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun parseArticleCard(article: Element, withDubStatus: Boolean = true): SearchResponse? {
         val linkEl = article.selectFirst("a[href]") ?: return null
         val url = linkEl.attr("abs:href")
         if (url.isEmpty()) return null
@@ -91,7 +126,8 @@ class LuciferDonghuaProvider : MainAPI() {
 
         return newAnimeSearchResponse(cleanTitle, url) {
             this.posterUrl = img
-            addDubStatus(DubStatus.Subbed, epNum)
+            // v4: en las secciones de genero/Completed no se marca "Subbed"; ahi manda la nota.
+            if (withDubStatus) addDubStatus(DubStatus.Subbed, epNum)
         }
     }
 
@@ -162,10 +198,24 @@ class LuciferDonghuaProvider : MainAPI() {
 
             val numText = linkEl.selectFirst(".epl-num")?.text()?.trim()
             val titleText = linkEl.selectFirst(".epl-title")?.text()?.trim()
-            val epNum = numText?.toIntOrNull()
+
+            // FIX v4 (2026-10): el sitio tiene erratas en .epl-num. El post del
+            // episodio 96 lleva num="56" -> colisionaba con el 56 real y la app
+            // se saltaba el 96 (del 95 pasaba al 97). La URL es fiable, asi que
+            // el numero se toma de "-episode-<N>" y .epl-num queda de reserva.
+            val urlNum = Regex("""-episode-(\d+(?:-\d+)?)""", RegexOption.IGNORE_CASE)
+                .find(epUrl)?.groupValues?.get(1)
+            val epNum = urlNum?.substringBefore("-")?.toIntOrNull()
+                ?: numText?.toIntOrNull()
                 ?: EPISODE_NUM_REGEX.find(titleText ?: "")?.groupValues?.get(1)
                     ?.substringBefore("-")?.toIntOrNull()
-            val name = titleText ?: numText
+
+            // Nombre: si el titulo discrepa del rango real de la URL (el sitio
+            // titula "Episode 46-50" un post que es episode-46-49), se corrige.
+            val name = titleText?.let { t ->
+                val tNum = EPISODE_NUM_REGEX.find(t)?.groupValues?.get(1)
+                if (urlNum != null && tNum != null && tNum != urlNum) t.replace(tNum, urlNum) else t
+            } ?: numText
 
             episodes.add(newEpisode(epUrl) {
                 this.name = name?.takeIf { it.isNotEmpty() }

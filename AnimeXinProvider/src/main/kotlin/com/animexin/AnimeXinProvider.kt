@@ -5,6 +5,9 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import org.jsoup.nodes.Element
 
 /**
@@ -20,6 +23,9 @@ import org.jsoup.nodes.Element
  *     * "All Sub Player Dailymotion AX" -> metadata DM con pistas MULTI-IDOMA
  *       que incluyen "es" (ESPANOL REAL) y "en-auto"; HLS "auto".
  *     * "Hardsub English Dailymotion AX" -> hardsub EN quemado en el video.
+ *     * "All Sub Player Dood" -> DoodStream (playmogo.com/dooood.com): mp4
+ *       progresivo + pistas VTT multi-idioma en srt.doodcdn.io (incluye
+ *       Spanish). Sirve de respaldo del All Sub de Dailymotion.
  *     * "Hardsub Indonesia ..." / "Dtube" / "Mega" -> otros idiomas o no
  *       extraibles (se omiten).
  *
@@ -40,6 +46,21 @@ class AnimeXinProvider : MainAPI() {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
 
         private val EPISODE_NUM_REGEX = Regex("""Episode\s+(\d+(?:-\d+)?)""", RegexOption.IGNORE_CASE)
+
+        /**
+         * Hosts de DoodStream y sus mirrors. `do+od` cubre dood / dooood
+         * (dooood.com redirige hoy a playmogo.com, el host real del embed).
+         */
+        private val DOOD_HOST = Regex(
+            """(?:playmogo|do+od|dsvplay|ds2play|d000d|doply|doodstream)""",
+            RegexOption.IGNORE_CASE
+        )
+
+        private const val DOOD_RAND_CHARS =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+        /** Cache slug -> rating; el listado no trae nota y hay que pedir la ficha. */
+        private val ratingCache = java.util.concurrent.ConcurrentHashMap<String, Double>()
     }
 
     // ==================== MAIN PAGE ====================
@@ -61,14 +82,45 @@ class AnimeXinProvider : MainAPI() {
 
         val document = app.get(url, headers = mapOf("User-Agent" to UA)).document
         val selector = if (sectionName == "Latest Release") ".listupd.normal article" else "article"
-        val items = document.select(selector).mapNotNull { parseArticleCard(it) }
+        val isLatest = sectionName == "Latest Release"
+        val items = document.select(selector).mapNotNull { parseArticleCard(it, withDubStatus = isLatest) }
             .distinctBy { it.url }
 
-        val hasNext = if (sectionName == "Latest Release") items.isNotEmpty() else items.size >= 10
-        return newHomePageResponse(listOf(HomePageList(sectionName, items)), hasNext)
+        // v3: en las secciones que NO son "Latest Release" se muestra la
+        // CALIFICACION sobre el poster en lugar de la etiqueta "Sub". El
+        // listado no incluye nota, asi que se lee la ficha de cada serie
+        // (en paralelo y con cache en memoria).
+        val finalItems = if (isLatest) items else withRatings(items)
+
+        val hasNext = if (isLatest) items.isNotEmpty() else items.size >= 10
+        return newHomePageResponse(listOf(HomePageList(sectionName, finalItems)), hasNext)
     }
 
-    private fun parseArticleCard(article: Element): SearchResponse? {
+    /** Anade la nota (Score) a cada card consultando su ficha; cachea por slug. */
+    private suspend fun withRatings(items: List<SearchResponse>): List<SearchResponse> = coroutineScope {
+        items.map { sr ->
+            async {
+                try {
+                    val slug = sr.url.trimEnd('/').substringAfterLast('/')
+                    val rating = ratingCache[slug] ?: fetchRating(sr.url)?.also { ratingCache[slug] = it }
+                    if (rating != null) sr.score = Score.from10(rating)
+                } catch (_: Exception) {}
+                sr
+            }
+        }.awaitAll()
+    }
+
+    /** Nota de la ficha: .numscore o meta[itemprop=ratingValue]. */
+    private suspend fun fetchRating(seriesUrl: String): Double? = try {
+        val doc = app.get(seriesUrl, headers = mapOf("User-Agent" to UA), timeout = 15L).document
+        (doc.selectFirst(".numscore")?.text()?.trim()
+            ?: doc.selectFirst("meta[itemprop=ratingValue]")?.attr("content")?.trim())
+            ?.toDoubleOrNull()?.takeIf { it > 0.0 }
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun parseArticleCard(article: Element, withDubStatus: Boolean = true): SearchResponse? {
         val linkEl = article.selectFirst("a[href]") ?: return null
         val url = linkEl.attr("abs:href")
         if (url.isEmpty()) return null
@@ -89,7 +141,8 @@ class AnimeXinProvider : MainAPI() {
             this.posterUrl = img
             // FIX v2: animexin.dev exige Referer para servir sus imagenes (403 sin el)
             this.posterHeaders = mapOf("Referer" to "$mainUrl/")
-            addDubStatus(DubStatus.Subbed, epNum)
+            // v3: en las secciones de genero no se marca "Subbed"; ahi manda la nota.
+            if (withDubStatus) addDubStatus(DubStatus.Subbed, epNum)
         }
     }
 
@@ -275,7 +328,9 @@ class AnimeXinProvider : MainAPI() {
                     extractDailymotion(fixed, "$mainUrl/", label, emittedSubs, subtitleCallback, callback)
                 fixed.contains("odysee.com", ignoreCase = true) ->
                     extractOdysee(fixed, data, label, callback)
-                else -> false // Dtube/Mega/Streamwish/Dood: no extraibles o muertos
+                DOOD_HOST.containsMatchIn(fixed) ->
+                    extractDood(fixed, "$mainUrl/", label, emittedSubs, subtitleCallback, callback)
+                else -> false // Dtube/Mega/Streamwish: no extraibles o muertos
             }
             if (ok) found = true
         }
@@ -436,6 +491,68 @@ class AnimeXinProvider : MainAPI() {
                 }
             }
             found
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * DoodStream (dooood.com -> playmogo.com). Flujo anonimo verificado 2026-10:
+     *   1) GET /e/<id>  ->  pagina con `$.get('/pass_md5/<hash>/<token>', ...)` y
+     *      `makePlay()` = 10 chars aleatorios + "?token=<token>&expiry="+Date.now().
+     *   2) GET /pass_md5/<hash>/<token> (Referer: pagina embed) -> prefijo de URL.
+     *   3) URL final = prefijo + random10 + "?token=...&expiry=..." (mp4 progresivo).
+     * Ademas la pagina lista las pistas VTT multi-idioma en srt.doodcdn.io
+     * (incluye Spanish), que son los subtitulos del servidor "All Sub".
+     *
+     * Nota: el CDN del video EXIGE Referer del host Dood; sin el responde 302.
+     */
+    private suspend fun extractDood(
+        embedUrl: String,
+        referer: String,
+        linkName: String,
+        emittedSubs: MutableSet<String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        return try {
+            val html = app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to UA), timeout = 25L).text
+
+            // /pass_md5/<hash>/<token>  (el hash lleva guiones)
+            val m = Regex("""/pass_md5/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)""").find(html) ?: return false
+            val path = m.value
+            val token = m.groupValues[2]
+            val origin = Regex("""^https?://[^/]+""").find(embedUrl)?.value ?: return false
+
+            val base = app.get(
+                "$origin$path",
+                referer = embedUrl,
+                headers = mapOf("User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest"),
+                timeout = 25L
+            ).text.trim()
+            if (base.isEmpty() || !base.startsWith("http")) return false
+
+            // Pistas de subtitulos VTT (multi-idioma) expuestas en la pagina
+            Regex("""\{src:'([^']+)',\s*label:'([^']*)',kind:'captions',srclang:'[^']*'\}""")
+                .findAll(html)
+                .forEach { sm ->
+                    val raw = sm.groupValues[1]
+                    if (raw.startsWith("data:")) return@forEach
+                    val url = if (raw.startsWith("//")) "https:$raw" else raw
+                    val label = sm.groupValues[2].trim().ifEmpty { "Subtitle" }
+                    if (emittedSubs.add(url)) subtitleCallback.invoke(SubtitleFile(label, url))
+                }
+
+            val rnd = (1..10).map { DOOD_RAND_CHARS.random() }.joinToString("")
+            val finalUrl = "$base$rnd?token=$token&expiry=${System.currentTimeMillis()}"
+
+            callback(
+                newExtractorLink(source = linkName, name = linkName, url = finalUrl) {
+                    this.referer = "$origin/"
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+            true
         } catch (_: Exception) {
             false
         }
