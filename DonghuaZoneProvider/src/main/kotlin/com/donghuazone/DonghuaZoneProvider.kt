@@ -265,6 +265,9 @@ class DonghuaZoneProvider : MainAPI() {
         val sorted = episodes.sortedBy { it.episode ?: 0 }
         val displayName = seriesLabel.replace(Regex("""\b[a-z]""")) { it.value.uppercase() }
 
+        // v3: recomendaciones (similitud de nombre, hasta 16).
+        val recommendations = fetchRecommendations(seriesLabel, url)
+
         return newAnimeLoadResponse(displayName, if (isEpisode) url else "$mainUrl/search/label/$labelEnc", TvType.Anime) {
             this.plot = if (seriesPlot.isNotBlank()) seriesPlot
             else "Donghua 4K con subtitulos (Indonesia/English). Servidor: Dailymotion (Multi Sub)."
@@ -272,8 +275,79 @@ class DonghuaZoneProvider : MainAPI() {
             if (genreLabels.isNotEmpty()) this.tags = genreLabels.toList()
             if (seriesYear != null && seriesYear in 1900..2100) this.year = seriesYear
             this.episodes = mutableMapOf(DubStatus.Subbed to sorted)
+            if (recommendations.isNotEmpty()) this.recommendations = recommendations
         }
     }
+
+    /**
+     * v3: recomendaciones "como en los primeros providers" — similitud de nombre
+     * (hasta 16 resultados), sobre el feed publico de Blogger:
+     *  1) Entradas cuya SERIE (label no-genero) empieza por el nombre base, una
+     *     por serie;
+     *  2) Relleno aleatorio de una pagina del feed general.
+     */
+    private suspend fun fetchRecommendations(
+        seriesLabel: String,
+        currentUrl: String
+    ): List<SearchResponse> {
+        val all = ArrayList<SearchResponse>()
+        val seenUrls = HashSet<String>()
+        seenUrls.add(currentUrl)
+        val seenSeries = HashSet<String>()
+
+        val norm = dzRecNormalize(seriesLabel)
+        val baseNorm = Regex("""\s+\d+$""").replace(norm, "").trim().ifBlank { norm }
+
+        // 1) Mismo nombre base (misma serie / temporadas)
+        if (baseNorm.isNotBlank()) {
+            try {
+                val q = java.net.URLEncoder.encode(baseNorm, "UTF-8")
+                fetchFeed("$mainUrl$FEED?alt=json&q=$q&max-results=25").entries.forEach { entry ->
+                    val link = entryLink(entry) ?: return@forEach
+                    if (link in seenUrls) return@forEach
+                    val label = seriesLabelOf(entry) ?: return@forEach
+                    val lNorm = dzRecNormalize(label)
+                    if (lNorm != baseNorm && !lNorm.startsWith(baseNorm)) return@forEach
+                    if (!seenSeries.add(lNorm)) return@forEach
+                    seenUrls.add(link)
+                    entryToSearchResponse(entry)?.let { all.add(it) }
+                }
+            } catch (_: Exception) {}
+        }
+
+        // 2) Relleno aleatorio del feed general
+        val pool = ArrayList<SearchResponse>()
+        if (all.size < 16) {
+            try {
+                val start = 1 + (0 until 8).random() * PAGE_SIZE
+                fetchFeed("$mainUrl$FEED?alt=json&max-results=$PAGE_SIZE&start-index=$start").entries
+                    .forEach { entry ->
+                        if (pool.size >= 40) return@forEach
+                        val link = entryLink(entry) ?: return@forEach
+                        if (link in seenUrls) return@forEach
+                        seenUrls.add(link)
+                        entryToSearchResponse(entry)?.let { pool.add(it) }
+                    }
+            } catch (_: Exception) {}
+        }
+
+        pool.shuffle()
+        all.addAll(pool)
+        return all.take(16)
+    }
+
+    /** Label de SERIE de una entrada del feed (ultimo label que no es genero/meta). */
+    private fun seriesLabelOf(entry: org.json.JSONObject): String? {
+        val cats = entry.optJSONArray("category") ?: return null
+        val labels = (0 until cats.length()).mapNotNull { cats.optJSONObject(it)?.optString("term") }
+        return labels.lastOrNull { !isGenreLabel(it) && it != "Eps. Donghua" }
+    }
+
+    /** Normaliza un titulo para comparar bases (minusculas, sin acentos ni simbolos). */
+    private fun dzRecNormalize(t: String): String =
+        java.text.Normalizer.normalize(t.lowercase(), java.text.Normalizer.Form.NFD)
+            .replace(Regex("""\p{Mn}+"""), "")
+            .replace(Regex("""[^a-z0-9]+"""), " ").trim()
 
     private fun entryLink(entry: org.json.JSONObject): String? {
         val links = entry.optJSONArray("link") ?: return null

@@ -209,6 +209,11 @@ class AnimeCubeProvider : MainAPI() {
     companion object {
         private const val UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
+
+        /** Palabras vacias para la similitud de nombres de las recomendaciones. */
+        private val AC_STOPWORDS = setOf(
+            "the", "and", "of", "a", "an", "to", "in", "for", "with", "its", "is", "are"
+        )
     }
 
     // ==================== MAIN PAGE ====================
@@ -421,6 +426,9 @@ class AnimeCubeProvider : MainAPI() {
         } ?: emptyList()
         val durationMin = Regex("\"duration\":(\\d+)").find(flight)?.groupValues?.get(1)?.toIntOrNull()
 
+        // v4: recomendaciones (similitud de nombre, hasta 16) desde el catalogo del home.
+        val recommendations = acRecommendations(title, slug)
+
         return newAnimeLoadResponse(title, "$mainUrl/anime/$slug", TvType.Anime) {
             this.plot = description
             if (cover.isNotBlank()) this.posterUrl = cover
@@ -434,8 +442,76 @@ class AnimeCubeProvider : MainAPI() {
             if (rating != null && rating > 0.0) this.score = Score.from10(rating)
             if (durationMin != null && durationMin > 0) this.duration = durationMin
             this.episodes = mutableMapOf(DubStatus.Subbed to sorted)
+            if (recommendations.isNotEmpty()) this.recommendations = recommendations
         }
     }
+
+    /**
+     * v4: recomendaciones "como en los primeros providers" — similitud de nombre
+     * (hasta 16 resultados). El sitio no expone un bloque de relacionados, asi que
+     * se usa el catalogo del home (mismo payload que el grid "For You"):
+     *  1) Otras temporadas/peliculas de la misma serie (misma base de slug);
+     *  2) El resto por SIMILITUD DE NOMBRE (solapamiento de palabras del titulo);
+     *  3) Si aun faltan, relleno aleatorio del catalogo.
+     */
+    private suspend fun acRecommendations(seriesTitle: String, slug: String): List<SearchResponse> {
+        return try {
+            val html = app.get("$mainUrl/", headers = mapOf("User-Agent" to UA), timeout = 25L).text
+            val catalog = acCatalog(html).filter { it.slug != slug }
+            if (catalog.isEmpty()) return emptyList()
+
+            val baseSlug = acBaseSlug(slug)
+            val ownTokens = acTokens(seriesTitle)
+
+            fun toResp(c: AcCatalogItem) = newAnimeSearchResponse(
+                c.title.ifBlank { acTitleFromSlug(c.slug) }, "$mainUrl/anime/${c.slug}"
+            ) {
+                this.posterUrl = c.poster
+                if (c.rating != null) this.score = Score.from10(c.rating)
+            }
+
+            // 1) Temporadas / partes de la misma serie, en orden numerico
+            val seasons = catalog.filter { c ->
+                baseSlug.isNotBlank() && acBaseSlug(c.slug) == baseSlug
+            }.sortedBy { c ->
+                Regex("""(?:-season)?-(\d+)$""").find(c.slug)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            }
+            val used = seasons.mapTo(HashSet()) { it.slug }
+
+            // 2) Similitud de nombre (solapamiento de palabras)
+            val ranked = catalog.filter { it.slug !in used }.map { c ->
+                val t = c.title.ifBlank { acTitleFromSlug(c.slug) }
+                val overlap = acTokens(t).intersect(ownTokens).size
+                val sameBase = baseSlug.isNotBlank() && acBaseSlug(c.slug) == baseSlug
+                Triple(c, overlap + if (sameBase) 3 else 0, acTokens(t).size)
+            }.sortedWith(
+                compareByDescending<Triple<AcCatalogItem, Int, Int>> { it.second }
+                    .thenByDescending { it.third }
+            )
+
+            val out = ArrayList<SearchResponse>()
+            seasons.forEach { out.add(toResp(it)) }
+            ranked.filter { it.second > 0 }.forEach { if (out.size < 16) out.add(toResp(it.first)) }
+            ranked.filter { it.second <= 0 }.map { it.first }.shuffled()
+                .forEach { if (out.size < 16) out.add(toResp(it)) }
+            out.take(16)
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /** Base de slug para agrupar temporadas: "x-season-4" / "x-2" -> "x". */
+    private fun acBaseSlug(slug: String): String =
+        Regex("""-season-\d+$""").replace(slug, "").replace(Regex("""-\d+$"""), "")
+
+    /** Palabras significativas de un titulo (minusculas, sin acentos, len >= 3). */
+    private fun acTokens(title: String): Set<String> =
+        java.text.Normalizer.normalize(title.lowercase(), java.text.Normalizer.Form.NFD)
+            .replace(Regex("""\p{Mn}+"""), "")
+            .replace(Regex("""[^a-z0-9]+"""), " ")
+            .split(" ")
+            .filter { it.length >= 3 && it !in AC_STOPWORDS }
+            .toSet()
 
     // ==================== VERSIONES / SOURCES ====================
 

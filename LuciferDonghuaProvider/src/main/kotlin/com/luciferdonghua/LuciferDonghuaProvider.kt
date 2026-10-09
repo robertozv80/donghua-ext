@@ -225,6 +225,9 @@ class LuciferDonghuaProvider : MainAPI() {
 
         val sortedEpisodes = episodes.sortedBy { it.episode ?: 0 }
 
+        // v4: recomendaciones (similitud de nombre, hasta 16).
+        val recommendations = fetchRecommendations(document, seriesUrl, title)
+
         return newAnimeLoadResponse(title, seriesUrl, TvType.Anime) {
             this.posterUrl = poster
             this.plot = description
@@ -234,8 +237,105 @@ class LuciferDonghuaProvider : MainAPI() {
             if (scoreVal != null) this.score = Score.from10(scoreVal)
             if (durationMin != null && durationMin > 0) this.duration = durationMin
             this.episodes = mutableMapOf(DubStatus.Subbed to sortedEpisodes)
+            if (recommendations.isNotEmpty()) this.recommendations = recommendations
         }
     }
+
+    /**
+     * v4: recomendaciones "como en los primeros providers" — similitud de nombre
+     * (hasta 16 resultados):
+     *  1) Otras temporadas de la misma serie (misma base de slug/titulo) via ?s=,
+     *     ordenadas por numero de temporada;
+     *  2) El bloque "Recommended Series" de la propia ficha;
+     *  3) Relleno aleatorio del catalogo paginado para que varian cada vez.
+     */
+    private suspend fun fetchRecommendations(
+        document: org.jsoup.nodes.Document,
+        seriesUrl: String,
+        seriesTitle: String
+    ): List<SearchResponse> {
+        val all = ArrayList<SearchResponse>()
+        val seen = HashSet<String>()
+        seen.add(seriesUrl)
+
+        val selfSlug = seriesUrl.trimEnd('/').substringAfterLast('/')
+        val baseSlug = Regex("""-season-\d+$""")
+            .replace(selfSlug, "")
+            .replace(Regex("""-\d+$"""), "")
+        val baseNorm = Regex("""\s+(?:season\s+)?\d+$""")
+            .replace(recommendNormalize(seriesTitle), "").trim()
+
+        // 1) Temporadas del mismo nombre
+        if (baseSlug.isNotBlank() && baseSlug != selfSlug) {
+            try {
+                val q = java.net.URLEncoder.encode(baseSlug.replace("-", " "), "UTF-8")
+                val doc = app.get("$mainUrl/?s=$q", headers = mapOf("User-Agent" to UA)).document
+                val seasons = ArrayList<Pair<Int, SearchResponse>>()
+                doc.select("article").forEach { art ->
+                    val parsed = parseArticleCard(art, withDubStatus = false) ?: return@forEach
+                    val slug = parsed.url.trimEnd('/').substringAfterLast('/')
+                    if (slug in seen || !slug.startsWith(baseSlug)) return@forEach
+                    seen.add(slug)
+                    val num = Regex("""(?:-season)?-(\d+)$""").find(slug)
+                        ?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                    seasons.add(num to parsed)
+                }
+                seasons.sortedBy { it.first }.forEach { all.add(it.second) }
+            } catch (_: Exception) {}
+        }
+
+        val pool = ArrayList<SearchResponse>()
+
+        // 2) "Recommended Series" de la ficha
+        try {
+            val anchor = document.select("h2, h3")
+                .firstOrNull { it.text().contains("Recommended", ignoreCase = true) }
+            var container = anchor?.parent()
+            var hops = 0
+            while (container != null && container.select("article").isEmpty() && hops < 4) {
+                container = container.nextElementSibling()
+                hops++
+            }
+            container?.select("article")?.forEach { art ->
+                val parsed = parseArticleCard(art, withDubStatus = false) ?: return@forEach
+                val slug = parsed.url.trimEnd('/').substringAfterLast('/')
+                if (slug in seen) return@forEach
+                seen.add(slug)
+                pool.add(parsed)
+            }
+        } catch (_: Exception) {}
+
+        // 3) Relleno aleatorio del catalogo
+        if (all.size + pool.size < 16) {
+            try {
+                val catDoc = app.get("$mainUrl/anime/", headers = mapOf("User-Agent" to UA)).document
+                val lastPage = catDoc.select("a[href*=/anime/page/]").mapNotNull {
+                    Regex("""/anime/page/(\d+)/""").find(it.attr("href"))?.groupValues?.get(1)?.toIntOrNull()
+                }.maxOrNull() ?: 1
+                val page = if (lastPage > 1) (1..minOf(lastPage, 60)).random() else 1
+                val pageDoc = if (page == 1) catDoc
+                else app.get("$mainUrl/anime/page/$page/", headers = mapOf("User-Agent" to UA)).document
+                pageDoc.select("article").forEach { art ->
+                    if (pool.size >= 40) return@forEach
+                    val parsed = parseArticleCard(art, withDubStatus = false) ?: return@forEach
+                    val slug = parsed.url.trimEnd('/').substringAfterLast('/')
+                    if (slug in seen) return@forEach
+                    seen.add(slug)
+                    pool.add(parsed)
+                }
+            } catch (_: Exception) {}
+        }
+
+        pool.shuffle()
+        all.addAll(pool)
+        return all.take(16)
+    }
+
+    /** Normaliza un titulo para comparar bases (minusculas, sin acentos ni simbolos). */
+    private fun recommendNormalize(t: String): String =
+        java.text.Normalizer.normalize(t.lowercase(), java.text.Normalizer.Form.NFD)
+            .replace(Regex("""\p{Mn}+"""), "")
+            .replace(Regex("""[^a-z0-9]+"""), " ").trim()
 
     /** Valor de un campo del bloque .spe del tema: "Status: Ongoing" -> "Ongoing". */
     private fun speValue(document: org.jsoup.nodes.Document, key: String): String? {
