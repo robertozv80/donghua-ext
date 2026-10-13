@@ -364,7 +364,9 @@ class TioDonghuaProvider : MainAPI() {
         // donghualife.png"; CloudStream no expone hero/spotlight a los plugins,
         // esta es la fila más grande que permite la API).
         return newHomePageResponse(
-            list = HomePageList(request.name, items.distinctBy { it.url }, isHorizontalImages = isHome),
+            // v25 (usuario): cards de "Últimos Episodios" al mismo tamaño que
+            // el resto de secciones (la fila horizontal las achicaba).
+            list = HomePageList(request.name, items.distinctBy { it.url }, isHorizontalImages = false),
             hasNext = hasNext
         )
     }

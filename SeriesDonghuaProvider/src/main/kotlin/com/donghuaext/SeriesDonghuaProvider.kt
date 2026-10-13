@@ -117,8 +117,9 @@ class SeriesDonghuaProvider : MainAPI() {
         }
 
         return newHomePageResponse(
-            // v24.2: fila horizontal de posters para "Nuevos Episodios"
-            list = HomePageList(request.name, items.distinctBy { it.url }, isHorizontalImages = isHome),
+            // v25 (usuario): cards de "Nuevos Episodios" del MISMO tamaño que el
+            // resto (la fila horizontal las achicaba en la app).
+            list = HomePageList(request.name, items.distinctBy { it.url }, isHorizontalImages = false),
             hasNext = doc.select("ul.pagination a.page-link[href]")
                 .any { it.attr("href").contains("page=${page + 1}") }
         )

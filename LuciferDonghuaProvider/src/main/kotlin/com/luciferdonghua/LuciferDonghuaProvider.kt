@@ -1,6 +1,7 @@
 package com.luciferdonghua
 
 import com.lagradost.cloudstream3.*
+import com.donghuaext.common.CommonExtractors as CE
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
@@ -429,59 +430,15 @@ class LuciferDonghuaProvider : MainAPI() {
     }
 
     // ==================== EXTRACTORES ====================
+    //
+    // v25: Dailymotion / Rumble / Ok.ru delegan en el extractor común
+    // (com.donghuaext.common.CommonExtractors). Gains: variantes AV1 descartadas
+    // (pantalla negra en devices sin decodificador), dedupe por video, y un flujo
+    // único contra el reto de Cloudflare de Rumble.
+    /** Dedupe por video de Dailymotion entre todos los mirrors del episodio. */
+    private val emittedDmVids = mutableSetOf<String>()
 
-    private fun unescJson(s: String): String {
-        val sb = StringBuilder(s.length)
-        var i = 0
-        while (i < s.length) {
-            val c = s[i]
-            if (c == '\\' && i + 1 < s.length) {
-                when (s[i + 1]) {
-                    'u' -> {
-                        val hex = s.substring(i + 2, (i + 6).coerceAtMost(s.length))
-                        val code = hex.toIntOrNull(16)
-                        if (code != null) {
-                            sb.append(code.toChar())
-                            i += 6
-                        } else {
-                            sb.append(s[i + 1])
-                            i += 2
-                        }
-                    }
-                    'n' -> { sb.append('\n'); i += 2 }
-                    't' -> { sb.append('\t'); i += 2 }
-                    'r' -> { sb.append('\r'); i += 2 }
-                    else -> { sb.append(s[i + 1]); i += 2 }
-                }
-            } else {
-                sb.append(c)
-                i++
-            }
-        }
-        return sb.toString()
-    }
-
-    private fun dmSubtitlesBlock(json: String): String? {
-        val start = json.indexOf("\"subtitles\"")
-        if (start < 0) return null
-        val dataIdx = json.indexOf("\"data\"", start)
-        if (dataIdx < 0) return null
-        val open = json.indexOf('{', dataIdx)
-        if (open < 0) return null
-        var depth = 0
-        for (i in open until json.length) {
-            when (json[i]) {
-                '{' -> depth++
-                '}' -> {
-                    depth--
-                    if (depth == 0) return json.substring(open, i + 1)
-                }
-            }
-        }
-        return null
-    }
-
-    /** Dailymotion via metadata: subs es* (Spanish) primero, en* despues; HLS + MP4. */
+    /** Dailymotion via el extractor común (subs es/en, HLS h264-first, MP4). */
     private suspend fun extractDailymotion(
         iframeSrc: String,
         referer: String,
@@ -490,177 +447,27 @@ class LuciferDonghuaProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val vid = Regex(
-            """(?:geo\.dailymotion\.com/player(?:/[a-z0-9]+)?\.html\?video=|dailymotion\.com/embed/video/)([A-Za-z0-9]+)""",
-            RegexOption.IGNORE_CASE
-        ).find(iframeSrc)?.groupValues?.get(1) ?: return false
-        return try {
-            val metaUrl = "https://www.dailymotion.com/player/metadata/video/$vid" +
-                "?embedder=" + java.net.URLEncoder.encode(referer, "UTF-8") + "&integration=inline"
-            // FIX v2: DM ahora escapa las barras en el JSON (https:\/\/...) -> desescapar
-            // antes de aplicar regex, si no ni el HLS ni los subs salen.
-            val json = app.get(metaUrl, referer = referer, headers = mapOf("User-Agent" to UA), timeout = 20L)
-                .text.replace("\\/", "/").replace("\\u0026", "&")
-
-            // Subtitulos: pistas "es*" = ESPANOL (prioridad 0), "en*" = ingles (1)
-            dmSubtitlesBlock(json)?.let { block ->
-                Regex(""""(es[a-z-]*|en[a-z-]*)":\s*\{[^{}]*?"urls":\["([^"]+)"""")
-                    .findAll(block)
-                    .map { it.groupValues[1] to unescJson(it.groupValues[2]) }
-                    .distinctBy { it.second }
-                    .sortedBy { (code, _) -> if (code.startsWith("es")) 0 else 1 }
-                    .forEach { (code, url) ->
-                        if (emittedSubs.add(url)) {
-                            subtitleCallback.invoke(
-                                SubtitleFile(if (code.startsWith("es")) "Spanish" else "English", url)
-                            )
-                        }
-                    }
-            }
-
-            var found = false
-            Regex(""""url":"(https://[^"]+?\.m3u8[^"]*)"""").findAll(json)
-                .map { unescJson(it.groupValues[1]) }
-                .firstOrNull()
-                ?.let { hls ->
-                    try {
-                        generateM3u8(linkName, hls, "https://www.dailymotion.com/").forEach(callback)
-                        found = true
-                    } catch (_: Exception) {}
-                }
-            Regex(""""(\d{3,4})":\s*\[\s*\{\s*"type":\s*"video/mp4"\s*,\s*"url":\s*"([^"]+)"""")
-                .findAll(json)
-                .forEach { m ->
-                    val h = m.groupValues[1].toIntOrNull()
-                    callback(
-                        newExtractorLink(source = linkName, name = linkName, url = unescJson(m.groupValues[2])) {
-                            this.referer = "https://www.dailymotion.com/"
-                            this.quality = when {
-                                h == null -> Qualities.Unknown.value
-                                h >= 1080 -> Qualities.P1080.value
-                                h >= 720 -> Qualities.P720.value
-                                h >= 480 -> Qualities.P480.value
-                                else -> Qualities.P360.value
-                            }
-                        }
-                    )
-                    found = true
-                }
-            found
-        } catch (_: Exception) {
-            false
-        }
+        return CE.extractDailymotion(iframeSrc, referer, linkName, UA, emittedSubs, emittedDmVids, subtitleCallback, callback)
     }
 
-    /** Rumble via API embedJS (puerto de TioDonghuaProvider v24.12). */
+    /** Rumble via el extractor común (embedJS doble intento contra el WAF). */
     private suspend fun extractRumble(
         embedUrl: String,
         referer: String,
         linkName: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        return try {
-            val vid = Regex("""rumble\.com/(?:embed/)?(v[a-zA-Z0-9]+)""").find(embedUrl)?.groupValues?.get(1)
-                ?: return false
-            val api = "https://rumble.com/embedJS/u3/?request=video&v=$vid" +
-                "&embed=" + java.net.URLEncoder.encode(embedUrl, "UTF-8")
-            val uaMap = Regex("\"(\\d{3,4})\":\\[\"(https://[a-z0-9.]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4)\"")
-            suspend fun emit(json: String): Int {
-                val fixed = json.replace("\\/", "/")
-                var n = 0
-                uaMap.findAll(fixed).forEach { m ->
-                    val h = m.groupValues[1].toIntOrNull()
-                    callback(
-                        newExtractorLink(source = linkName, name = linkName, url = m.groupValues[2]) {
-                            this.referer = "https://rumble.com/"
-                            this.quality = when {
-                                h == null -> Qualities.Unknown.value
-                                h >= 1080 -> Qualities.P1080.value
-                                h >= 720 -> Qualities.P720.value
-                                h >= 480 -> Qualities.P480.value
-                                else -> Qualities.P360.value
-                            }
-                        }
-                    )
-                    n++
-                }
-                return n
-            }
-            var json = try {
-                app.get(api, referer = "https://rumble.com/", headers = mapOf("User-Agent" to UA), timeout = 20L).text
-            } catch (_: Exception) { "" }
-            var count = if (json.isNotBlank()) emit(json) else 0
-            if (count == 0) {
-                // WAF Cloudflare: visitar el embed primero y reintentar con la cookie
-                try {
-                    app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to UA), timeout = 20L)
-                } catch (_: Exception) {}
-                json = try {
-                    app.get(api, referer = embedUrl, headers = mapOf("User-Agent" to UA), timeout = 20L).text
-                } catch (_: Exception) { "" }
-                if (json.isNotBlank()) count = emit(json)
-            }
-            count > 0
-        } catch (_: Exception) {
-            false
-        }
+        return CE.extractRumble(embedUrl, referer, linkName, UA, callback)
     }
 
-    /** Ok.Ru via data-options (puerto de TioDonghuaProvider). */
+    /** Ok.Ru via el extractor común (data-options: HLS + progresivos). */
     private suspend fun extractOkRu(
         embedUrl0: String,
         referer: String,
         linkName: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        return try {
-            val url = if (embedUrl0.startsWith("//")) "https:$embedUrl0" else embedUrl0
-            val html = app.get(url, referer = referer, headers = mapOf("User-Agent" to UA), timeout = 20L).text
-            val decodeUnicode = { s: String ->
-                Regex("""\\u([0-9a-fA-F]{4})""").replace(s) { m ->
-                    m.groupValues[1].toInt(16).toChar().toString()
-                }
-            }
-            val options = Regex("data-options=\"([^\"]+)\"").find(html)
-                ?.groupValues?.get(1)
-                ?.let { it.replace("&quot;", "\"").replace("\\/", "/").let(decodeUnicode) }
-                ?: return false
-            var found = false
-            val hlsUrl = Regex("\"(?:[a-zA-Z]*ManifestUrl|ondemandHls)\":\"([^\"]+)\"")
-                .findAll(options).map { it.groupValues[1] }.firstOrNull { candidate ->
-                    try {
-                        app.get(candidate, referer = url, headers = mapOf("User-Agent" to UA), timeout = 20L)
-                            .text.trimStart().startsWith("#EXTM3U")
-                    } catch (_: Exception) { false }
-                }
-            if (hlsUrl != null) {
-                try {
-                    generateM3u8(linkName, hlsUrl, url).forEach(callback)
-                    found = true
-                } catch (_: Exception) {}
-            }
-            Regex("\"name\":\"(mobile|lowest|low|sd|hd|full|super)\",\"url\":\"([^\"]+)\"")
-                .findAll(options).forEach { m ->
-                    val progressive = decodeUnicode(m.groupValues[2])
-                    if (progressive.startsWith("http")) {
-                        val full = if (progressive.startsWith("//")) "https:$progressive" else progressive
-                        callback(
-                            newExtractorLink(source = linkName, name = linkName, url = full) {
-                                this.referer = url
-                                this.quality = when (m.groupValues[1]) {
-                                    "full", "super" -> Qualities.P1080.value
-                                    "hd" -> Qualities.P720.value
-                                    "sd" -> Qualities.P480.value
-                                    else -> Qualities.P360.value
-                                }
-                            }
-                        )
-                        found = true
-                    }
-                }
-            found
-        } catch (_: Exception) {
-            false
-        }
+        return CE.extractOkRu(embedUrl0, referer, linkName, UA, callback)
     }
 }
+

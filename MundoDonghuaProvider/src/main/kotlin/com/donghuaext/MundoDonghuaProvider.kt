@@ -956,11 +956,8 @@ class MundoDonghuaProvider : MainAPI() {
                         }
 
                         // ===== Voe (voe.sx) =====
-                        val voeRegex = Regex("voe\\.sx/e/([a-zA-Z0-9]+)")
-                        val voeId = voeRegex.find(unpack)?.destructured?.component1()
-                        if (!voeId.isNullOrEmpty()) {
-                            embedsFound.add("https://voe.sx/e/$voeId")
-                        }
+                        // v25: eliminado. Auditoria v24.15: 0/17 vivos (404).
+                        // Cada intento costaba 1 request serial al final.
 
                         // ===== Vhide / VidHide (vidhidepro.com) =====
                         val vhPatterns = listOf(
@@ -976,18 +973,8 @@ class MundoDonghuaProvider : MainAPI() {
                             }
                         }
 
-                        // ===== Kaga / VgEmbed (vgembed.com) ===== NEW SERVER
-                        val kagaPatterns = listOf(
-                            Regex("vgembed\\.com/e/([a-zA-Z0-9]+)"),
-                            Regex("vgembed\\.com/v/([a-zA-Z0-9]+)"),
-                        )
-                        for (kagaPattern in kagaPatterns) {
-                            val kagaId = kagaPattern.find(unpack)?.destructured?.component1()
-                            if (!kagaId.isNullOrEmpty()) {
-                                embedsFound.add("https://vgembed.com/e/$kagaId")
-                                break
-                            }
-                        }
+                        // ===== Kaga / VgEmbed (vgembed.com) =====
+                        // v25: eliminado. Auditoria v24.15: 0/7 vivos (404).
 
                         // ===== Swish / StreamWish (embedwish.com) =====
                         val swPatterns = listOf(

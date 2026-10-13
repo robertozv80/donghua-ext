@@ -6,6 +6,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
+import com.donghuaext.common.CommonExtractors as CE
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -496,35 +497,15 @@ class LmAnimeProvider : MainAPI() {
         return sb.toString()
     }
 
-    /** Extrae el bloque JSON subtitles.data del metadata de Dailymotion. */
-    private fun dmSubtitlesBlock(json: String): String? {
-        val start = json.indexOf("\"subtitles\"")
-        if (start < 0) return null
-        val dataIdx = json.indexOf("\"data\"", start)
-        if (dataIdx < 0) return null
-        val open = json.indexOf('{', dataIdx)
-        if (open < 0) return null
-        var depth = 0
-        for (i in open until json.length) {
-            when (json[i]) {
-                '{' -> depth++
-                '}' -> {
-                    depth--
-                    if (depth == 0) return json.substring(open, i + 1)
-                }
-            }
-        }
-        return null
-    }
+    // ==================== EXTRACTORES ====================
+    //
+    // v5: Dailymotion y Ok.ru delegan en el extractor común
+    // (com.donghuaext.common.CommonExtractors): gains = variantes AV1
+    // descartadas (negro/sin audio), dedupe por video y subs es/en estable.
+    /** Dedupe por video de Dailymotion entre todos los mirrors del episodio. */
+    private val emittedDmVids = mutableSetOf<String>()
 
-    /**
-     * Extractor de Dailymotion via API metadata (misma via que usa el reproductor
-     * geo.dailymotion.com). Emite:
-     *  - SubtitleFile de las pistas "es*" (ESPANOL, prioridad) y "en*" (ingles);
-     *  - HLS master ("auto") via generateM3u8;
-     *  - MP4 progresivos por calidad si existen.
-     * Devuelve true si emitio al menos un enlace de video.
-     */
+    /** Dailymotion via el extractor común. */
     private suspend fun extractDailymotion(
         iframeSrc: String,
         referer: String,
@@ -533,129 +514,16 @@ class LmAnimeProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val vid = Regex(
-            """(?:geo\.dailymotion\.com/player(?:/[a-z0-9]+)?\.html\?video=|dailymotion\.com/embed/video/)([A-Za-z0-9]+)""",
-            RegexOption.IGNORE_CASE
-        ).find(iframeSrc)?.groupValues?.get(1) ?: return false
-        return try {
-            val metaUrl = "https://www.dailymotion.com/player/metadata/video/$vid" +
-                "?embedder=" + java.net.URLEncoder.encode(referer, "UTF-8") + "&integration=inline"
-            // FIX v2: DM ahora escapa las barras en el JSON (https:\/\/...) -> desescapar
-            // antes de aplicar regex, si no ni el HLS ni los subs salen.
-            val json = app.get(metaUrl, referer = referer, headers = mapOf("User-Agent" to UA), timeout = 20L)
-                .text.replace("\\/", "/").replace("\\u0026", "&")
-
-            // --- Subtitulos: es* primero (espanol), luego en* (ingles) ---
-            dmSubtitlesBlock(json)?.let { block ->
-                Regex(""""(es[a-z-]*|en[a-z-]*)":\s*\{[^{}]*?"urls":\["([^"]+)"""")
-                    .findAll(block)
-                    .map { it.groupValues[1] to unescJson(it.groupValues[2]) }
-                    .distinctBy { it.second }
-                    .sortedBy { (code, _) -> if (code.startsWith("es")) 0 else 1 }
-                    .forEach { (code, url) ->
-                        if (emittedSubs.add(url)) {
-                            subtitleCallback.invoke(
-                                SubtitleFile(if (code.startsWith("es")) "Spanish" else "English", url)
-                            )
-                        }
-                    }
-            }
-
-            // --- Video HLS (calidad auto) ---
-            var found = false
-            Regex(""""url":"(https://[^"]+?\.m3u8[^"]*)"""").findAll(json)
-                .map { unescJson(it.groupValues[1]) }
-                .firstOrNull()
-                ?.let { hls ->
-                    try {
-                        generateM3u8(linkName, hls, "https://www.dailymotion.com/").forEach(callback)
-                        found = true
-                    } catch (_: Exception) {}
-                }
-
-            // --- MP4 progresivos por calidad ---
-            Regex(""""(\d{3,4})":\s*\[\s*\{\s*"type":\s*"video/mp4"\s*,\s*"url":\s*"([^"]+)"""")
-                .findAll(json)
-                .forEach { m ->
-                    val h = m.groupValues[1].toIntOrNull()
-                    callback(
-                        newExtractorLink(source = linkName, name = linkName, url = unescJson(m.groupValues[2])) {
-                            this.referer = "https://www.dailymotion.com/"
-                            this.quality = when {
-                                h == null -> Qualities.Unknown.value
-                                h >= 1080 -> Qualities.P1080.value
-                                h >= 720 -> Qualities.P720.value
-                                h >= 480 -> Qualities.P480.value
-                                else -> Qualities.P360.value
-                            }
-                        }
-                    )
-                    found = true
-                }
-            found
-        } catch (_: Exception) {
-            false
-        }
+        return CE.extractDailymotion(iframeSrc, referer, linkName, UA, emittedSubs, emittedDmVids, subtitleCallback, callback)
     }
 
-    /**
-     * Extractor de Ok.Ru: el embed trae data-options con el hlsManifestUrl y las
-     * urls progresivas (patron portado de TioDonghuaProvider).
-     */
+    /** Ok.Ru via el extractor común (data-options: HLS + progresivos). */
     private suspend fun extractOkRu(
         embedUrl0: String,
         referer: String,
         linkName: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        return try {
-            val url = if (embedUrl0.startsWith("//")) "https:$embedUrl0" else embedUrl0
-            val html = app.get(url, referer = referer, headers = mapOf("User-Agent" to UA), timeout = 20L).text
-            val decodeUnicode = { s: String ->
-                Regex("""\\u([0-9a-fA-F]{4})""").replace(s) { m ->
-                    m.groupValues[1].toInt(16).toChar().toString()
-                }
-            }
-            val options = Regex("data-options=\"([^\"]+)\"").find(html)
-                ?.groupValues?.get(1)
-                ?.let { it.replace("&quot;", "\"").replace("\\/", "/").let(decodeUnicode) }
-                ?: return false
-            var found = false
-            val hlsUrl = Regex("\"(?:[a-zA-Z]*ManifestUrl|ondemandHls)\":\"([^\"]+)\"")
-                .findAll(options).map { it.groupValues[1] }.firstOrNull { candidate ->
-                    try {
-                        app.get(candidate, referer = url, headers = mapOf("User-Agent" to UA), timeout = 20L)
-                            .text.trimStart().startsWith("#EXTM3U")
-                    } catch (_: Exception) { false }
-                }
-            if (hlsUrl != null) {
-                try {
-                    generateM3u8(linkName, hlsUrl, url).forEach(callback)
-                    found = true
-                } catch (_: Exception) {}
-            }
-            Regex("\"name\":\"(mobile|lowest|low|sd|hd|full|super)\",\"url\":\"([^\"]+)\"")
-                .findAll(options).forEach { m ->
-                    val progressive = decodeUnicode(m.groupValues[2])
-                    if (progressive.startsWith("http")) {
-                        val full = if (progressive.startsWith("//")) "https:$progressive" else progressive
-                        callback(
-                            newExtractorLink(source = linkName, name = linkName, url = full) {
-                                this.referer = url
-                                this.quality = when (m.groupValues[1]) {
-                                    "full", "super" -> Qualities.P1080.value
-                                    "hd" -> Qualities.P720.value
-                                    "sd" -> Qualities.P480.value
-                                    else -> Qualities.P360.value
-                                }
-                            }
-                        )
-                        found = true
-                    }
-                }
-            found
-        } catch (_: Exception) {
-            false
-        }
+        return CE.extractOkRu(embedUrl0, referer, linkName, UA, callback)
     }
 }

@@ -1,6 +1,7 @@
 package com.animecube
 
 import com.lagradost.cloudstream3.*
+import com.donghuaext.common.CommonExtractors as CE
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
@@ -694,6 +695,13 @@ class AnimeCubeProvider : MainAPI() {
         return null
     }
 
+    /**
+     * v5: Dailymotion delega en el extractor común. Aporta:
+     *  - dedupe por video (evita la "misma fuente" repetida por mirror);
+     *  - variantes h264 primero y AV1 descartada cuando hay h264
+     *    (la AV1 dariapantalla negra/sin audio en devices sin decodificador);
+     *  - subs es/en con el mismo orden de prioridad de siempre.
+     */
     private suspend fun extractDailymotion(
         vid: String,
         referer: String,
@@ -702,97 +710,45 @@ class AnimeCubeProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        return try {
-            val metaUrl = "https://www.dailymotion.com/player/metadata/video/$vid" +
-                "?embedder=" + java.net.URLEncoder.encode(referer, "UTF-8") + "&integration=inline"
-            val json = app.get(metaUrl, referer = referer, headers = mapOf("User-Agent" to UA), timeout = 20L)
-                .text.replace("\\/", "/").replace("\\u0026", "&")
-
-            dmSubtitlesBlock(json)?.let { block ->
-                Regex(""""(es[a-z-]*|en[a-z-]*)":\s*\{[^{}]*?"urls":\["([^"]+)"""")
-                    .findAll(block)
-                    .map { it.groupValues[1] to acUnescJson(it.groupValues[2]) }
-                    .distinctBy { it.second }
-                    .sortedBy { (code, _) -> if (code.startsWith("es")) 0 else 1 }
-                    .forEach { (code, url) ->
-                        if (emittedSubs.add(url)) {
-                            subtitleCallback.invoke(
-                                SubtitleFile(if (code.startsWith("es")) "Spanish" else "English", url)
-                            )
-                        }
-                    }
-            }
-
-            var found = false
-            Regex(""""url":"(https://[^"]+?\.m3u8[^"]*)"""").findAll(json)
-                .map { acUnescJson(it.groupValues[1]) }
-                .firstOrNull()
-                ?.let { hls ->
-                    try {
-                        generateM3u8(linkName, hls, "https://www.dailymotion.com/").forEach(callback)
-                        found = true
-                    } catch (_: Exception) {}
-                }
-            Regex(""""(\d{3,4})":\s*\[\s*\{\s*"type":\s*"video/mp4"\s*,\s*"url":\s*"([^"]+)"""")
-                .findAll(json)
-                .forEach { m ->
-                    val h = m.groupValues[1].toIntOrNull()
-                    callback(
-                        newExtractorLink(source = linkName, name = linkName, url = acUnescJson(m.groupValues[2])) {
-                            this.referer = "https://www.dailymotion.com/"
-                            this.quality = when {
-                                h == null -> Qualities.Unknown.value
-                                h >= 1080 -> Qualities.P1080.value
-                                h >= 720 -> Qualities.P720.value
-                                h >= 480 -> Qualities.P480.value
-                                else -> Qualities.P360.value
-                            }
-                        }
-                    )
-                    found = true
-                }
-            found
-        } catch (_: Exception) {
-            false
-        }
+        return CE.extractDailymotion(
+            "https://www.dailymotion.com/embed/video/$vid",
+            referer,
+            linkName,
+            UA,
+            emittedSubs,
+            emittedDmVids,
+            subtitleCallback,
+            callback
+        )
     }
 
+    /** Dedupe por videoId entre sources del mismo episodio (o re-entradas). */
+    private val emittedDmVids = mutableSetOf<String>()
+
+    /**
+     * v5: Rumble delega en el extractor común (doble intento embedJS + visita
+     * previa al embed para el reto de Cloudflare), conservando el fallback HLS.
+     */
     private suspend fun extractRumble(
         vid: String,
         linkName: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        val embed = "https://rumble.com/embed/$vid/"
+        val ok = CE.extractRumble(embed, "$mainUrl/", linkName, UA, callback)
+        if (ok) return true
+        // Fallback HLS que ya tenia el modulo (mismo endpoint embedJS).
         return try {
-            val embed = "https://rumble.com/embed/$vid/"
             val api = "https://rumble.com/embedJS/u3/?request=video&v=$vid" +
                 "&embed=" + java.net.URLEncoder.encode(embed, "UTF-8")
-            val json = app.get(api, referer = "https://rumble.com/", headers = mapOf("User-Agent" to UA), timeout = 20L)
+            val json = app.get(api, referer = embed, headers = mapOf("User-Agent" to UA), timeout = 20L)
                 .text.replace("\\/", "/")
-            var found = false
-            Regex(""""(\d{3,4})":\["(https://[a-z0-9.]*rumble\.cloud/video/[A-Za-z0-9/._-]+\.mp4)"""")
-                .findAll(json).forEach { m ->
-                    val h = m.groupValues[1].toIntOrNull()
-                    callback(
-                        newExtractorLink(source = linkName, name = linkName, url = m.groupValues[2]) {
-                            this.referer = "https://rumble.com/"
-                            this.quality = when {
-                                h == null -> Qualities.Unknown.value
-                                h >= 1080 -> Qualities.P1080.value
-                                h >= 720 -> Qualities.P720.value
-                                h >= 480 -> Qualities.P480.value
-                                else -> Qualities.P360.value
-                            }
-                        }
-                    )
-                    found = true
-                }
             Regex(""""hls":\{"url":"(https://rumble\.com/hls-vod/[^"]+)"""").find(json)?.let { m ->
                 try {
                     generateM3u8(linkName, m.groupValues[1], embed).forEach(callback)
-                    found = true
                 } catch (_: Exception) {}
-            }
-            found
+                true
+            } ?: false
         } catch (_: Exception) {
             false
         }

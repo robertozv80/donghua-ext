@@ -1,6 +1,7 @@
 package com.animexin
 
 import com.lagradost.cloudstream3.*
+import com.donghuaext.common.CommonExtractors as CE
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
@@ -402,8 +403,10 @@ class AnimeXinProvider : MainAPI() {
         val emittedSubs = mutableSetOf<String>()
         var found = false
 
-        // Prioridad: "All Sub" (subs ES/EN reales) -> resto de Dailymotion ->
-        // Odysee/Rumble/Ok.ru/otros. sortedBy es estable.
+        // Prioridad: "All Sub" (subs ES/EN reales y hosts extraibles) -> resto de
+        // Dailymotion -> Odysee/Rumble/Ok.ru/Dood. sortedBy es estable y ya NO
+        // se corta al primer impacto: antes los mirrors de Streamwish/Rumble/Dood
+        // (prio 5) se saltaban en cuanto un Dailymotion funcionaba.
         val prio = { label: String ->
             val l = label.lowercase()
             when {
@@ -411,26 +414,32 @@ class AnimeXinProvider : MainAPI() {
                 l.contains("dailymotion") && l.contains("english") -> 1
                 l.contains("dailymotion") -> 2
                 l.contains("odysee") && l.contains("english") -> 3
-                l.contains("ok.ru") && l.contains("english") -> 4
-                else -> 5
+                l.contains("rumble") -> 4
+                l.contains("ok.ru") -> 5
+                l.contains("dood") -> 6
+                l.contains("odysee") -> 7
+                else -> 8
             }
         }
 
+        val emittedVids = mutableSetOf<String>()
         for ((label, iframeHtml) in mirrors.sortedBy { prio(it.first) }) {
             val iframeSrc = Regex("""src=["']([^"']+)["']""").find(iframeHtml)?.groupValues?.get(1)
                 ?: continue
             val fixed = if (iframeSrc.startsWith("//")) "https:$iframeSrc" else iframeSrc
-            val isPrimary = prio(label) <= 2 // All Sub + todos los Dailymotion
-            if (!isPrimary && found) break   // fallbacks solo si nada primario funcionó
 
             val ok = when {
                 fixed.contains("dailymotion", ignoreCase = true) ->
-                    extractDailymotion(fixed, "$mainUrl/", label, emittedSubs, subtitleCallback, callback)
+                    CE.extractDailymotion(fixed, "$mainUrl/", label, UA, emittedSubs, emittedVids, subtitleCallback, callback)
+                fixed.contains("rumble.com", ignoreCase = true) ->
+                    CE.extractRumble(fixed, "$mainUrl/", label, UA, callback)
+                DOOD_HOST.containsMatchIn(fixed) ->
+                    CE.extractDood(fixed, "$mainUrl/", label, UA, emittedSubs, subtitleCallback, callback)
+                fixed.contains("ok.ru", ignoreCase = true) ->
+                    CE.extractOkRu(fixed, "$mainUrl/", label, UA, callback)
                 fixed.contains("odysee.com", ignoreCase = true) ->
                     extractOdysee(fixed, data, label, callback)
-                DOOD_HOST.containsMatchIn(fixed) ->
-                    extractDood(fixed, "$mainUrl/", label, emittedSubs, subtitleCallback, callback)
-                else -> false // Dtube/Mega/Streamwish: no extraibles o muertos
+                else -> false // Dtube/Mega/Streamwish(seekplayer): no extraibles o muertos
             }
             if (ok) found = true
         }
@@ -490,75 +499,7 @@ class AnimeXinProvider : MainAPI() {
         return null
     }
 
-    /** Dailymotion via metadata: subs es* (Spanish) primero, en* (English) despues. */
-    private suspend fun extractDailymotion(
-        iframeSrc: String,
-        referer: String,
-        linkName: String,
-        emittedSubs: MutableSet<String>,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val vid = Regex(
-            """(?:geo\.dailymotion\.com/player(?:/[a-z0-9]+)?\.html\?video=|dailymotion\.com/embed/video/)([A-Za-z0-9]+)""",
-            RegexOption.IGNORE_CASE
-        ).find(iframeSrc)?.groupValues?.get(1) ?: return false
-        return try {
-            val metaUrl = "https://www.dailymotion.com/player/metadata/video/$vid" +
-                "?embedder=" + java.net.URLEncoder.encode(referer, "UTF-8") + "&integration=inline"
-            // FIX v2: DM ahora escapa las barras en el JSON (https:\/\/...) -> desescapar
-            // antes de aplicar regex, si no ni el HLS ni los subs salen.
-            val json = app.get(metaUrl, referer = referer, headers = mapOf("User-Agent" to UA), timeout = 20L)
-                .text.replace("\\/", "/").replace("\\u0026", "&")
-
-            dmSubtitlesBlock(json)?.let { block ->
-                Regex(""""(es[a-z-]*|en[a-z-]*)":\s*\{[^{}]*?"urls":\["([^"]+)"""")
-                    .findAll(block)
-                    .map { it.groupValues[1] to unescJson(it.groupValues[2]) }
-                    .distinctBy { it.second }
-                    .sortedBy { (code, _) -> if (code.startsWith("es")) 0 else 1 }
-                    .forEach { (code, url) ->
-                        if (emittedSubs.add(url)) {
-                            subtitleCallback.invoke(
-                                SubtitleFile(if (code.startsWith("es")) "Spanish" else "English", url)
-                            )
-                        }
-                    }
-            }
-
-            var found = false
-            Regex(""""url":"(https://[^"]+?\.m3u8[^"]*)"""").findAll(json)
-                .map { unescJson(it.groupValues[1]) }
-                .firstOrNull()
-                ?.let { hls ->
-                    try {
-                        generateM3u8(linkName, hls, "https://www.dailymotion.com/").forEach(callback)
-                        found = true
-                    } catch (_: Exception) {}
-                }
-            Regex(""""(\d{3,4})":\s*\[\s*\{\s*"type":\s*"video/mp4"\s*,\s*"url":\s*"([^"]+)"""")
-                .findAll(json)
-                .forEach { m ->
-                    val h = m.groupValues[1].toIntOrNull()
-                    callback(
-                        newExtractorLink(source = linkName, name = linkName, url = unescJson(m.groupValues[2])) {
-                            this.referer = "https://www.dailymotion.com/"
-                            this.quality = when {
-                                h == null -> Qualities.Unknown.value
-                                h >= 1080 -> Qualities.P1080.value
-                                h >= 720 -> Qualities.P720.value
-                                h >= 480 -> Qualities.P480.value
-                                else -> Qualities.P360.value
-                            }
-                        }
-                    )
-                    found = true
-                }
-            found
-        } catch (_: Exception) {
-            false
-        }
-    }
+    // Dailymotion y Dood viven en el extractor común (com.donghuaext.common).
 
     /**
      * Odysee: hardsub EN/ID embebido en el stream HLS del embed (iframe con
@@ -591,68 +532,6 @@ class AnimeXinProvider : MainAPI() {
                 }
             }
             found
-        } catch (_: Exception) {
-            false
-        }
-    }
-
-    /**
-     * DoodStream (dooood.com -> playmogo.com). Flujo anonimo verificado 2026-10:
-     *   1) GET /e/<id>  ->  pagina con `$.get('/pass_md5/<hash>/<token>', ...)` y
-     *      `makePlay()` = 10 chars aleatorios + "?token=<token>&expiry="+Date.now().
-     *   2) GET /pass_md5/<hash>/<token> (Referer: pagina embed) -> prefijo de URL.
-     *   3) URL final = prefijo + random10 + "?token=...&expiry=..." (mp4 progresivo).
-     * Ademas la pagina lista las pistas VTT multi-idioma en srt.doodcdn.io
-     * (incluye Spanish), que son los subtitulos del servidor "All Sub".
-     *
-     * Nota: el CDN del video EXIGE Referer del host Dood; sin el responde 302.
-     */
-    private suspend fun extractDood(
-        embedUrl: String,
-        referer: String,
-        linkName: String,
-        emittedSubs: MutableSet<String>,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        return try {
-            val html = app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to UA), timeout = 25L).text
-
-            // /pass_md5/<hash>/<token>  (el hash lleva guiones)
-            val m = Regex("""/pass_md5/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)""").find(html) ?: return false
-            val path = m.value
-            val token = m.groupValues[2]
-            val origin = Regex("""^https?://[^/]+""").find(embedUrl)?.value ?: return false
-
-            val base = app.get(
-                "$origin$path",
-                referer = embedUrl,
-                headers = mapOf("User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest"),
-                timeout = 25L
-            ).text.trim()
-            if (base.isEmpty() || !base.startsWith("http")) return false
-
-            // Pistas de subtitulos VTT (multi-idioma) expuestas en la pagina
-            Regex("""\{src:'([^']+)',\s*label:'([^']*)',kind:'captions',srclang:'[^']*'\}""")
-                .findAll(html)
-                .forEach { sm ->
-                    val raw = sm.groupValues[1]
-                    if (raw.startsWith("data:")) return@forEach
-                    val url = if (raw.startsWith("//")) "https:$raw" else raw
-                    val label = sm.groupValues[2].trim().ifEmpty { "Subtitle" }
-                    if (emittedSubs.add(url)) subtitleCallback.invoke(SubtitleFile(label, url))
-                }
-
-            val rnd = (1..10).map { DOOD_RAND_CHARS.random() }.joinToString("")
-            val finalUrl = "$base$rnd?token=$token&expiry=${System.currentTimeMillis()}"
-
-            callback(
-                newExtractorLink(source = linkName, name = linkName, url = finalUrl) {
-                    this.referer = "$origin/"
-                    this.quality = Qualities.Unknown.value
-                }
-            )
-            true
         } catch (_: Exception) {
             false
         }

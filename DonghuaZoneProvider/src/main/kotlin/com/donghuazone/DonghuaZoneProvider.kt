@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
+import com.donghuaext.common.CommonExtractors as CE
 
 /**
  * DonghuaZone (https://www.donghuazone.com/) — Blogger (Blogspot) con plantilla
@@ -56,8 +57,26 @@ class DonghuaZoneProvider : MainAPI() {
             "Erotica", "Hentai", "Danger", "Hot", "Sub", "Episode", "Eps. Donghua"
         )
 
-        /** Labels meta que NO son generos reales (se excluyen de los tags de la ficha). */
-        private val META_LABELS = setOf("Danger", "Hot", "Sub", "Episode", "Eps. Donghua")
+        /** Labels meta que NO son generos ni series reales (verificados en el feed
+         *  2026-10: las fichas llevan ademas Censored/China/Donghua/Movie/Series/
+         *  Ongoing/"Summer 2026" y la nota como label "8.50"). */
+        private val META_LABELS = setOf(
+            "Danger", "Hot", "Sub", "Episode", "Eps. Donghua", "Movie", "Series",
+            "Ongoing", "Completed", "Censored", "China", "Donghua"
+        )
+
+        /** Labels meta con FORMATO variable: estaciones ("Summer 2026") y notas ("8.50"). */
+        private val META_LABEL_PATTERNS = listOf(
+            Regex("""^(?:Spring|Summer|Fall|Winter)\s+\d{4}$""", RegexOption.IGNORE_CASE),
+            Regex("""^\d\.\d+$"""),
+            Regex("""^Eps?\.?"""),
+            Regex("""^\d{4}$""")
+        )
+
+        /** true si el label es meta bajo forma variable (estacion/nota/digito). */
+        private fun isMetaLikeLabel(l: String): Boolean =
+            META_LABEL_PATTERNS.any { it.containsMatchIn(l.trim()) } ||
+                Regex("""\d{4}""").containsMatchIn(l)
     }
 
     // ==================== MAIN PAGE ====================
@@ -107,9 +126,19 @@ class DonghuaZoneProvider : MainAPI() {
             .replace(Regex("""\s*[\[(].*?[\])]\s*$"""), "")
             .trim()
 
+        // v5 (3.3): la nota del sitio viaja como label "8.50"; se muestra sobre
+        // el poster en el home y en los carruseles de Movies/Recomendado.
+        val scoreVal = entry.optJSONArray("category")?.let { cats ->
+            (0 until cats.length()).firstNotNullOfOrNull { i ->
+                cats.optJSONObject(i)?.optString("term")?.trim()
+                    ?.let { Regex("""^\d\.\d+$""").matchEntire(it)?.value }?.toDoubleOrNull()
+            }
+        }?.takeIf { it > 0.0 }
+
         return newAnimeSearchResponse(cleanTitle, url) {
             this.posterUrl = img
             addDubStatus(DubStatus.Subbed, epNum)
+            if (scoreVal != null) this.score = Score.from10(scoreVal)
         }
     }
 
@@ -181,6 +210,10 @@ class DonghuaZoneProvider : MainAPI() {
         val isEpisode = url.contains(Regex("""/\d{4}/\d{2}/.+\.html$"""))
         var seriesLabel = ""
         var firstPostTitle = ""
+        var firstPostContent = ""
+        var ratingSelf: Double? = null
+        var posterSelf = ""
+        var yearSelf: Int? = null
         if (isEpisode) {
             val slug = url.substringAfterLast("/").removeSuffix(".html")
             // El feed q= del slug trae el post; sus labels incluyen la serie
@@ -190,8 +223,33 @@ class DonghuaZoneProvider : MainAPI() {
                 if (link != null && (link == url || link.contains(slug))) {
                     val cats = entry.optJSONArray("category")
                     val labels = (0 until (cats?.length() ?: 0)).mapNotNull { cats?.optJSONObject(it)?.optString("term") }
-                    seriesLabel = labels.lastOrNull { !isGenreLabel(it) && it != "Eps. Donghua" } ?: ""
+                    // v5: "el ULTIMO label" era "Summer 2026"/"Eps. Movie"/etc. y la
+                    // ficha salia vacia. Ahora se elige el label no-genero/meta que
+                    // mas se parezca al titulo del post; si ninguno hay parecido,
+                    // el primero del conjunto no-meta (orden estable).
+                    seriesLabel = labels
+                        .filter { !isGenreLabel(it) && it !in META_LABELS && !isMetaLikeLabel(it) }
+                        .maxByOrNull { dzRecNormalize(it).takeIf { n -> n.isNotBlank() }
+                            ?.let { n -> dzRecNormalize(firstPostTitleFallback(url)).indexOf(n) } ?: -1 }
+                        ?.takeIf { dzRecNormalize(it).isNotBlank() }
+                        ?: labels.firstOrNull { !isGenreLabel(it) && it !in META_LABELS && !isMetaLikeLabel(it) }
+                        ?: ""
+                    // La nota viaja como label "8.50"; y el doble post (movie) cambia
+                    // el titulo por lo que guardamos datos del proprio post.
+                    ratingSelf = labels.firstNotNullOfOrNull { lbl ->
+                        Regex("""^\d\.\d+$""").matchEntire(lbl.trim())?.value?.toDoubleOrNull()
+                    }
                     firstPostTitle = entry.optJSONObject("title")?.optString("\$t") ?: ""
+                    firstPostContent = entry.optJSONObject("content")?.optString("\$t") ?: ""
+                    posterSelf = entry.optJSONObject("media\$thumbnail")?.optString("url")
+                        ?.replace(Regex("/s\\d+(-c)?/"), "/s0/") ?: ""
+                    yearSelf = entry.optString("published")?.take(4)?.toIntOrNull()
+
+                    // Para fichas de Movie/serie sin post aparte: si el propio post
+                    // trae sinopsis (content enriquecio con .descNime), usamos eso.
+                    if (seriesLabel.isBlank() && firstPostContent.isNotBlank()) {
+                        seriesLabel = entry.optJSONObject("title")?.optString("\$t")?.take(80) ?: ""
+                    }
                     break
                 }
             }
@@ -262,6 +320,14 @@ class DonghuaZoneProvider : MainAPI() {
             startIndex += PAGE_SIZE
         }
 
+        // v5 (3.1): si el feed de serie no expuso sinopsis (posts de Movie o
+        // series sin post propio), usar el content del post recibido: la web
+        // lo mete en <div class='descNime'><p>Sinopsis. ...</p></div>.
+        val selfPlotPlain = stripHtml(
+            firstPostContent.substringAfter("class='descNime'", "").substringBefore("</p>")
+        ).ifBlank { stripHtml(firstPostContent).take(1200) }
+        val finalPlot = seriesPlot.ifBlank { selfPlotPlain }
+
         val sorted = episodes.sortedBy { it.episode ?: 0 }
         val displayName = seriesLabel.replace(Regex("""\b[a-z]""")) { it.value.uppercase() }
 
@@ -269,15 +335,23 @@ class DonghuaZoneProvider : MainAPI() {
         val recommendations = fetchRecommendations(seriesLabel, url)
 
         return newAnimeLoadResponse(displayName, if (isEpisode) url else "$mainUrl/search/label/$labelEnc", TvType.Anime) {
-            this.plot = if (seriesPlot.isNotBlank()) seriesPlot
+            this.plot = if (finalPlot.isNotBlank()) finalPlot
             else "Donghua 4K con subtitulos (Indonesia/English). Servidor: Dailymotion (Multi Sub)."
             if (seriesThumb.isNotBlank()) this.posterUrl = seriesThumb
+            if (seriesThumb.isBlank() && posterSelf.isNotBlank()) this.posterUrl = posterSelf
+            // v5 (3.3): la nota viaja como label "8.50" en el post de la serie.
+            if (ratingSelf != null) this.score = Score.from10(ratingSelf!!)
             if (genreLabels.isNotEmpty()) this.tags = genreLabels.toList()
             if (seriesYear != null && seriesYear in 1900..2100) this.year = seriesYear
+            else if (yearSelf != null && yearSelf in 1900..2100) this.year = yearSelf
             this.episodes = mutableMapOf(DubStatus.Subbed to sorted)
             if (recommendations.isNotEmpty()) this.recommendations = recommendations
         }
     }
+
+    /** Titulo plano del slug del post (para comparar labels y el nombre base). */
+    private fun firstPostTitleFallback(url: String): String =
+        url.substringAfterLast("/").removeSuffix(".html").replace("-", " ")
 
     /**
      * v3: recomendaciones "como en los primeros providers" — similitud de nombre
@@ -340,7 +414,7 @@ class DonghuaZoneProvider : MainAPI() {
     private fun seriesLabelOf(entry: org.json.JSONObject): String? {
         val cats = entry.optJSONArray("category") ?: return null
         val labels = (0 until cats.length()).mapNotNull { cats.optJSONObject(it)?.optString("term") }
-        return labels.lastOrNull { !isGenreLabel(it) && it != "Eps. Donghua" }
+        return labels.filter { !isGenreLabel(it) && it !in META_LABELS && !isMetaLikeLabel(it) }.firstOrNull()
     }
 
     /** Normaliza un titulo para comparar bases (minusculas, sin acentos ni simbolos). */
@@ -388,131 +462,18 @@ class DonghuaZoneProvider : MainAPI() {
         }
 
         val emittedSubs = mutableSetOf<String>()
+        val emittedVids = mutableSetOf<String>()
         var found = false
         for ((u, label) in sorted) {
-            val dmVid = Regex("""(?:geo\.dailymotion\.com/player(?:/[a-z0-9]+)?\.html\?video=|dailymotion\.com/embed/video/)([A-Za-z0-9]+)""", RegexOption.IGNORE_CASE)
-                .find(u)?.groupValues?.get(1)
-            if (dmVid != null) {
-                val ok = extractDailymotion(dmVid, "$mainUrl/", "Dailymotion ($label)", emittedSubs, subtitleCallback, callback)
-                if (ok) found = true
-            }
+            // v5 (3.2): el extractor común deduplica por video (los posts del sitio
+            // repiten el mismo Dailymotion en 2+ botones -> "fuentes duplicadas")
+            // y descarta variantes AV1 (negro/sin audio); h264 primero.
+            val ok = CE.extractDailymotion(u, "$mainUrl/", "Dailymotion ($label)", UA, emittedSubs, emittedVids, subtitleCallback, callback)
+            if (ok) found = true
         }
         return found
     }
 
     // ==================== EXTRACTORES ====================
 
-    private fun dmSubtitlesBlock(json: String): String? {
-        val start = json.indexOf("\"subtitles\"")
-        if (start < 0) return null
-        val dataIdx = json.indexOf("\"data\"", start)
-        if (dataIdx < 0) return null
-        val open = json.indexOf('{', dataIdx)
-        if (open < 0) return null
-        var depth = 0
-        for (i in open until json.length) {
-            when (json[i]) {
-                '{' -> depth++
-                '}' -> {
-                    depth--
-                    if (depth == 0) return json.substring(open, i + 1)
-                }
-            }
-        }
-        return null
-    }
-
-    private fun unescJson(s: String): String {
-        val sb = StringBuilder(s.length)
-        var i = 0
-        while (i < s.length) {
-            val c = s[i]
-            if (c == '\\' && i + 1 < s.length) {
-                when (s[i + 1]) {
-                    'u' -> {
-                        val hex = s.substring(i + 2, (i + 6).coerceAtMost(s.length))
-                        val code = hex.toIntOrNull(16)
-                        if (code != null) {
-                            sb.append(code.toChar())
-                            i += 6
-                        } else {
-                            sb.append(s[i + 1])
-                            i += 2
-                        }
-                    }
-                    'n' -> { sb.append('\n'); i += 2 }
-                    't' -> { sb.append('\t'); i += 2 }
-                    'r' -> { sb.append('\r'); i += 2 }
-                    else -> { sb.append(s[i + 1]); i += 2 }
-                }
-            } else {
-                sb.append(c)
-                i++
-            }
-        }
-        return sb.toString()
-    }
-
-    private suspend fun extractDailymotion(
-        vid: String,
-        referer: String,
-        linkName: String,
-        emittedSubs: MutableSet<String>,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        return try {
-            val metaUrl = "https://www.dailymotion.com/player/metadata/video/$vid" +
-                "?embedder=" + java.net.URLEncoder.encode(referer, "UTF-8") + "&integration=inline"
-            val json = app.get(metaUrl, referer = referer, headers = mapOf("User-Agent" to UA), timeout = 20L)
-                .text.replace("\\/", "/").replace("\\u0026", "&")
-
-            dmSubtitlesBlock(json)?.let { block ->
-                Regex(""""(es[a-z-]*|en[a-z-]*)":\s*\{[^{}]*?"urls":\["([^"]+)"""")
-                    .findAll(block)
-                    .map { it.groupValues[1] to unescJson(it.groupValues[2]) }
-                    .distinctBy { it.second }
-                    .sortedBy { (code, _) -> if (code.startsWith("es")) 0 else 1 }
-                    .forEach { (code, url) ->
-                        if (emittedSubs.add(url)) {
-                            subtitleCallback.invoke(
-                                SubtitleFile(if (code.startsWith("es")) "Spanish" else "English", url)
-                            )
-                        }
-                    }
-            }
-
-            var found = false
-            Regex(""""url":"(https://[^"]+?\.m3u8[^"]*)"""").findAll(json)
-                .map { unescJson(it.groupValues[1]) }
-                .firstOrNull()
-                ?.let { hls ->
-                    try {
-                        generateM3u8(linkName, hls, "https://www.dailymotion.com/").forEach(callback)
-                        found = true
-                    } catch (_: Exception) {}
-                }
-            Regex(""""(\d{3,4})":\s*\[\s*\{\s*"type":\s*"video/mp4"\s*,\s*"url":\s*"([^"]+)"""")
-                .findAll(json)
-                .forEach { m ->
-                    val h = m.groupValues[1].toIntOrNull()
-                    callback(
-                        newExtractorLink(source = linkName, name = linkName, url = unescJson(m.groupValues[2])) {
-                            this.referer = "https://www.dailymotion.com/"
-                            this.quality = when {
-                                h == null -> Qualities.Unknown.value
-                                h >= 1080 -> Qualities.P1080.value
-                                h >= 720 -> Qualities.P720.value
-                                h >= 480 -> Qualities.P480.value
-                                else -> Qualities.P360.value
-                            }
-                        }
-                    )
-                    found = true
-                }
-            found
-        } catch (_: Exception) {
-            false
-        }
-    }
 }

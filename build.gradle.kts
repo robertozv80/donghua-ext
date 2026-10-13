@@ -55,6 +55,18 @@ subprojects {
             targetSdk = 36
         }
 
+        // v25: fichero compartido de extractores (common/). Cada módulo Gradle
+        // compila el MISMO fichero fuente en su propio .cs3 (el plugin de
+        // CloudStream empaqueta por módulo, no enlaza proyectos).
+        sourceSets {
+            getByName("main") {
+                java.srcDir(rootProject.projectDir.resolve("common/src"))
+                // el compilador Kotlin integrado registra sus fuentes aparte:
+                // registrar tambien la carpeta como fuente Kotlin
+                kotlin.srcDir(rootProject.projectDir.resolve("common/src"))
+            }
+        }
+
         compileOptions {
             // JVM 11: el JAR cloudstream3 "pre-release" (canal móvil) se compila con
             // target 11 y Kotlin rechaza inlinar bytecode 11 en modulos 1.8
