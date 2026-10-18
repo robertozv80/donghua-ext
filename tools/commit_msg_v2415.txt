@@ -1,0 +1,80 @@
+v24.15: MundoDonghua — extractor "Fm" vía API pública + subtítulos + servidores ordenados por vivo/muerto; AnimeGratis — póster por ficha y srcset
+
+(1) MUNDODONGHUA / SERVIDOR "Fm" (bysekoze) — Se ha descubierto que la API
+pública GET https://bysekoze.com/api/videos/{code} devuelve el MISMO playback
+cifrado (playback{algorithm,iv,payload,key_parts,version}, cache_status, poster_url)
+que el endpoint /embed/playback, pero SIN captcha y SIN Proof-of-Work: solo
+respeta Origin/Referer/X-Embed-* de mundodonghua.com. Con ello el extractor pasa
+de 4 peticiones + PoW a 1 sola. Motivo de hacerlo ahora: la dificultad del PoW
+subió de 16 bits (v24.14) a 17-19 bits en la auditoría de octubre
+(tools/_fm_tracks.txt), así que el camino del captcha cada vez es más lento y más
+frágil. El flujo con PoW se conserva como respaldo (fetchViaCaptcha) por si el
+sitio vuelve a cerrar el endpoint público; el port del PoW se verificó byte a byte
+contra assets/pow-*.js del embed (rotación de 8 = t[3]^t[0] y acceso a la tabla
+con máscara) y NO se toca. También se separa la etiqueta GCM (16 últimos bytes) y
+se pasa explícitamente a doFinal. E2E en vivo sobre 6 códigos: 1 GET -> descifrado
+-> 1 fuente HLS 1080p (los 2 con "video record missing" son del propio sitio, no
+del extractor).
+
+(2) MUNDODONGHUA / SUBTÍTULOS — CloudStream no descubre pistas embebidas en el
+HLS: cada SubtitleFile del provider se envuelve en un SingleSampleMediaSource, o
+sea que solo reproduce un archivo único. Añadido emitSubtitles() al extractor Fm:
+emite las pistas que declare la API (campo "tracks") y, si el master HLS declara
+#EXT-X-MEDIA:TYPE=SUBTITLES, descarga el playlist, concatena los .vtt segmentos
+(mergeVttSegment quita cabecera WEBVTT, NOTE y numeración) y lo entrega como
+data-URI data:text/vtt;base64 (DefaultDataSource enruta el esquema data: a
+DataSchemeDataSource). AVISO HONESTO: en la auditoría de 31 códigos de bysekoze
+(tools/_fm_api_scan.txt, _fm_master_scan.txt) el campo "tracks" vino VACÍO 31/31,
+los 31 master HLS came sin NINGÚN EXT-X-MEDIA, el CDN no expone rutas de
+subtítulo (index/subtitles/subs/lang/eng/*.m3u8 -> 404/400) y el HTML de
+mundodonghua no tiene ningún .srt/.vtt ni <track>. O sea: hoy bysekoze no sirve
+archivo de subtítulo; el "subtítulo automatizado en español" del reproductor web
+se genera en el navegador. El código queda preparado por si el sitio empieza a
+publicar pistas, y es la vía que usarán los servidores que sí las traigan.
+
+(3) MUNDODONGHUA / AUDITORÍA DE SERVIDORES — 20 series x 1 episodio, una serie
+distinta por prueba (tools/_md_audit7.log, _md_audit_acc.txt): VIVOS Fm/bysekoze
+20/20 (es además el único presente en todos los capítulos); Sw/embedwish 5/12
+(el resto responde 200 con 426 B "no longer available"); Vh/vidhidepro 7/17 (el
+resto 200 con 419 B "no longer available"). MUERTOS de forma estable Vg/vgembed
+0/7 (404 "no longer available") y Voe 0/17 (404). Asura y Tamamo 0/12 porque AMBOS
+dependen de www.mdnemonicplayer.xyz, que resuelve pero responde HTTP 522
+(Cloudflare sin origen) tanto en /redirector.php como en /dmplayer.php — no es
+que el slug sea malo, es que el dominio del reproductor está caído. Decisión igual
+que en v24.13 de TioDonghua: NO se depura ninguna etiqueta (los servidores
+revivan y no todas las series usan los mismos), solo se priorizan. loadLinks ahora
+recolecta los embeds en embedsFound y los emite al final con
+sortedByDescending(mdServerPriority) — estable, así que dentro de cada grupo se
+conserva el orden del propio sitio — con bysekoze=4, embedwish/streamwish=3,
+vidhidepro=2 y el resto=0; los enlaces directos de Asura/Tamamo y del fallback
+genérico se guardan en deadLinks y se emiten los últimos. Así la reproducción por
+defecto cae en un servidor que responde sin perder ninguna opción.
+
+(4) ANIMEGRATIS / PÓSTER POR FICHA — Corregido el bug de "todos los títulos
+cargan el mismo póster": antes findBestPosterUrl cogía el primer
+img[src*=cdn.animegratis] del documento, que cuando la portada real no está en ese
+CDN (sí aparece cdn.jkdesa.com en algunas fichas) era la primera card de
+recomendaciones. Ahora se busca el img del propio póster (loading="eager" +
+width="220" + alt con texto, sin aria-hidden, prefiriendo el div.max-w-[220px]) y
+se añade cdn.jkdesa a los selectores de CDN. Verificado en vivo sobre 20 fichas
+(12 donghua + 8 anime): las 20 resuelven la portada de SU título y la URL
+responde 200 en el CDN (25-103 KB).
+
+(5) ANIMEGRATIS / SRCSET — bestImageUrl() ahora lee srcset y se queda con la
+variante de mayor ancho (o mayor densidad si el descriptor es Nx), descartando los
+srcset de /icons/ (el logo). MEDIDO: hoy animegratis.net NO pone srcset en las
+cards de catálogo — el único srcset del HTML es el del logo
+(/icons/logo-animegratis-*.webp) — y el src de las pósters ya es el ORIGINAL del
+CDN: no existen variantes (cover-large.webp, cover_big.webp, cover@2x.webp,
+cover_1080.webp, original.* -> 404) ni parámetros (?w=, ?width=, ?size=,
+?quality= devuelven el mismo byte a byte, 50585 B). Es decir, hoy no se gana
+calidad con srcset porque no hay nada más grande que pedir; el helper queda
+listo para cuando el sitio sí lo sirva.
+
+(6) Versiones: AnimeGratisProvider 3->4, MundoDonghuaProvider 3->4
+(makePluginsJson regenerado: 6 providers); ediciones con scripts python verbatim
+(reemplazos con conteo exacto, CRLF intacto en los dos .kt); compileDebugKotlin
+limpio en ambos módulos.
+
+🤖 Generated with Codebuff
+Co-Authored-By: Codebuff <noreply@codebuff.com>

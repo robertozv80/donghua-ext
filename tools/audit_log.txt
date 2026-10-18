@@ -1,0 +1,71 @@
+
+########## SERIE: tales-of-demons-and-gods ##########
+  sin episodios
+
+########## SERIE: against-the-gods ##########
+  episodios: 30 (listado ordenado)
+
+  === ep #1: https://www.mundodonghua.com/ver/against-the-gods/30 ===
+    embeds: {"asura":1,"tamamo":1,"fm":1,"vhide":1,"vg":1,"sw":1,"voe":1}
+    [MUERTO] asura@mdplayer.xyz/nemonicplayer -> 0 0  
+    [MUERTO] asura@mdnemonicplayer.xyz/nemonicplayer -> 0 0  
+    [MUERTO] tamamo ->  dmplayer sin video id 
+    [VIVO] fm ->  200 {"pow_nonce":"c1900ae2374cc5212e9711c4563bf485","p 
+    [MUERTO] vhide -> 522  
+    [MUERTO] vg -> 404  
+    [MUERTO] sw -> 200  
+    [MUERTO] voe -> 404  
+
+  === ep #30: https://www.mundodonghua.com/ver/against-the-gods/1 ===
+    embeds: {"asura":1,"tamamo":1,"fm":1,"vg":1,"voe":1}
+    [MUERTO] asura@mdplayer.xyz/nemonicplayer -> 0 0  
+    [MUERTO] asura@mdnemonicplayer.xyz/nemonicplayer -> 0 0  
+    [MUERTO] tamamo ->  dmplayer sin video id 
+    [VIVO] fm ->  200 {"pow_nonce":"705cf1762374d4746c46ccf804e29ea8","p 
+    [MUERTO] vg -> 404  
+    [MUERTO] voe -> 404  
+
+########## SERIE: apotheosis ##########
+  episodios: 52 (listado ordenado)
+
+  === ep #1: https://www.mundodonghua.com/ver/apotheosis/52 ===
+    embeds: {"asura":1,"tamamo":1,"fm":1,"vg":1,"voe":1}
+    [MUERTO] asura@mdplayer.xyz/nemonicplayer -> 0 0  
+    [MUERTO] asura@mdnemonicplayer.xyz/nemonicplayer -> 523 523 <!DOCTYPE html> <!--[if lt IE 7]> <html  
+    [MUERTO] tamamo ->  dmplayer sin video id 
+    [VIVO] fm ->  200 {"pow_nonce":"98418a29b7ee288f85698698823c46b3","p 
+    [MUERTO] vg -> 404  
+    [MUERTO] voe -> 404  
+
+  === ep #52: https://www.mundodonghua.com/ver/apotheosis/1 ===
+    embeds: {"asura":1,"tamamo":1,"voe":1}
+    [MUERTO] asura@mdplayer.xyz/nemonicplayer -> 0 0  
+    [MUERTO] asura@mdnemonicplayer.xyz/nemonicplayer -> 0 0  
+    [MUERTO] tamamo ->  dmplayer sin video id 
+    [MUERTO] voe -> 404  
+
+########## SERIE: black-and-white-warriors ##########
+  episodios: 12 (listado ordenado)
+
+  === ep #1: https://www.mundodonghua.com/ver/black-and-white-warriors/12 ===
+    embeds: {"tamamo":1,"fm":1,"vhide":1}
+    [MUERTO] tamamo ->  dmplayer sin video id 
+    [VIVO] fm ->  200 {"pow_nonce":"f8bb2251dffb8ef077c6c7ddfbdd7ee0","p 
+    [MUERTO] vhide -> 522  
+
+  === ep #12: https://www.mundodonghua.com/ver/black-and-white-warriors/1 ===
+    embeds: {"tamamo":1,"fm":1,"vhide":1}
+    [MUERTO] tamamo ->  dmplayer sin video id 
+    [VIVO] fm ->  200 {"pow_nonce":"8f17d19307c9934423ae7a120144aae2","p 
+    [MUERTO] vhide -> 522  
+
+
+========== RESUMEN ==========
+asura@mdplayer.xyz/nemonicplayer: VIVOS 0 / MUERTOS 4  [against-the-gods#1:M, against-the-gods#30:M, apotheosis#1:M, apotheosis#52:M]
+asura@mdnemonicplayer.xyz/nemonicplayer: VIVOS 0 / MUERTOS 4  [against-the-gods#1:M, against-the-gods#30:M, apotheosis#1:M, apotheosis#52:M]
+tamamo: VIVOS 0 / MUERTOS 6  [against-the-gods#1:M, against-the-gods#30:M, apotheosis#1:M, apotheosis#52:M, black-and-white-#1:M, black-and-white-#12:M]
+fm: VIVOS 5 / MUERTOS 0  [against-the-gods#1:V, against-the-gods#30:V, apotheosis#1:V, black-and-white-#1:V, black-and-white-#12:V]
+vhide: VIVOS 0 / MUERTOS 3  [against-the-gods#1:M, black-and-white-#1:M, black-and-white-#12:M]
+vg: VIVOS 0 / MUERTOS 3  [against-the-gods#1:M, against-the-gods#30:M, apotheosis#1:M]
+sw: VIVOS 0 / MUERTOS 1  [against-the-gods#1:M]
+voe: VIVOS 0 / MUERTOS 4  [against-the-gods#1:M, against-the-gods#30:M, apotheosis#1:M, apotheosis#52:M]

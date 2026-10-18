@@ -1,6 +1,7 @@
 package com.donghuaext
 
 import com.lagradost.cloudstream3.*
+import com.donghuaext.common.CommonExtractors as CE
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
 import com.lagradost.cloudstream3.utils.loadExtractor
@@ -605,47 +606,26 @@ class SeriesDonghuaProvider : MainAPI() {
     // ========== Extractores ==========
 
     /**
-     * Dailymotion: pre-warm de cookies + API de metadata.
-     * Visitar el embed primero planta la cookie v1st; sin ella la URL m3u8 de
-     * cdndirector devuelve 403 en reproduccion.
+     * Dailymotion: v26 delega en el extractor COMÚN (mismos fixes de audio:
+     * master completo sin partir a variantes + muxed mp4_h264_aac primero),
+     * conservando el pre-warm de cookies del embed que necesitaba el sitio.
      */
     private suspend fun extractSdDailymotion(
         embedUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // El endpoint get-server puede devolver geo.dailymotion.com/player.html?video=ID
-        // o player/x19frc.html?video=ID; el clasico es /embed/video/ID (y dai.ly/video/ID)
         val videoId = Regex("(?:dailymotion\\.com|dai\\.ly)/(?:embed/)?(?:video/|player(?:/[a-z0-9]+)?\\.html\\?video=)([a-zA-Z0-9]+)")
             .find(embedUrl)?.groupValues?.get(1) ?: return false
         val canonical = "https://www.dailymotion.com/embed/video/$videoId"
         try { app.get(canonical, referer = referer, headers = mapOf("User-Agent" to SD_USER_AGENT), timeout = 15L) } catch (_: Exception) {}
-        try {
-            val json = app.get(
-                "https://www.dailymotion.com/player/metadata/video/$videoId",
-                referer = canonical,
-                headers = mapOf("User-Agent" to SD_USER_AGENT, "Accept" to "application/json"),
-                timeout = 15L
-            ).text.replace("\\/", "/")
-            // qualities.auto[*].url (m3u8 adaptable)
-            Regex("\"qualities\"\\s*:\\s*\\{\\s*\"auto\"\\s*:\\s*\\[\\s*\\{[^}]*?\"url\"\\s*:\\s*\"([^\"]+\\.m3u8[^\"]*)\"")
-                .find(json)?.let { m ->
-                    try { generateM3u8(serverName, m.groupValues[1], canonical).forEach(callback); return true } catch (_: Exception) {}
-                }
-            // Resto de m3u8 (saltar publicidad y placeholders de plantillas)
-            for (m in Regex("(https?://[^\"'\\s<>]+\\.m3u8[^\"'\\s<>]*)").findAll(json)) {
-                val u = m.value
-                if (u.contains("dmxleo.dailymotion.com")) continue
-                if (u.contains("[APIFRAMEWORKS]") || u.contains("[VASTVERSIONS]")) continue
-                try { generateM3u8(serverName, u, canonical).forEach(callback); return true } catch (_: Exception) {}
-            }
-            for (m in Regex("(https?://[^\"'\\s<>]+\\.mp4[^\"'\\s<>]*)").findAll(json)) {
-                callback(newExtractorLink(source = serverName, name = serverName, url = m.value) {
-                    this.referer = canonical; this.quality = Qualities.Unknown.value
-                })
-                return true
-            }
-        } catch (_: Exception) {}
-        return false
+        return CE.extractDailymotion(
+            canonical, referer, serverName, SD_USER_AGENT,
+            sdEmittedSubs, sdEmittedDmVids, { }, callback
+        )
     }
+
+    /** Dedupe/compartido para el extractor común. */
+    private val sdEmittedSubs = mutableSetOf<String>()
+    private val sdEmittedDmVids = mutableSetOf<String>()
 
     /**
      * Ok.Ru (v24.2, mismo approach que TioDonghua): data-options con escapes

@@ -1,0 +1,46 @@
+v24.14: extractor servidor "Fm" de MundoDonghua (SPA bysekoze con PoW + AES-GCM) y fixes de catálogo/búsqueda en AnimeGratis
+
+MundoDonghuaProvider v2 -> v3:
+- El tab "Fm" (fmoon) ya no sirve un player clásico: bysekoze.com pasó a ser una
+  SPA ("Byse Frontend") que consume una API propia con gate de Proof-of-Work y
+  playback cifrado. El extractor StreamWish anterior devolvía 0 enlaces.
+- Ingeniería inversa de la API verificada en vivo con los episodios de prueba
+  (the-first-immortal-of-sword-art/1 y the-first-immortal-of-sword-art-2/1):
+  1) POST /api/videos/{code}/embed/captcha -> {pow_nonce, pow_difficulty, pow_token}
+  2) PoW: hallar N tal que el hash custom de "nonce:N" tenga >= dificultad bits
+     en cero a la izquierda (dificultad 16 bits, solución típica ~15-30k intentos)
+  3) POST /embed/captcha/verify {pow_token, solution} -> {status:"ok", token}
+  4) POST /embed/playback {fingerprint} + X-Captcha-Token (el fingerprint solo
+     necesita existir como objeto; no valida attestation)
+     -> {playback:{algorithm, iv, payload, key_parts[], version}}
+  5) key = b64url(key_parts[version-1]) + b64url(key_parts[30-version]);
+     AES-256-GCM -> {sources:[{url, mime_type, label, height}]}
+- La API valida el dominio del embed: la API rechazaba requests con
+  Origin/Referer ajenos ("embedding from X is not allowed for this video");
+  se envían Origin/Referer/X-Embed-* de mundodonghua.com en todas las llamadas.
+- Nuevo objeto mdFmoonByseExtractor (port exacto del hash PoW del bundle JS,
+  desempaquetado base64url de key_parts y descifrado AES-GCM con javax.crypto),
+  cableado en mdHandleEmbed para bysekoze.com; filemoon.to sigue en StreamWish.
+- E2E verificado en vivo: ambos episodios emiten master.m3u8 1080p válido
+  (edge1-vienna-sprintcdn / edge1-madrid-sprintcdn, HTTP 200 #EXTM3U).
+
+AnimeGratisProvider v2 -> v3:
+- FIX secciones vacías: el sitio rediseñó las cards del catálogo y ya no hay
+  <h3> con el título dentro del <a>; el título vive en el alt del <img>
+  ("Portada de X"). parseDonghuaCards ahora extrae el título del alt (con
+  fallback a la estructura antigua) y salta links de episodios y de navegación
+  de géneros. Esto arregla Donghuas, En Emisión, Finalizados y la búsqueda,
+  que devolvían 0 resultados pese a que el sitio responde 200 con 24+ cards.
+- FIX búsqueda: /donghua?q= ahora se parsea con el mismo extractor de cards;
+  verificado en vivo ("jade" -> Jade Dynasty 1..3, "battle" -> 2, "ren" -> 24).
+- Nuevas secciones por género del catálogo donghua: Acción
+  (/donghua/genero/accion) y Artes Marciales (/donghua/genero/artes-marciales),
+  con paginación ?page=N verificada en vivo (48 cards por página, rel=next).
+- getMainPage unifica el parseo para todo /donghua (base, ?status= y géneros)
+  y corrige la paginación: con query propio usa &page=N, sin query ?page=N.
+
+Versiones: AnimeGratis 2->3, MundoDonghua 2->3. Compilación limpia de ambos
+módulos (compileDebugKotlin) y makePluginsJson regenerado.
+
+🤖 Generated with Codebuff
+Co-Authored-By: Codebuff <noreply@codebuff.com>

@@ -7,6 +7,9 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
 import org.jsoup.Jsoup
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 
 /**
  * AnimeCube (https://animecube.live/) — SPA Next.js con API JSON propia.
@@ -224,7 +227,9 @@ class AnimeCubeProvider : MainAPI() {
         "$mainUrl/##genre:Action" to "Action",
         "$mainUrl/##genre:Adventure" to "Adventure",
         "$mainUrl/##genre:Fantasy" to "Fantasy",
-        "$mainUrl/##genre:Martial Arts" to "Martial Arts"
+        "$mainUrl/##genre:Martial Arts" to "Martial Arts",
+        "$mainUrl/##movies" to "Movies",
+        "$mainUrl/##moviesRec" to "Recommended"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -234,6 +239,22 @@ class AnimeCubeProvider : MainAPI() {
 
         // Secciones de genero: el sitio no expone paginas de genero, pero el payload del home
         // trae el campo "genres" de cada serie; se filtra el catalogo por genero.
+        // v6: seccion "Movies" + subseccion "Recomendado" con etiqueta de rating.
+        if (request.data.contains("##movies")) {
+            val isRec = request.data.contains("##moviesRec")
+            val items = catalog
+                .filter { it.slug.contains("movie") }
+                .let { list ->
+                    if (isRec) list.sortedByDescending { it.rating ?: 0.0 } else list
+                }
+                .map { c ->
+                    newAnimeSearchResponse(c.title.ifBlank { acTitleFromSlug(c.slug) }, "$mainUrl/anime/${c.slug}") {
+                        this.posterUrl = c.poster
+                        if (c.rating != null) this.score = Score.from10(c.rating)
+                    }
+                }
+            return newHomePageResponse(listOf(HomePageList(request.name, items)), hasNext = false)
+        }
         if (request.data.contains("##genre:")) {
             val want = request.data.substringAfter("##genre:").lowercase()
             val items = catalog
@@ -252,14 +273,15 @@ class AnimeCubeProvider : MainAPI() {
         val items = mutableListOf<SearchResponse>()
         val seen = mutableSetOf<String>()
 
-        // Cards SSR del home: <a aria-label="..." href="/anime/<slug>...">
-        Regex("""<a[^>]+aria-label="([^"]+)"[^>]+href="/anime/([a-z0-9-]+)[^"]*""", RegexOption.IGNORE_CASE)
+        // Cards SSR del home: <a aria-label="..." href="/anime/<slug>..."> y tambien
+        // las cards de Movies que van SIN aria-label (v6): <a class=... href="/anime/<slug>?from=home">
+        Regex("""<a[^>]+href="/anime/([a-z0-9-]+)[^"]*""", RegexOption.IGNORE_CASE)
             .findAll(html)
-            .forEach { m ->
-                val (label, slug) = m.destructured
+            .map { m -> m.groupValues[1] }
+            .forEach { slug ->
                 if (seen.add(slug)) {
                     val c = bySlug[slug]
-                    items.add(newAnimeSearchResponse(c?.title?.takeIf { it.isNotBlank() } ?: label.trim(), "$mainUrl/anime/$slug") {
+                    items.add(newAnimeSearchResponse(c?.title?.takeIf { it.isNotBlank() } ?: acSlugToTitle(slug), "$mainUrl/anime/$slug") {
                         this.posterUrl = c?.poster ?: ""
                         if (c?.rating != null) this.score = Score.from10(c.rating)
                     })
@@ -310,7 +332,9 @@ class AnimeCubeProvider : MainAPI() {
                 this.posterUrl = c?.poster ?: ""
                 if (c?.rating != null) this.score = Score.from10(c.rating)
             }
-        }
+            // v6: evitar resultados REPETIDOS con el mismo titulo (mismo anime,
+            // distinto slug de poster/temporada en el sitemap).
+        }.distinctBy { (it.name ?: "").lowercase() }
     }
 
     // ==================== DETAIL ====================
@@ -319,9 +343,57 @@ class AnimeCubeProvider : MainAPI() {
     private data class AcSeason(val id: String, val title: String, val episodes: List<AcEpisode>)
 
     /**
-     * Parsea seasons/episodes del flight payload (regex tolerantes). Devuelve
-     * las temporadas en orden de aparicion.
+     * v6 (2026-10): temporada(s)/episodes del flight con el formato actual del
+     * sitio (primaryTabs -> seasons -> episodes). El parse por regex de seasons
+     * fallaba (ficha vacia) porque en posts nuevos el esquema añade
+     * "customName"/"type":"movie" y el seasonHead dejaba de matchear. Ahora los
+     * EPISODES se extraen directamente del array "episodes" (estable en todos
+     * los posts) y las temporadas solo aportan el nombre.
      */
+    private fun acParseEpisodes(flight: String, slug: String): List<AcSeason> {
+        val seasons = LinkedHashMap<String, MutableAcSeason>()
+        val epPattern = Regex(
+            """"id":"([^"]+)-(tab-[\w-]+)-ep-(\d+(?:-\d+)?)","number":(\d+),"numberDisplay":"((?:[^"\]|\.)*)","title":"((?:[^"\]|\.)*)"""
+        )
+        epPattern.findAll(flight).forEach { em ->
+            val seId = em.groupValues[2]
+            val id = em.groupValues[1] + "-" + seId + "-ep-" + em.groupValues[3]
+            if (em.groupValues[1] != slug) return@forEach
+            val ep = AcEpisode(
+                id,
+                em.groupValues[4].toIntOrNull() ?: 0,
+                acUnescJson(em.groupValues[5]),
+                acUnescJson(em.groupValues[6])
+            )
+            seasons.getOrPut(seId) { MutableAcSeason(seId, "") }.episodes.add(ep)
+        }
+        // Titulo de temporada: "id":"tab-...","number":N,"title":"..."
+        Regex(""""id":"(tab-[\w-]+)","number":\d+,"title":"((?:[^"\\\\]|\\\\.)*)"""").findAll(flight).forEach { sm ->
+            seasons[sm.groupValues[1]]?.let { s ->
+                if (s.title.isBlank()) s.title = acUnescJson(sm.groupValues[2])
+            }
+        }
+        return seasons.values.map { AcSeason(it.id, it.title, it.episodes.toList()) }
+    }
+
+    private class MutableAcSeason(val id: String, var title: String) {
+        val episodes = ArrayList<AcEpisode>()
+    }
+
+    /**
+     * v6: SINOPSIS REAL del anime. En el flight hay varias "description": la
+     * PRIMERA es el boilerplate del sitio y la del anime es la mas larga. Se
+     * coge la primera >= 200 chars que no sea marketing.
+     */
+    private fun acSynopsis(flight: String): String {
+        val bad = listOf("stay updated", "stream quality", "premium anime", "watch donghua online")
+        Regex(""""description":"((?:[^"\\\\]|\\\\.)*)"""").findAll(flight).forEach { m ->
+            val d = acUnescJson(m.groupValues[1]).trim()
+            if (d.length >= 200 && bad.none { d.lowercase().startsWith(it) }) return d
+        }
+        return ""
+    }
+
     private fun parseRscSeasons(flight: String, slug: String): List<AcSeason> {
         // FIX v3: el grupo atomico con cuantificador perezoso (?>[^{}]*?) se congelaba
         // con 0 caracteres y el regex nunca hacia match -> 0 episodios y ficha vacia.
@@ -380,7 +452,7 @@ class AnimeCubeProvider : MainAPI() {
             timeout = 25L
         ).text
 
-        val seasons = parseRscSeasons(flight, slug)
+        val seasons = acParseEpisodes(flight, slug)
 
         // Titulo: og:title del HTML SSR ("<slug> - Watch Online | Anime Cube")
         val html = app.get("$mainUrl/anime/$slug", headers = mapOf("User-Agent" to UA)).text
@@ -388,7 +460,12 @@ class AnimeCubeProvider : MainAPI() {
         val title = doc.selectFirst("meta[property=og:title]")?.attr("content")
             ?.removeSuffix(" - Watch Online | Anime Cube")?.trim()
             ?: acSlugToTitle(slug)
-        val description = doc.selectFirst("meta[name=description]")?.attr("content")?.trim() ?: ""
+        val description = run {
+            val meta = doc.selectFirst("meta[name=description]")?.attr("content")?.trim() ?: ""
+            // v6: la meta es boilerplate del sitio; usar la sinopsis del flight
+            if (meta.isBlank() || meta.endsWith("Watch anime online in high quality.")) acSynopsis(flight)
+            else meta
+        }
 
         val episodes = mutableListOf<Episode>()
         val seen = mutableSetOf<String>()

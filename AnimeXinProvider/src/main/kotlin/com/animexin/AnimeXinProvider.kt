@@ -3,6 +3,7 @@ package com.animexin
 import com.lagradost.cloudstream3.*
 import com.donghuaext.common.CommonExtractors as CE
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
@@ -439,6 +440,17 @@ class AnimeXinProvider : MainAPI() {
                     CE.extractOkRu(fixed, "$mainUrl/", label, UA, callback)
                 fixed.contains("odysee.com", ignoreCase = true) ->
                     extractOdysee(fixed, data, label, callback)
+                // v27 (2026-10): "All Sub Player" en este episodio es un embed de
+                // YouTube (no extraible server-side de forma fiable); se delega al
+                // extractor de YouTube que traiga la app instalada.
+                fixed.contains("youtube.com", ignoreCase = true) ||
+                    fixed.contains("youtu.be", ignoreCase = true) ->
+                    try { loadExtractor("https://www.youtube.com/watch?v=" + fixed.substringAfter("/embed/").substringBefore("?"), "$mainUrl/", subtitleCallback, callback) } catch (_: Exception) { false }
+                // "Spanish/Indonesian/..." = gdriveplayer.to (jwplayer): hoy el
+                // servidor responde "Source not found" (caido); se delega por si
+                // reviviera. Coste: 1 intento al final de las prioridades.
+                fixed.contains("gdriveplayer", ignoreCase = true) ->
+                    try { loadExtractor(fixedIfProtocol(fixed), "$mainUrl/", subtitleCallback, callback) } catch (_: Exception) { false }
                 else -> false // Dtube/Mega/Streamwish(seekplayer): no extraibles o muertos
             }
             if (ok) found = true
@@ -478,6 +490,10 @@ class AnimeXinProvider : MainAPI() {
         }
         return sb.toString()
     }
+
+    /** Normaliza //host a https://host para loadExtractor. */
+    private fun fixedIfProtocol(u: String): String =
+        if (u.startsWith("//")) "https:$u" else u
 
     private fun dmSubtitlesBlock(json: String): String? {
         val start = json.indexOf("\"subtitles\"")

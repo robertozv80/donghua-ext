@@ -1,0 +1,9 @@
+fm=1
+asura@mdplayer.xyz/nemonicplayer=0
+asura@mdnemonicplayer.xyz/nemonicplayer=0
+tamamo=0
+vg@e=0
+voe@e=0
+vh@v=1
+vh@e=0
+sw@e=1

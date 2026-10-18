@@ -451,9 +451,14 @@ class LmAnimeProvider : MainAPI() {
             for (iframe in iframes.distinct()) {
                 found = when {
                     iframe.contains("dailymotion", ignoreCase = true) ->
-                        extractDailymotion(iframe, "$mainUrl/", "$langTag • Dailymotion", emittedSubs, subtitleCallback, callback)
+                        CE.extractDailymotion(iframe, "$mainUrl/", "$langTag • Dailymotion", UA, emittedSubs, emittedDmVids, subtitleCallback, callback)
                     iframe.contains("ok.ru", ignoreCase = true) ->
-                        extractOkRu(iframe, referer, "$langTag • Ok.ru", callback)
+                        CE.extractOkRu(iframe, referer, "$langTag • Ok.ru", UA, callback)
+                    // v6 (2026-10): server Fembed del sitio. Fembed (fembed.com)
+                    // responde /api/source POST con flv/video mp4 progresivos.
+                    iframe.contains("fembed", ignoreCase = true) ->
+                        extractFembed(iframe, referer, "$langTag • Fembed", callback)
+                    // Filemoon (filemoon.sx): needs PoW; sin soporte (se omite).
                     else -> false
                 } || found
             }
@@ -463,67 +468,48 @@ class LmAnimeProvider : MainAPI() {
         }
     }
 
-    // ==================== EXTRACTORES ====================
-
-    /** Desescapa secuencias JSON (\uXXXX, \/, \n, ...). */
-    private fun unescJson(s: String): String {
-        val sb = StringBuilder(s.length)
-        var i = 0
-        while (i < s.length) {
-            val c = s[i]
-            if (c == '\\' && i + 1 < s.length) {
-                when (s[i + 1]) {
-                    'u' -> {
-                        val hex = s.substring(i + 2, (i + 6).coerceAtMost(s.length))
-                        val code = hex.toIntOrNull(16)
-                        if (code != null) {
-                            sb.append(code.toChar())
-                            i += 6
-                        } else {
-                            sb.append(s[i + 1])
-                            i += 2
-                        }
-                    }
-                    'n' -> { sb.append('\n'); i += 2 }
-                    't' -> { sb.append('\t'); i += 2 }
-                    'r' -> { sb.append('\r'); i += 2 }
-                    else -> { sb.append(s[i + 1]); i += 2 }
-                }
-            } else {
-                sb.append(c)
-                i++
-            }
-        }
-        return sb.toString()
-    }
-
-    // ==================== EXTRACTORES ====================
-    //
-    // v5: Dailymotion y Ok.ru delegan en el extractor común
-    // (com.donghuaext.common.CommonExtractors): gains = variantes AV1
-    // descartadas (negro/sin audio), dedupe por video y subs es/en estable.
     /** Dedupe por video de Dailymotion entre todos los mirrors del episodio. */
     private val emittedDmVids = mutableSetOf<String>()
 
-    /** Dailymotion via el extractor común. */
-    private suspend fun extractDailymotion(
-        iframeSrc: String,
-        referer: String,
-        linkName: String,
-        emittedSubs: MutableSet<String>,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        return CE.extractDailymotion(iframeSrc, referer, linkName, UA, emittedSubs, emittedDmVids, subtitleCallback, callback)
-    }
-
-    /** Ok.Ru via el extractor común (data-options: HLS + progresivos). */
-    private suspend fun extractOkRu(
-        embedUrl0: String,
+    /**
+     * Fembed (server "Español Alternative" del sitio): POST /api/source con
+     * {file: /v/<id>} -> {data:[{file,label}]}. Dominios: fembed.com, femedia...
+     */
+    private suspend fun extractFembed(
+        embedUrl: String,
         referer: String,
         linkName: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        return CE.extractOkRu(embedUrl0, referer, linkName, UA, callback)
+        return try {
+            val vid = Regex("(?:fembed|femedia)[^/]*?/(?:v|e)/([A-Za-z0-9_-]+)", RegexOption.IGNORE_CASE)
+                .find(embedUrl)?.groupValues?.get(1) ?: return false
+            val origin = Regex("^https?://[^/]+").find(embedUrl)?.value ?: return false
+            val json = app.post(
+                "$origin/api/source",
+                json = mapOf("file" to "/v/$vid"),
+                referer = embedUrl,
+                headers = mapOf("User-Agent" to UA),
+                timeout = 20L
+            ).text
+            var foundLocal = false
+            Regex(""""(?:file|url)":"(https://[^"]+)"""").findAll(json).forEach { m ->
+                val u = m.groupValues[1]
+                val isHls = u.contains(".m3u8")
+                callback(
+                    newExtractorLink(
+                        source = linkName, name = linkName, url = u,
+                        type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = "$origin/"
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+                foundLocal = true
+            }
+            foundLocal
+        } catch (_: Exception) {
+            false
+        }
     }
 }

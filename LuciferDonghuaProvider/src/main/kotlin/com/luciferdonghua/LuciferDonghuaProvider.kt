@@ -57,16 +57,42 @@ class LuciferDonghuaProvider : MainAPI() {
     override val mainPage = mainPageOf(
         "$mainUrl/##latest" to "Latest Release",
         "$mainUrl/anime/?status=completed&sub=&order=latest" to "Completed",
-        "$mainUrl/anime/?genre%5B%5D=action&genre%5B%5D=adventure&genre%5B%5D=martial-arts&status=&type=&order=latest" to "Action / Adventure"
+        "$mainUrl/schedule/##day:Monday" to "Monday",
+        "$mainUrl/schedule/##day:Tuesday" to "Tuesday",
+        "$mainUrl/schedule/##day:Wednesday" to "Wednesday",
+        "$mainUrl/schedule/##day:Thursday" to "Thursday",
+        "$mainUrl/schedule/##day:Friday" to "Friday",
+        "$mainUrl/schedule/##day:Saturday" to "Saturday",
+        "$mainUrl/schedule/##day:Sunday" to "Sunday"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val sectionName = request.name
         val base = request.data.substringBefore("##")
+
+        // v26: secciones por DIA desde /schedule/ (Monday..Sunday); se sustituye
+        // "Action / Adventure". La pagina pinta el horario completo con un
+        // bixbox schedulepage sch_<dia> por dia (listupd con .bs tiles de SERIE).
+        if (request.data.contains("##day:")) {
+            val day = request.data.substringAfter("##day:").lowercase()
+            val document = app.get(base, headers = mapOf("User-Agent" to UA)).document
+            val items = document.select(".bixbox.schedulepage.sch_$day .listupd .bs a").mapNotNull { item ->
+                val u = item.absUrl("href")
+                if (u.isEmpty()) return@mapNotNull null
+                val t = item.selectFirst(".tt")?.text()?.trim()
+                    ?: item.attr("title")
+                    ?: return@mapNotNull null
+                newAnimeSearchResponse(t, u) {
+                    this.posterUrl = item.selectFirst("img")?.let { getImgSrc(it) }
+                }
+            }
+            return newHomePageResponse(listOf(HomePageList(sectionName, items)), hasNext = false)
+        }
+
         val url = when {
             sectionName == "Latest Release" ->
                 if (page == 1) base else "$mainUrl/page/$page/"
-            else -> // Completed / Action-Adventure: query params + /page/N/ despues del path
+            else -> // Completed: query params + /page/N/ despues del path
                 if (page == 1) base
                 else base.replace("?", "/page/$page/?")
         }
@@ -113,14 +139,18 @@ class LuciferDonghuaProvider : MainAPI() {
         val url = linkEl.attr("abs:href")
         if (url.isEmpty()) return null
 
-        val title = linkEl.attr("title").takeIf { it.isNotEmpty() }
-            ?: linkEl.selectFirst("h2, h3, .eggtitle, .tt")?.text()?.trim()
+        val title = article.selectFirst(".tt, h2, h3, .eggtitle")?.text()?.trim()
+            ?: linkEl.attr("title").takeIf { it.isNotEmpty() }
             ?: linkEl.selectFirst("img")?.attr("alt")?.takeIf { it.isNotEmpty() }
             ?: return null
 
         val img = article.selectFirst("img")?.let { getImgSrc(it) } ?: ""
         val epNum = EPISODE_NUM_REGEX.find(title)?.groupValues?.get(1)
             ?.substringBefore("-")?.toIntOrNull()
+        // FIX v26: el título del card siempre es de SERIE, no del episodio. La
+        // cadena "<Serie> ... Episode N ..." se limpia; si queda vacía (el post
+        // se titula solo "Episode N ...") se usa el "tt" del tema que siempre
+        // trae el nombre de la serie.
         val cleanTitle = title.replace(
             Regex("""\s*Episode\s+\d+(?:-\d+)?[^|]*$""", RegexOption.IGNORE_CASE), ""
         ).trim()

@@ -847,15 +847,18 @@ class MundoDonghuaProvider : MainAPI() {
                                 // mdnemonicplayer.xyz (verificado en vivo: el dominio nuevo
                                 // devuelve un M3U8 válido; el viejo responde basura de 25 bytes).
                                 try {
+                                    // v26 SPEED: el host www.mdnemonicplayer.xyz lleva meses en 522
+                                    // (Cloudflare sin origen) y generateM3u8 agotaba su timeout en cada
+                                    // ficha. Se emite el URL EN CRUDO (ExoPlayer lo resuelve al
+                                    // reproducir) sin pedir nada por adelantado.
                                     val m3u8Url = "https://www.mdnemonicplayer.xyz/nemonicplayer/redirector.php?slug=$asuraSlug"
-                                    deadLinks.addAll(generateM3u8("Asura", m3u8Url, datafix))
-                                } catch (_: Exception) {
-                                    // Fallback: intentar generar M3U8 sin verificar
-                                    try {
-                                        val m3u8Url = "https://www.mdnemonicplayer.xyz/nemonicplayer/redirector.php?slug=$asuraSlug"
-                                        deadLinks.addAll(generateM3u8("Asura", m3u8Url, datafix))
-                                    } catch (_: Exception) {}
-                                }
+                                    deadLinks.add(
+                                        newExtractorLink(source = "Asura", name = "Asura", url = m3u8Url) {
+                                            this.referer = datafix
+                                            this.quality = Qualities.Unknown.value
+                                        }
+                                    )
+                                } catch (_: Exception) {}
                             }
 
                             // También buscar URL m3u8 directa en el unpack
@@ -863,7 +866,12 @@ class MundoDonghuaProvider : MainAPI() {
                             val fileUrl = fileRegex.find(unpack)?.destructured?.component1()
                             if (!fileUrl.isNullOrEmpty()) {
                                 try {
-                                    deadLinks.addAll(generateM3u8("Asura", fileUrl, datafix))
+                                    deadLinks.add(
+                                        newExtractorLink(source = "Asura", name = "Asura", url = fileUrl) {
+                                            this.referer = datafix
+                                            this.quality = Qualities.Unknown.value
+                                        }
+                                    )
                                 } catch (_: Exception) {}
                             }
                         }
@@ -886,8 +894,10 @@ class MundoDonghuaProvider : MainAPI() {
                                         val apiKey = keyRegex.find(apiResp)?.destructured?.component1()
                                         if (!apiKey.isNullOrEmpty()) {
                                             // Paso 3: Obtener página del reproductor Dailymotion
+                                            // v26 SPEED: timeout corto, el host muerto (522) no debe
+                                            // bloquear la carga de fuentes de la ficha.
                                             val playerUrl = "https://www.mdnemonicplayer.xyz/nemonicplayer/dmplayer.php?key=$apiKey"
-                                            val playerResp = app.get(playerUrl, headers = reqHEAD, timeout = 15).text
+                                            val playerResp = app.get(playerUrl, headers = reqHEAD, timeout = 6).text
                                             // Paso 4: Extraer ID del video Dailymotion
                                             val dmIdPatterns = listOf(
                                                 Regex("""video\s*:\s*["']([A-Za-z0-9]+)["']"""),
@@ -904,8 +914,15 @@ class MundoDonghuaProvider : MainAPI() {
                                                             referer = "https://www.dailymotion.com/embed/video/$vidID",
                                                             headers = mapOf("User-Agent" to USER_AGENT, "Accept" to "application/json"),
                                                             timeout = 15L).text
+                                                        // v26 SPEED: enlaces en crudo, sin expandir el master.
                                                         for (m in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(jsonText)) {
-                                                            try { deadLinks.addAll(generateM3u8("Tamamo", m.value, "https://www.dailymotion.com")); break } catch (_: Exception) {}
+                                                            deadLinks.add(
+                                                                newExtractorLink(source = "Tamamo", name = "Tamamo", url = m.value) {
+                                                                    this.referer = "https://www.dailymotion.com"
+                                                                    this.quality = Qualities.Unknown.value
+                                                                }
+                                                            )
+                                                            break
                                                         }
                                                         val mp4Urls = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(jsonText).map { it.value }.distinct().toList()
                                                         if (mp4Urls.isNotEmpty()) {
@@ -990,18 +1007,16 @@ class MundoDonghuaProvider : MainAPI() {
                         }
 
                         // ===== Fallback: buscar URLs m3u8/mp4 en el unpack =====
+                        // v26 SPEED: emitidos EN CRUDO; sin generateM3u8 (pedía el master
+                        // aquí dentro, en serie, y retrasaba toda la ficha).
                         val urlRegex = Regex("""(https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*)""")
                         for (match in urlRegex.findAll(unpack)) {
                             val foundUrl = match.value
                             try {
-                                if (foundUrl.contains(".m3u8")) {
-                                    deadLinks.addAll(generateM3u8("Server", foundUrl, datafix))
-                                } else {
-                                    deadLinks.add(newExtractorLink(source = "Server", name = "Server", url = foundUrl) {
-                                        this.referer = datafix
-                                        this.quality = Qualities.Unknown.value
-                                    })
-                                }
+                                deadLinks.add(newExtractorLink(source = "Server", name = "Server", url = foundUrl) {
+                                    this.referer = datafix
+                                    this.quality = Qualities.Unknown.value
+                                })
                             } catch (_: Exception) {}
                         }
 

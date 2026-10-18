@@ -1,0 +1,20 @@
+        if (statusText.isBlank()) {
+            val rscStatus = Regex(
+                "\"text-xs font-black uppercase tracking-widest\",\"children\":\"([^\"]+)\""
+            ).find(rscPayload)?.groupValues?.get(1)?.trim().orEmpty()
+            if (rscStatus.isNotBlank()) {
+                statusText = rscStatus
+                when {
+                    rscStatus.contains("Finalizado", ignoreCase = true) ||
+                        rscStatus.contains("Completed", ignoreCase = true) ->
+                        parsedShowStatus = ShowStatus.Completed
+                    rscStatus.contains("Emisión", ignoreCase = true) ||
+                        rscStatus.contains("Emision", ignoreCase = true) ||
+                        rscStatus.contains("Pausa", ignoreCase = true) ||
+                        rscStatus.contains("Ongoing", ignoreCase = true) ->
+                        parsedShowStatus = ShowStatus.Ongoing
+                    else -> {}
+                }
+            }
+        }
+

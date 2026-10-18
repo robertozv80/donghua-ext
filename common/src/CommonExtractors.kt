@@ -3,6 +3,7 @@ package com.donghuaext.common
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
@@ -50,13 +51,14 @@ object CommonExtractors {
                     else -> { sb.append(s[i + 1]); i += 2 }
                 }
             } else {
-                sb.append(c); i++
+                sb.append(c)
+                i++
             }
         }
         return sb.toString()
     }
 
-    /** Bloque subtitles.data del metadata de Dailymotion (rmtegis: obj balanceado). */
+    /** Bloque subtitles.data del metadata de Dailymotion (obj balanceado). */
     fun dmSubtitlesBlock(json: String): String? {
         val start = json.indexOf("\"subtitles\"")
         if (start < 0) return null
@@ -91,20 +93,69 @@ object CommonExtractors {
         ).find(src)?.groupValues?.get(1)
     }
 
+    /** Subs: pistas es* y en* del bloque subtitles. */
+    private fun emitDmSubtitles(
+        json: String,
+        emittedSubs: MutableSet<String>,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ) {
+        dmSubtitlesBlock(json)?.let { block ->
+            Regex(""""(es[a-z-]*|en[a-z-]*|fr|pt|ru|tr|pl|ar|bn|fa|id|ms|it|de|hi|th|vi)":\s*\{[^{}]*?"urls":\["([^"]+)"""")
+                .findAll(block)
+                .map { it.groupValues[1] to unescJson(it.groupValues[2]) }
+                .distinctBy { it.second }
+                .sortedBy { (code, _) ->
+                    when {
+                        code.startsWith("es") -> 0
+                        code.startsWith("en") -> 1
+                        else -> 2
+                    }
+                }
+                .forEach { (code, url) ->
+                    if (emittedSubs.add(url)) {
+                        subtitleCallback.invoke(
+                            SubtitleFile(dmSubLangName(code), url)
+                        )
+                    }
+                }
+        }
+    }
+
+    private fun dmSubLangName(code: String): String = when {
+        code.startsWith("es") -> "Spanish"
+        code.startsWith("en") -> if (code.contains("auto")) "English (auto)" else "English"
+        code.startsWith("fr") -> "French"
+        code.startsWith("pt") -> "Portuguese"
+        code.startsWith("ru") -> "Russian"
+        code.startsWith("tr") -> "Turkish"
+        code.startsWith("pl") -> "Polish"
+        code.startsWith("ar") -> "Arabic"
+        code.startsWith("bn") -> "Bengali"
+        code.startsWith("fa") -> "Persian"
+        code.startsWith("id") -> "Indonesian"
+        code.startsWith("ms") -> "Malay"
+        code.startsWith("it") -> "Italian"
+        code.startsWith("de") -> "German"
+        code.startsWith("hi") -> "Hindi"
+        code.startsWith("th") -> "Thai"
+        code.startsWith("vi") -> "Vietnamese"
+        else -> code
+    }
+
     /**
      * Dailymotion via metadata API.
      *
-     * FIXES 2026-10 (aplican a todos los providers):
-     *  1. Pantalla negra al inicio: el master del CDN listaba variantes AV1
-     *     (`/av1_fhd/`) y H264 (`/h264_fhd/`); ExoPlayer tomaba la AV1 y muchos
-     *     dispositivos no tienen decodificador -> negro/atajo con error
-     *     setDataSource 0x80000000. Ahora el común le pide a generateM3u8 la
-     *     lista y EMITE SOLO variantes no-av1 (si no queda ninguna, emite todas).
-     *  2. Fuentes duplicadas ("...Dailymotion 1080p" x2): las dos variantes con
-     *     el mismo NAME colisionaban + cada mirror del sitio repetía el mismo
-     *     video. El común deduplica por URL de variante y por videoId.
-     *  3. Preferencia h264 aunque exista mp4 progresivo, para que el orden
-     *     interno no deje al usuario, por defecto, en una fuente sin audio.
+     * FIX v6 (2026-10, el importante): NO expandir el master con generateM3u8.
+     * Las variantes fmp4 (`/h264_fhd/3/manifest.m3u8`) NO traen audio: el audio
+     * vive en grupos EXT-X-MEDIA del master y al partirlo el reproductor pierde
+     * la asociación -> "video sin audio". Además duplicaba entradas (av1 + h264
+     * de la misma calidad). Ahora se emite:
+     *  1) progresivos mp4 del metadata (video/mp4 .mp4) — VIDEO;
+     *  2) HLS muxed `mp4_h264_aac` (audio integrado en la playlist) — M3U8;
+     *  3) el master cdndirector "auto" COMPLETO como UN link M3U8: ExoPlayer
+     *     resuelve los grupos de audio y descarta el AV1 si el dispositivo
+     *     no lo soporta.
+     *  AV1: nunca se emite como link independiente.
      */
     suspend fun extractDailymotion(
         iframeSrc: String,
@@ -128,76 +179,72 @@ object CommonExtractors {
             val json = app.get(metaUrl, referer = referer, headers = headersWithUA(customUA), timeout = 20L)
                 .text.replace("\\/", "/").replace("\\u0026", "&")
 
-            dmSubtitlesBlock(json)?.let { block ->
-                Regex(""""(es[a-z-]*|en[a-z-]*)":\s*\{[^{}]*?"urls":\["([^"]+)"""")
-                    .findAll(block)
-                    .map { it.groupValues[1] to unescJson(it.groupValues[2]) }
-                    .distinctBy { it.second }
-                    .sortedBy { (code, _) -> if (code.startsWith("es")) 0 else 1 }
-                    .forEach { (code, url) ->
-                        if (emittedSubs.add(url)) {
-                            subtitleCallback.invoke(
-                                SubtitleFile(if (code.startsWith("es")) "Spanish" else "English", url)
-                            )
-                        }
-                    }
-            }
+            emitDmSubtitles(json, emittedSubs, subtitleCallback)
 
             var found = false
             val emittedUrls = mutableSetOf<String>()
 
-            fun emitVariant(link: ExtractorLink) {
-                if (emittedUrls.add(link.url)) callback(link)
-            }
-
-            // MP4 progresivos del metadata (cuando DM aún los entrega): audio
-            // garantizado (muxed h264+aac), por eso se emiten PRIMERO.
-            // (bucle for: Sequence.map no es inline y el builder de
-            //  newExtractorLink exige contexto de corrutina)
-            for (m in Regex(""""(\d{3,4})":\s*\[\s*\{\s*"type":\s*"video/mp4"\s*,\s*"url":\s*"([^"]+)"""").findAll(json)) {
-                val h = m.groupValues[1].toIntOrNull()
-                val link = newExtractorLink(source = linkName, name = linkName, url = unescJson(m.groupValues[2])) {
-                    this.referer = DM_REFERER
-                    this.quality = when {
-                        h == null -> Qualities.Unknown.value
-                        h >= 1080 -> Qualities.P1080.value
-                        h >= 720 -> Qualities.P720.value
-                        h >= 480 -> Qualities.P480.value
-                        else -> Qualities.P360.value
+            suspend fun emit(u: String, hls: Boolean, q: Int?) {
+                val url = u.takeIf { it.startsWith("http") } ?: return
+                if (!emittedUrls.add(url)) return
+                callback(
+                    newExtractorLink(
+                        source = linkName, name = linkName, url = url,
+                        type = if (hls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = DM_REFERER
+                        this.quality = q ?: Qualities.Unknown.value
                     }
-                }
-                emitVariant(link)
+                )
+                found = true
             }
-            found = emittedUrls.isNotEmpty()
 
-            // HLS: master "auto" (cdndirector). generateM3u8 expande a variantes;
-            // el común descarta las AV1 y no repite URLs/etiquetas.
-            Regex(""""url":"(https://[^"]+?\.m3u8[^"]*)"""").findAll(json)
-                .map { unescJson(it.groupValues[1]) }
-                .firstOrNull { u -> u.contains("cdndirector") || u.contains("dmcdn") || u.endsWith(".m3u8") }
-                ?.let { hls ->
-                    try {
-                        val links = generateM3u8(linkName, hls, DM_REFERER) ?: emptyList()
-                        val isAv1 = { u: String -> u.contains("/av1", ignoreCase = true) || u.contains("_av1_", ignoreCase = true) }
-                        val chosen = links.filter { !isAv1(it.url) }.ifEmpty { links }
-                        // Orden: h264 (codec clásico, decodifica en cualquier device) primero.
-                        chosen.sortedBy { if (isAv1(it.url)) 1 else 0 }.forEach { emitVariant(it) }
-                        if (chosen.isNotEmpty()) found = true
-                    } catch (_: Exception) {}
+            // 1) Progresivos mp4 reales O HLS muxed del qualities map.
+            //    Formato: "1080":[{"type":"video/mp4","url":"..."}]
+            Regex(""""(\d{3,4})":\[\{"type":"([^"]+)","url":"([^"]+)"""").findAll(json).forEach { m ->
+                val h = m.groupValues[1].toIntOrNull()
+                val url = unescJson(m.groupValues[3])
+                val q = when {
+                    h == null -> Qualities.Unknown.value
+                    h >= 1080 -> Qualities.P1080.value
+                    h >= 720 -> Qualities.P720.value
+                    h >= 480 -> Qualities.P480.value
+                    h >= 360 -> Qualities.P360.value
+                    else -> Qualities.Unknown.value
                 }
-
-            // URLs m3u8 alternativas (old-style combinado mp4_h264_aac_*): llevan
-            // audio muxed; emitir si no colisiona.
-            Regex(""""url":"(https://[^"]+?mp4_h264_aac[^"]*\.m3u8[^"]*)"""").findAll(json)
-                .map { unescJson(it.groupValues[1]) }
-                .forEach { combined ->
-                    try {
-                        val links = generateM3u8(linkName, combined, DM_REFERER) ?: emptyList()
-                        links.forEach { emitVariant(it) }
-                        if (links.isNotEmpty()) found = true
-                    } catch (_: Exception) {}
+                // AV1 nunca (negro/sin audio): exclude urls av1
+                if (url.contains("/av1", ignoreCase = true) || url.contains("_av1_", ignoreCase = true)) {
+                    if (url.contains("av1")) { // skip
+                    } else emit(url, url.contains(".m3u8"), q)
+                } else {
+                    emit(url, url.contains(".m3u8"), q)
                 }
+            }
 
+            // 2) Master auto (cdndirector) — UN link completo. contiene audio group.
+            Regex("""https://[^"']+?cdndirector[^"']*?\.m3u8[^"']*""").findAll(json)
+                .forEach { m -> emit(m.value, true, Qualities.Unknown.value) }
+
+            // 3) Otros masters dmcdn del metadata (p. ej. muxed mp4_h264_aac).
+            Regex("""https://[^"']+?dmcdn[^"']*?\.m3u8[^"']*""")
+                .findAll(json)
+                .map { it.value }
+                .filter { !it.contains("/av1", true) && !it.contains("_av1_", true) }
+                .forEach { emit(it, true, null) }
+
+            // Fallback último: expandir master si no se emitió nada (raro).
+            if (!found) {
+                Regex("""https://[^"']+?\.m3u8[^"']*""").findAll(json).map { it.value }
+                    .forEach { master ->
+                        try {
+                            generateM3u8(linkName, master, DM_REFERER)?.forEach { link ->
+                                if (emittedUrls.add(link.url)) callback(link)
+                                found = true
+                            }
+
+                        } catch (_: Exception) {}
+                    }
+            }
             found
         } catch (_: Exception) {
             false
@@ -205,9 +252,10 @@ object CommonExtractors {
     }
 
     /**
-     * Rumble. Flujo: embedJS (u3) con doble intento y visita previa al embed
-     * para sobrevivir al reto de Cloudflare; extrae mp4 progresivos por
-     * calidad de la respuesta JSON (`"1080":["https://...rumble.cloud/...mp4",...]`).
+     * Rumble. Flujo: embedJS (u3) con doble intento + visita previa al embed
+     * para el reto de Cloudflare; mp4 progresivos del JSON.
+     * NOTA 2026-10: si el video fue ELIMINADO de Rumble el endpoint responde
+     * {} / 410 "Video not found" — no es fallo del extractor.
      */
     suspend fun extractRumble(
         embedUrl: String,
@@ -228,7 +276,7 @@ object CommonExtractors {
                 uaMap.findAll(fixed).forEach { m ->
                     val h = m.groupValues[1].toIntOrNull()
                     callback(
-                        newExtractorLink(source = linkName, name = linkName, url = m.groupValues[2]) {
+                        newExtractorLink(source = linkName, name = linkName, url = m.groupValues[2], type = ExtractorLinkType.VIDEO) {
                             this.referer = "https://rumble.com/"
                             this.quality = when {
                                 h == null -> Qualities.Unknown.value
@@ -300,7 +348,7 @@ object CommonExtractors {
                     if (progressive.startsWith("http")) {
                         val full = if (progressive.startsWith("//")) "https:$progressive" else progressive
                         callback(
-                            newExtractorLink(source = linkName, name = linkName, url = full) {
+                            newExtractorLink(source = linkName, name = linkName, url = full, type = ExtractorLinkType.VIDEO) {
                                 this.referer = url
                                 this.quality = when (m.groupValues[1]) {
                                     "full", "super" -> Qualities.P1080.value
@@ -367,7 +415,7 @@ object CommonExtractors {
             val finalUrl = "$base$rnd?token=$token&expiry=${System.currentTimeMillis()}"
 
             callback(
-                newExtractorLink(source = linkName, name = linkName, url = finalUrl) {
+                newExtractorLink(source = linkName, name = linkName, url = finalUrl, type = ExtractorLinkType.VIDEO) {
                     this.referer = "$origin/"
                     this.quality = Qualities.Unknown.value
                 }
