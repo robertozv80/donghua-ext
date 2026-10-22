@@ -210,34 +210,77 @@ object CommonExtractors {
                 found = true
             }
 
-            // v7 (2026-10, AUDIO): el master cdndirector empezo a entregar
-            // variantes fhd/av1 SIN pista de audio asociada (render silencioso
-            // en los episodios reportados: ep195/ep43/ATG58). MUXED con audio
-            // seguro: <dc>.dailymotion.com/cdn/<CALIDAD>/vCRN/mp4_h264_aac.m3u8
-            // (a veces aplica el srcIp del embedder, por eso se usa solo como
-            // intento — si no responde con playlist, sigue el flujo antigo).
-            suspend fun tryNewMuxedPreset() {
-                try {
-                    val masterAuto = Regex("""https://[a-z0-9.-]+\.dailymotion\.com/cdn/manifest/video/[a-z0-9]+\.m3u8[^"']*""",
-                        RegexOption.IGNORE_CASE).find(json)?.value ?: return
-                    val dc = Regex("https://([a-z0-9.-]+)\\.dailymotion\\.com", RegexOption.IGNORE_CASE).find(masterAuto)?.groupValues?.get(1) ?: return
-                    val vid2 = Regex("video/([a-z0-9]+)\\.m3u8", RegexOption.IGNORE_CASE).find(masterAuto)?.groupValues?.get(1) ?: return
+            // v8 (2026-10): una sola ruta válida por video + validación.
+            // Bug v7 que corregimos tras los reportes:
+            //  - "Formatos duplicados": los masters + progresivos del mismo
+            //    video salían como varias fuentes (duplicando la lista).
+            //  - "Error ERROR_CODE_PARSING": el fallback picking his first
+            //    `.dailymotion.com/cdn/manifest/...` match del JSON que era
+            //    `advertising.ad_url` (dmxleo + auth=...) que responde VMAP
+            //    XML de anuncios, no un m3u8, y ExoPlayer lo rechaza.
+            // Nuevo flujo: un master HLS del campo "qualities" metadata
+            // (incl. pref cdndirector o diretamente de un DC), validado
+            // con GET antes de emitir (#EXTM3U), luego presets muxed mp4
+            // _h264_aac/DM, y si nada de eso funciona, progresivos mp4.
+            // El ad VMAP / dmxleo con auth= nunca se emite.
+
+            suspend fun tryPlaylist(u: String, hlsQ: Int?): Boolean {
+                if (u.isBlank() || !u.startsWith("http")) return false
+                val isPlaylist = try {
+                    app.get(u, referer = DM_REFERER, headers = headersWithUA(customUA), timeout = 12L)
+                        .text.trimStart().startsWith("#EXT")
+                } catch (_: Exception) { false }
+                return if (isPlaylist) { emit(u, true, hlsQ); true } else false
+            }
+
+            // 1) Master HLS del campo qualities del metadata. El propio URL
+            //    es lo que da el server mp4_h264_aac y audio-embedded.
+            var emittedAny = false
+            Regex(""""auto":\[\{"url":"(https://[^"]+)"""").findAll(json).forEach { m ->
+                if (emittedAny) return@forEach
+                if (m.groupValues[1].contains("dailymotion.com")) {
+                    emittedAny = tryPlaylist(unescJson(m.groupValues[1]), Qualities.Unknown.value)
+                }
+            }
+            // Sometimes the qualities obj may include type before url: parse both orders.
+            if (!emittedAny) {
+                Regex(""""auto":\[\{[^}]*?"type":"[^"]+","url":"(https://[^"]+)"""").findAll(json).forEach { m ->
+                    if (emittedAny) return@forEach
+                    if (m.groupValues[1].contains("dailymotion.com")) {
+                        emittedAny = tryPlaylist(unescJson(m.groupValues[1]), Qualities.Unknown.value)
+                    }
+                }
+            }
+            // 2) Presets muxed vCRN (v7 legacy path, aplicado a los reportes
+            //    para el get fp4 aac que antes funcionaba; keep as fallback).
+            if (!emittedAny) {
+                val masterAuto = Regex("""https://[a-z0-9.-]+\.dailymotion\.com/cdn/manifest/video/[a-z0-9]+\.m3u8[^"']*""",
+                    RegexOption.IGNORE_CASE).find(json)?.value
+                val dc = masterAuto?.let {
+                    Regex("https://([a-z0-9.-]+)\\.dailymotion\\.com", RegexOption.IGNORE_CASE)
+                        .find(it)?.groupValues?.get(1) ?: "dmxleo"
+                }.takeIf { it != null && !it.startsWith("cdndirector") }
+                val vid2 = masterAuto?.let { Regex("video/([a-z0-9]+)\\.m3u8", RegexOption.IGNORE_CASE).find(it)?.groupValues?.get(1) }
+                if (dc != null && vid2 != null) {
                     for (preset in listOf("H264-1280x720", "H264-1920x1080", "H264-854x480")) {
                         val u = "https://$dc.dailymotion.com/cdn/$preset/vCRN/mp4_h264_aac.m3u8?video=$vid2"
-                        try {
-                            val pre = app.get(u, referer = DM_REFERER, headers = headersWithUA(customUA), timeout = 12L).text
-                            if (pre.trimStart().startsWith("#EXT")) {
-                                emit(u, true, Qualities.P720.value)
-                                return
-                            }
-                        } catch (_: Exception) {}
+                        if (tryPlaylist(u, Qualities.P720.value)) { emittedAny = true; break }
                     }
-                } catch (_: Exception) {}
+                }
             }
-            tryNewMuxedPreset()
+            // 3) Otros masters "dmcdn" del metadata (muxed mp4_h264_aac) — excluye AV1.
+            if (!emittedAny) {
+                Regex("""https://[^"']+?dmcdn[^"']*?\.m3u8[^"']*""")
+                    .findAll(json)
+                    .map { it.value }
+                    .filter { !it.contains("/av1", true) && !it.contains("_av1_", true) }
+                    .forEach { if (!emittedAny && tryPlaylist(it, null)) emittedAny = true }
+            }
+            if (emittedAny) return found   // UN RUTA por video: evita duplicados.
 
-            // 1) Progresivos mp4 reales O HLS muxed del qualities map.
-            //    Formato: "1080":[{"type":"video/mp4","url":"..."}]
+            // 4) Último recurso: progresivos mp4 del qualities map. Los fMP4 de
+            //    DM son streams video-only (por eso el histórico "sin audio");
+            //    pero es mejor una fuente que se pueda abrir que reportar nada.
             Regex(""""(\d{3,4})":\[\{"type":"([^"]+)","url":"([^"]+)"""").findAll(json).forEach { m ->
                 val h = m.groupValues[1].toIntOrNull()
                 val url = unescJson(m.groupValues[3])
@@ -249,31 +292,11 @@ object CommonExtractors {
                     h >= 360 -> Qualities.P360.value
                     else -> Qualities.Unknown.value
                 }
-                // AV1 nunca (negro/sin audio): exclude urls av1
                 if (url.contains("/av1", ignoreCase = true) || url.contains("_av1_", ignoreCase = true)) {
-                    // skip
+                    // skip AV1: negro / sin audio
                 } else {
                     emit(url, url.contains(".m3u8"), q)
                 }
-            }
-
-            // 2) Master auto (cdndirector) — UN link completo. contiene audio group.
-            Regex("""https://[^"']+?cdndirector[^"']*?\.m3u8[^"']*""").findAll(json)
-                .forEach { m -> emit(m.value, true, Qualities.Unknown.value) }
-
-            // 3) Otros masters dmcdn del metadata (p. ej. muxed mp4_h264_aac).
-            Regex("""https://[^"']+?dmcdn[^"']*?\.m3u8[^"']*""")
-                .findAll(json)
-                .map { it.value }
-                .filter { !it.contains("/av1", true) && !it.contains("_av1_", true) }
-                .forEach { emit(it, true, null) }
-
-            // Fallback último: solo masters DM firmados. No expandir variantes
-            // fMP4 arbitrarias: pueden ser video-only y perder el audio asociado.
-            if (!found) {
-                Regex("""https://[^"']+?\.dailymotion\.com/cdn/manifest/video/[^"']+?\.m3u8[^"']*""",
-                    RegexOption.IGNORE_CASE).findAll(json)
-                    .forEach { master -> emit(master.value, true, null) }
             }
             found
         } catch (_: Exception) {
