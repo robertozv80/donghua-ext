@@ -713,15 +713,20 @@ class AnimeCubeProvider : MainAPI() {
             // (privateId, p.ej. "k5Vsp1UXQ2vIA2HSWyi") para los videos no listados del
             // sitio; el videoId corto ("xaq348m") responde error -> 0 HLS/0 subs y la
             // ficha mostraba "No se encontraron enlaces". Preferir privateId.
-            Regex(""""platform":"([\w-]+)"\s*,\s*(?:"privateId":"([^"]*)"\s*,\s*)?"quality":"([^"]*)"\s*,\s*"videoId":"([\w-]+)"""")
+            // El orden de propiedades no es estable; no acoplar el parser a
+            // platform -> privateId -> quality -> videoId.
+            Regex("""\{[^{}]*"platform":"([\w-]+)"[^{}]*\}""")
                 .findAll(payload)
-                .map { m ->
+                .mapNotNull { m ->
+                    val item = m.value
                     val platform = m.groupValues[1]
-                    val privateId = m.groupValues[2]
-                    val quality = m.groupValues[3]
-                    val videoId = m.groupValues[4]
-                    AcSourceEntry(platform, privateId.ifBlank { videoId }, quality)
+                    val privateId = Regex(""""privateId":"([^"]*)"""").find(item)?.groupValues?.get(1).orEmpty()
+                    val videoId = Regex(""""videoId":"([\w-]+)"""").find(item)?.groupValues?.get(1).orEmpty()
+                    val quality = Regex(""""quality":"([^"]*)"""").find(item)?.groupValues?.get(1).orEmpty()
+                    val id = privateId.ifBlank { videoId }
+                    if (id.isBlank()) null else AcSourceEntry(platform, id, quality)
                 }
+                .distinctBy { "${it.platform}|${it.videoId}" }
                 .toList()
         } catch (_: Exception) {
             emptyList()

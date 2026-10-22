@@ -188,9 +188,19 @@ object CommonExtractors {
             suspend fun emit(u: String, hls: Boolean, q: Int?) {
                 val url = u.takeIf { it.startsWith("http") } ?: return
                 if (!emittedUrls.add(url)) return
+                val qualitySuffix = when (q) {
+                    Qualities.P1080.value -> " 1080p"
+                    Qualities.P720.value -> " 720p"
+                    Qualities.P480.value -> " 480p"
+                    Qualities.P360.value -> " 360p"
+                    else -> ""
+                }
+                val displayName = if (qualitySuffix.isNotEmpty() &&
+                    !Regex("\\b\\d{3,4}p\\b", RegexOption.IGNORE_CASE).containsMatchIn(linkName)
+                ) linkName + qualitySuffix else linkName
                 callback(
                     newExtractorLink(
-                        source = linkName, name = linkName, url = url,
+                        source = linkName, name = displayName, url = url,
                         type = if (hls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                     ) {
                         this.referer = DM_REFERER
