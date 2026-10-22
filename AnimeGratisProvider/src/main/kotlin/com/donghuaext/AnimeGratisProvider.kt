@@ -7,6 +7,7 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
+import com.donghuaext.common.CommonExtractors as CE
 import com.lagradost.cloudstream3.utils.getAndUnpack
 import java.util.*
 import kotlinx.coroutines.async
@@ -1059,6 +1060,14 @@ class AnimeGratisProvider : MainAPI() {
     }
 
     private suspend fun extractDailymotionApi(videoId: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit): Boolean {
+        // v27: primero el extractor COMÚN (master completo con audio, dedupe
+        // de videos y subs multi-idioma). El flujo legacy queda como fallback.
+        if (CE.extractDailymotion(
+                "https://www.dailymotion.com/embed/video/$videoId",
+                referer, serverName, USER_AGENT, mutableSetOf(), agEmittedDmVids,
+                { }, callback
+            )
+        ) return true
         try {
             val apiUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
             val jsonText = app.get(apiUrl, referer = "https://www.dailymotion.com/embed/video/$videoId",
@@ -1097,7 +1106,12 @@ class AnimeGratisProvider : MainAPI() {
         return false
     }
 
+    /** Dedupe de videos de DM entre servers del episodio. */
+    private val agEmittedDmVids = mutableSetOf<String>()
+
     private suspend fun extractOkRu(videoUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit): Boolean {
+        // v27: primero el extractor COMÚN (manifiesto validado #EXTM3U).
+        if (CE.extractOkRu(videoUrl, referer, serverName, USER_AGENT, callback)) return true
         try {
             val html = app.get(videoUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
             val dataMatch = Regex("""data-options="([^"]+)"""").find(html)

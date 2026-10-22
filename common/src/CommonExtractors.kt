@@ -174,7 +174,8 @@ object CommonExtractors {
         val referer = embedderReferer.ifBlank { "https://animexin.dev" }
         return try {
             val metaUrl = "https://www.dailymotion.com/player/metadata/video/$vid" +
-                "?embedder=" + java.net.URLEncoder.encode(referer, "UTF-8") + "&integration=inline"
+                "?embedder=" + java.net.URLEncoder.encode(referer, "UTF-8") + "&integration=inline" +
+                "&app=com.dailymotion.neon"
             // DM escapa las barras del JSON: desescapar antes de aplicar regex.
             val json = app.get(metaUrl, referer = referer, headers = headersWithUA(customUA), timeout = 20L)
                 .text.replace("\\/", "/").replace("\\u0026", "&")
@@ -207,9 +208,9 @@ object CommonExtractors {
             // intento — si no responde con playlist, sigue el flujo antigo).
             suspend fun tryNewMuxedPreset() {
                 try {
-                    val masterAuto = Regex("""https://[a-z0-9]+\.dailymotion\.com/cdn/manifest/video/[a-z0-9]+\.m3u8[^"']*""",
+                    val masterAuto = Regex("""https://[a-z0-9.-]+\.dailymotion\.com/cdn/manifest/video/[a-z0-9]+\.m3u8[^"']*""",
                         RegexOption.IGNORE_CASE).find(json)?.value ?: return
-                    val dc = Regex("https://([a-z0-9]+)\\.dailymotion\\.com", RegexOption.IGNORE_CASE).find(masterAuto)?.groupValues?.get(1) ?: return
+                    val dc = Regex("https://([a-z0-9.-]+)\\.dailymotion\\.com", RegexOption.IGNORE_CASE).find(masterAuto)?.groupValues?.get(1) ?: return
                     val vid2 = Regex("video/([a-z0-9]+)\\.m3u8", RegexOption.IGNORE_CASE).find(masterAuto)?.groupValues?.get(1) ?: return
                     for (preset in listOf("H264-1280x720", "H264-1920x1080", "H264-854x480")) {
                         val u = "https://$dc.dailymotion.com/cdn/$preset/vCRN/mp4_h264_aac.m3u8?video=$vid2"
@@ -257,18 +258,12 @@ object CommonExtractors {
                 .filter { !it.contains("/av1", true) && !it.contains("_av1_", true) }
                 .forEach { emit(it, true, null) }
 
-            // Fallback último: expandir master si no se emitió nada (raro).
+            // Fallback último: solo masters DM firmados. No expandir variantes
+            // fMP4 arbitrarias: pueden ser video-only y perder el audio asociado.
             if (!found) {
-                Regex("""https://[^"']+?\.m3u8[^"']*""").findAll(json).map { it.value }
-                    .forEach { master ->
-                        try {
-                            generateM3u8(linkName, master, DM_REFERER)?.forEach { link ->
-                                if (emittedUrls.add(link.url)) callback(link)
-                                found = true
-                            }
-
-                        } catch (_: Exception) {}
-                    }
+                Regex("""https://[^"']+?\.dailymotion\.com/cdn/manifest/video/[^"']+?\.m3u8[^"']*""",
+                    RegexOption.IGNORE_CASE).findAll(json)
+                    .forEach { master -> emit(master.value, true, null) }
             }
             found
         } catch (_: Exception) {
@@ -296,7 +291,7 @@ object CommonExtractors {
                 "&embed=" + java.net.URLEncoder.encode(embedUrl, "UTF-8")
             suspend fun emit(json: String): Int {
                 val fixed = json.replace("\\/", "/")
-                val uaMap = Regex(""""(\d{3,4})":\["(https://[a-z0-9.]*rumble\.cloud/video/[A-Za-z0-9/._-]+\.mp4)"""")
+                val uaMap = Regex(""""(\d{3,4})":\["(https://[a-z0-9.-]*rumble\.cloud/video/[A-Za-z0-9/._-]+\.mp4)"""")
                 var n = 0
                 uaMap.findAll(fixed).forEach { m ->
                     val h = m.groupValues[1].toIntOrNull()
@@ -356,7 +351,7 @@ object CommonExtractors {
             val out = ByteArray(raw.size)
             for (i in raw.indices) out[i] = (raw[i].toInt() xor keyBytes[i % keyBytes.size].toInt()).toByte()
             val decoded = String(out, Charsets.ISO_8859_1).replace("\\/", "/")
-            val hlsRel = Regex("HLS=\"([^\"]+\\\\.m3u8)\"").find(decoded)?.groupValues?.get(1) ?: return false
+            val hlsRel = Regex("HLS=\"([^\"]+\\.m3u8)\"").find(decoded)?.groupValues?.get(1) ?: return false
             val origin = Regex("^https?://[^/]+").find(embedUrl)?.value ?: return false
             val playlist = if (hlsRel.startsWith("http")) hlsRel else "$origin/$hlsRel"
             val text = try { app.get(playlist, referer = embedUrl, headers = headersWithUA(customUA), timeout = 20L).text } catch (_: Exception) { "" }

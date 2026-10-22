@@ -19,6 +19,7 @@ import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.Qualities
+import com.donghuaext.common.CommonExtractors as CE
 import java.net.URLDecoder
 import kotlin.collections.ArrayList
 import kotlin.coroutines.resume
@@ -3194,6 +3195,10 @@ var emitted = false
         }
     }
 
+    /** Dedupe de subs/videos de DM entre mirrors del episodio. */
+    private val dlEmittedDmSubs = mutableSetOf<String>()
+    private val dlEmittedDmVids = mutableSetOf<String>()
+
     private suspend fun extractDailymotion(
         embedUrl: String,
         referer: String,
@@ -3201,14 +3206,28 @@ var emitted = false
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         var emitted = false
+        val emittedUrls = mutableSetOf<String>()
         val trackingCb: (ExtractorLink) -> Unit = { link ->
-            emitted = true
-            callback(link)
+            if (emittedUrls.add(link.url)) {
+                emitted = true
+                callback(link)
+            }
         }
         val videoId = Regex("video=([A-Za-z0-9]+)").find(embedUrl)?.destructured?.component1()
             ?: Regex("/video/([A-Za-z0-9]+)").find(embedUrl)?.destructured?.component1()
             ?: Regex("/embed/video/([A-Za-z0-9]+)").find(embedUrl)?.destructured?.component1()
             ?: return false
+
+        // v27: primero el extractor COMÚN (master completo con audio + dedupe
+        // de videos + subs multi-idioma). El flujo legacy queda como fallback.
+        try {
+            if (CE.extractDailymotion(
+                    "https://www.dailymotion.com/embed/video/$videoId",
+                    referer, serverName, browserUA, dlEmittedDmSubs, dlEmittedDmVids,
+                    { }, trackingCb
+                )
+            ) return true
+        } catch (_: Exception) {}
 
         try {
             val apiUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
@@ -3223,13 +3242,15 @@ var emitted = false
                 timeout = 15L).text
             Log.i(TAG, "extractDailymotion: videoId=$videoId jsonLen=${jsonText.length}")
 
-            for (match in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(jsonText)) {
-                try {
-                    generateM3u8(serverName, match.value, "https://www.dailymotion.com").forEach(trackingCb)
-                    if (emitted) return true
-                } catch (e: Exception) {
-                    Log.w(TAG, "extractDailymotion: m3u8 method failed: ${e.message}")
-                }
+            // Solo aceptar el master HLS firmado de Dailymotion. Expandir
+            // variantes fMP4 individuales puede eliminar la pista de audio.
+            val masterRegex = Regex("""(https?://[^"'\s<>]+dailymotion\.com/cdn/manifest/video/[^\s"'<>]+\.m3u8[^\s"'<>]*)""", RegexOption.IGNORE_CASE)
+            for (match in masterRegex.findAll(jsonText)) {
+                trackingCb(newExtractorLink(source = serverName, name = serverName, url = match.groupValues[1], type = ExtractorLinkType.M3U8) {
+                    this.referer = "https://www.dailymotion.com/"
+                    this.quality = Qualities.Unknown.value
+                })
+                if (emitted) return true
             }
             val mp4Urls = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(jsonText).map { it.value }.distinct().toList()
             for (u in mp4Urls) {
@@ -3304,6 +3325,10 @@ var emitted = false
         serverName: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // v27: primero el extractor COMÚN (hls validado #EXTM3U).
+        try {
+            if (CE.extractOkRu(videoUrl, referer, serverName, browserUA, callback)) return true
+        } catch (_: Exception) {}
         try {
             val resp = app.get(videoUrl, referer = referer, headers = mapOf("User-Agent" to browserUA), timeout = 15L)
             val html = resp.text

@@ -10,6 +10,7 @@ import com.lagradost.cloudstream3.utils.getAndUnpack
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlin.collections.ArrayList
+import com.donghuaext.common.CommonExtractors as CE
 
 /** UA de navegador (necesario para varios hosts). */
 const val TD_USER_AGENT =
@@ -20,6 +21,8 @@ const val TD_USER_AGENT =
  * hlsManifestUrl y las urls progresivas en el atributo data-options.
  */
 private suspend fun extractTdOkRu(embedUrl: String, referer: String, name: String, callback: (ExtractorLink) -> Unit): Boolean {
+    // v27: primero el extractor COMÚN (hls validado #EXTM3U + progresivos).
+    if (CE.extractOkRu(embedUrl, referer, name, TD_USER_AGENT, callback)) return true
     return try {
         // v24.2: el embed puede llegar protocol-relative (//ok.ru/...) dentro del
         // HTML dtshcode; sin esquema la petición falla.
@@ -112,7 +115,7 @@ private suspend fun extractTdRumble(embedUrl: String, referer: String, name: Str
         if (vid != null) {
             val api = "https://rumble.com/embedJS/u3/?request=video&v=$vid" +
                 "&embed=" + java.net.URLEncoder.encode(embedUrl, "UTF-8")
-            val uaMap = Regex("\"(\\d{3,4})\":\\[\"(https://[a-z0-9.]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4)\"")
+            val uaMap = Regex("\"(\\d{3,4})\":\\[\"(https://[a-z0-9.-]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4)\"")
             suspend fun emit(json: String): Int {
                 val fixed = json.replace("\\/", "/")
                 var n = 0
@@ -171,7 +174,7 @@ private suspend fun extractTdRumble(embedUrl: String, referer: String, name: Str
             }
         // v24.2: el JSON del embed trae un mapa de calidades con dimensiones:
         // "360":{"url":"...mp4","meta":{...,"w":638,"h":360}}. Emitir cada una.
-        val qualities = Regex("\"(\\d{3,4})\":\\{\"url\":\"(https://[a-z0-9.]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4)\"")
+        val qualities = Regex("\"(\\d{3,4})\":\\{\"url\":\"(https://[a-z0-9.-]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4)\"")
             .findAll(fixed).toList()
         if (qualities.isNotEmpty()) {
             qualities.distinctBy { it.groupValues[2] }.forEach { m ->
@@ -190,7 +193,7 @@ private suspend fun extractTdRumble(embedUrl: String, referer: String, name: Str
             return true
         }
         // Fallback: primer mp4 directo (embeds sin mapa de calidades)
-        val url = Regex("https://[a-z0-9.]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4")
+        val url = Regex("https://[a-z0-9.-]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4")
             .find(fixed)?.value ?: return false
         callback(newExtractorLink(source = name, name = name, url = url) {
             this.referer = embedUrl
@@ -1097,6 +1100,10 @@ class TioDonghuaProvider : MainAPI() {
      * Dailymotion: pre-warm de cookies + API de metadata
      * (mismo approach probado en SeriesDonghuaProvider).
      */
+    /** Dedupe de subs/videos de DM entre servers del episodio. */
+    private val tdEmittedDmSubs = mutableSetOf<String>()
+    private val tdEmittedDmVids = mutableSetOf<String>()
+
     private suspend fun extractTdDailymotion(
         embedUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
@@ -1105,6 +1112,13 @@ class TioDonghuaProvider : MainAPI() {
         val videoId = Regex("dailymotion\\.com/(?:embed/)?video/([a-zA-Z0-9]+)|geo\\.dailymotion\\.com/player\\.html\\?video=([a-zA-Z0-9]+)")
             .find(embedUrl)?.let { it.groupValues[1].ifBlank { it.groupValues[2] } } ?: return false
         try { app.get(embedUrl, referer = referer, timeout = 15L) } catch (_: Exception) {}
+        // v27: primero el extractor COMÚN (master completo con audio + dedupe).
+        if (CE.extractDailymotion(
+                "https://www.dailymotion.com/embed/video/$videoId",
+                referer, serverName, TD_USER_AGENT, tdEmittedDmSubs, tdEmittedDmVids,
+                { }, callback
+            )
+        ) return true
         try {
             val json = app.get(
                 "https://www.dailymotion.com/player/metadata/video/$videoId",

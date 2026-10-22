@@ -634,6 +634,8 @@ class SeriesDonghuaProvider : MainAPI() {
      * urls progresivas de videos[].
      */
     private suspend fun extractSdOkRu(embedUrl: String, referer: String, name: String, callback: (ExtractorLink) -> Unit): Boolean {
+        // v27: primero el extractor COMÚN (hls validado #EXTM3U + progresivos).
+        if (CE.extractOkRu(embedUrl, referer, name, SD_USER_AGENT, callback)) return true
         return try {
             val url = if (embedUrl.startsWith("//")) "https:$embedUrl" else embedUrl
             val html = app.get(url, referer = referer,
@@ -707,7 +709,7 @@ class SeriesDonghuaProvider : MainAPI() {
             if (vid != null) {
                 val api = "https://rumble.com/embedJS/u3/?request=video&v=$vid" +
                     "&embed=" + java.net.URLEncoder.encode(embedUrl, "UTF-8")
-                val uaMap = Regex("\"(\\d{3,4})\":\\[\"(https://[a-z0-9.]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4)\"")
+                val uaMap = Regex("\"(\\d{3,4})\":\\[\"(https://[a-z0-9.-]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4)\"")
                 suspend fun emit(json: String): Int {
                     val fixed = json.replace("\\/", "/")
                     var n = 0
@@ -763,7 +765,7 @@ class SeriesDonghuaProvider : MainAPI() {
                         return true
                     } catch (_: Exception) {}
                 }
-            val qualities = Regex("\"(\\d{3,4})\":\\{\"url\":\"(https://[a-z0-9.]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4)\"")
+            val qualities = Regex("\"(\\d{3,4})\":\\{\"url\":\"(https://[a-z0-9.-]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4)\"")
                 .findAll(fixed).toList()
             if (qualities.isNotEmpty()) {
                 qualities.distinctBy { it.groupValues[2] }.forEach { m ->
@@ -782,7 +784,7 @@ class SeriesDonghuaProvider : MainAPI() {
                 return true
             }
             // Fallback: primer mp4 directo
-            val url = Regex("https://[a-z0-9.]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4")
+            val url = Regex("https://[a-z0-9.-]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4")
                 .find(fixed)?.value ?: return false
             callback(newExtractorLink(source = name, name = name, url = url) {
                 this.referer = embedUrl

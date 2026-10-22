@@ -7,6 +7,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
+import com.donghuaext.common.CommonExtractors as CE
 
 class DonghuaWorldProvider : MainAPI() {
     override var mainUrl = "https://donghuaworld.com"
@@ -1046,39 +1047,35 @@ class DonghuaWorldProvider : MainAPI() {
     /**
      * Extract video from Dailymotion embed URL (Eng-Sub Player).
      */
+    /**
+     * Extract video from Dailymotion embed URL (Eng-Sub Player).
+     *
+     * v27: delega en el extractor COMÚN (fixes de audio + dedupe + subs).
+     */
     private suspend fun extractDailymotion(
         embedUrl: String,
         callback: (ExtractorLink) -> Unit
     ) {
         try {
             val videoId = embedUrl.substringAfter("video=", "").substringBefore("&").substringBefore("#")
-            if (videoId.isEmpty()) return
-
-            val apiUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
-            val json = app.get(apiUrl, referer = embedUrl).text
-
-            val hlsMatch = Regex("""["'](?:url|stream_url|hls)["']\s*:\s*["']([^"']+\.m3u8[^"']*)["']""").find(json)
-                ?: Regex("""["'](https://[^"']*dmcdn\.net/[^"']*m3u8[^"']*)["']""").find(json)
-
-            if (hlsMatch != null) {
-                val hlsUrl = hlsMatch.groupValues[1]
-                    .replace("\\/", "/")
-                    .replace("\\u0026", "&")
-
-                callback.invoke(
-                    newExtractorLink(
-                        source = "Eng-Sub Player",
-                        name = "Eng-Sub Player",
-                        url = hlsUrl,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = "https://www.dailymotion.com/"
-                        this.quality = Qualities.Unknown.value
-                    }
+            if (videoId.isNotEmpty()) {
+                CE.extractDailymotion(
+                    "https://www.dailymotion.com/embed/video/$videoId",
+                    "$mainUrl/",
+                    "Eng-Sub Player",
+                    null,
+                    dwEmittedDmSubs,
+                    dwEmittedDmVids,
+                    { },
+                    callback
                 )
             }
         } catch (_: Exception) {
             // Dailymotion extraction failed
         }
     }
+
+    /** Dedupe de videos/subs de DM entre todos los embeds del episodio. */
+    private val dwEmittedDmSubs = mutableSetOf<String>()
+    private val dwEmittedDmVids = mutableSetOf<String>()
 }
