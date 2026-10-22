@@ -446,11 +446,12 @@ class AnimeXinProvider : MainAPI() {
                 fixed.contains("youtube.com", ignoreCase = true) ||
                     fixed.contains("youtu.be", ignoreCase = true) ->
                     try { loadExtractor("https://www.youtube.com/watch?v=" + fixed.substringAfter("/embed/").substringBefore("?"), "$mainUrl/", subtitleCallback, callback) } catch (_: Exception) { false }
-                // "Spanish/Indonesian/..." = gdriveplayer.to (jwplayer): hoy el
-                // servidor responde "Source not found" (caido); se delega por si
-                // reviviera. Coste: 1 intento al final de las prioridades.
+                // "Spanish/Indonesian/..." = gdriveplayer.to (jwplayer). v28: el
+                // embed vive y guardia su playlist tras XOR (k/atob) en
+                // hlsplaylist.php; se extrae por el comun en vez de delegar a
+                // loadExtractor (que no la resolvia -> "No se encontraron enlaces").
                 fixed.contains("gdriveplayer", ignoreCase = true) ->
-                    try { loadExtractor(fixedIfProtocol(fixed), "$mainUrl/", subtitleCallback, callback) } catch (_: Exception) { false }
+                    CE.extractGdrivePlayer(fixedIfProtocol(fixed), "$mainUrl/", label, UA, callback)
                 else -> false // Dtube/Mega/Streamwish(seekplayer): no extraibles o muertos
             }
             if (ok) found = true

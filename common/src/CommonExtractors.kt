@@ -199,6 +199,32 @@ object CommonExtractors {
                 found = true
             }
 
+            // v7 (2026-10, AUDIO): el master cdndirector empezo a entregar
+            // variantes fhd/av1 SIN pista de audio asociada (render silencioso
+            // en los episodios reportados: ep195/ep43/ATG58). MUXED con audio
+            // seguro: <dc>.dailymotion.com/cdn/<CALIDAD>/vCRN/mp4_h264_aac.m3u8
+            // (a veces aplica el srcIp del embedder, por eso se usa solo como
+            // intento — si no responde con playlist, sigue el flujo antigo).
+            suspend fun tryNewMuxedPreset() {
+                try {
+                    val masterAuto = Regex("""https://[a-z0-9]+\.dailymotion\.com/cdn/manifest/video/[a-z0-9]+\.m3u8[^"']*""",
+                        RegexOption.IGNORE_CASE).find(json)?.value ?: return
+                    val dc = Regex("https://([a-z0-9]+)\\.dailymotion\\.com", RegexOption.IGNORE_CASE).find(masterAuto)?.groupValues?.get(1) ?: return
+                    val vid2 = Regex("video/([a-z0-9]+)\\.m3u8", RegexOption.IGNORE_CASE).find(masterAuto)?.groupValues?.get(1) ?: return
+                    for (preset in listOf("H264-1280x720", "H264-1920x1080", "H264-854x480")) {
+                        val u = "https://$dc.dailymotion.com/cdn/$preset/vCRN/mp4_h264_aac.m3u8?video=$vid2"
+                        try {
+                            val pre = app.get(u, referer = DM_REFERER, headers = headersWithUA(customUA), timeout = 12L).text
+                            if (pre.trimStart().startsWith("#EXT")) {
+                                emit(u, true, Qualities.P720.value)
+                                return
+                            }
+                        } catch (_: Exception) {}
+                    }
+                } catch (_: Exception) {}
+            }
+            tryNewMuxedPreset()
+
             // 1) Progresivos mp4 reales O HLS muxed del qualities map.
             //    Formato: "1080":[{"type":"video/mp4","url":"..."}]
             Regex(""""(\d{3,4})":\[\{"type":"([^"]+)","url":"([^"]+)"""").findAll(json).forEach { m ->
@@ -214,8 +240,7 @@ object CommonExtractors {
                 }
                 // AV1 nunca (negro/sin audio): exclude urls av1
                 if (url.contains("/av1", ignoreCase = true) || url.contains("_av1_", ignoreCase = true)) {
-                    if (url.contains("av1")) { // skip
-                    } else emit(url, url.contains(".m3u8"), q)
+                    // skip
                 } else {
                     emit(url, url.contains(".m3u8"), q)
                 }
@@ -265,7 +290,7 @@ object CommonExtractors {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         return try {
-            val vid = Regex("""rumble\.com/(?:embed/)?(v[a-zA-Z0-9]+)""", RegexOption.IGNORE_CASE)
+            val vid = Regex("""rumble\.com/(?:embed/)?(v[0-9a-z]+)(?:[-/_.@?]|$)""", RegexOption.IGNORE_CASE)
                 .find(embedUrl)?.groupValues?.get(1) ?: return false
             val api = "https://rumble.com/embedJS/u3/?request=video&v=$vid" +
                 "&embed=" + java.net.URLEncoder.encode(embedUrl, "UTF-8")
@@ -301,6 +326,54 @@ object CommonExtractors {
                 if (json.isNotBlank()) count = emit(json)
             }
             count > 0
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Ok.ru via data-options del embed. Verifica con #EXTM3U y añade progresivos.
+     */
+    suspend fun extractGdrivePlayer(
+        embedUrl: String,
+        siteReferer: String,
+        linkName: String,
+        customUA: String? = null,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        return try {
+            val html = app.get(embedUrl, referer = siteReferer, headers = headersWithUA(customUA), timeout = 20L).text
+            // El jugador JW del embed viaja XOR-eado: k="<hex>", b=atob("..."),
+            // o = b[i] ^ k[i % k.len]; (0,eval)(o). En el JS decodificado queda
+            // HLS="hlsplaylist.php?s=...&idhls=....m3u8" (relativo al embed host).
+            val script = Regex("<script>([\\s\\S]*?)</script>").findAll(html)
+                .map { it.groupValues[1] }
+                .firstOrNull { it.contains("atob(") && it.contains("k=\"") } ?: return false
+            val key = Regex("k=\"([0-9a-f]+)\"").find(script)?.groupValues?.get(1) ?: return false
+            val b64 = Regex("atob(\"([^\"]+)\")").find(script)?.groupValues?.get(1) ?: return false
+            val raw = try { java.util.Base64.getDecoder().decode(b64) } catch (_: Exception) { return false }
+            val keyBytes = key.toByteArray(Charsets.ISO_8859_1)
+            val out = ByteArray(raw.size)
+            for (i in raw.indices) out[i] = (raw[i].toInt() xor keyBytes[i % keyBytes.size].toInt()).toByte()
+            val decoded = String(out, Charsets.ISO_8859_1).replace("\\/", "/")
+            val hlsRel = Regex("HLS=\"([^\"]+\\\\.m3u8)\"").find(decoded)?.groupValues?.get(1) ?: return false
+            val origin = Regex("^https?://[^/]+").find(embedUrl)?.value ?: return false
+            val playlist = if (hlsRel.startsWith("http")) hlsRel else "$origin/$hlsRel"
+            val text = try { app.get(playlist, referer = embedUrl, headers = headersWithUA(customUA), timeout = 20L).text } catch (_: Exception) { "" }
+            if (!text.trimStart().startsWith("#EXTM3U")) return false
+            var emitted = false
+            try {
+                generateM3u8(linkName, playlist, origin).forEach { callback(it); emitted = true }
+            } catch (_: Exception) {}
+            if (!emitted) {
+                callback(
+                    newExtractorLink(source = linkName, name = linkName, url = playlist, type = ExtractorLinkType.M3U8) {
+                        this.referer = origin
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+            }
+            true
         } catch (_: Exception) {
             false
         }

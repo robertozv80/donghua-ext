@@ -454,9 +454,11 @@ class LmAnimeProvider : MainAPI() {
                         CE.extractDailymotion(iframe, "$mainUrl/", "$langTag • Dailymotion", UA, emittedSubs, emittedDmVids, subtitleCallback, callback)
                     iframe.contains("ok.ru", ignoreCase = true) ->
                         CE.extractOkRu(iframe, referer, "$langTag • Ok.ru", UA, callback)
-                    // v6 (2026-10): server Fembed del sitio. Fembed (fembed.com)
-                    // responde /api/source POST con flv/video mp4 progresivos.
-                    iframe.contains("fembed", ignoreCase = true) ->
+                    // v7 (2026-10): fembed (POST /api/source server-side) y
+                    // freeplayer (iframe WAF) hoy responden vacio: 1 intento
+                    // generico por si reviven.
+                    iframe.contains("fembed", ignoreCase = true) ||
+                        iframe.contains("freeplayer", ignoreCase = true) ->
                         extractFembed(iframe, referer, "$langTag • Fembed", callback)
                     // Filemoon (filemoon.sx): needs PoW; sin soporte (se omite).
                     else -> false

@@ -15,6 +15,9 @@ import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.collections.ArrayList
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
 
 // v22.2: extractores propios para servidores que CloudStream no trae integrados
 // (vgembed y bysekoze no existen en la lista de extractores del APK).
@@ -605,13 +608,18 @@ class MundoDonghuaProvider : MainAPI() {
             url
         }
 
-        val doc = app.get(donghuaUrl, timeout = 120).document
-        // FIX: Usar getBestImgSrc para manejar lazy loading de imágenes
+        // v27 SPEED: el pool del directorio se lanza en paralelo con la ficha y se
+        // cachea 30 min; la ficha NO espera el pool (el pool se consume al final,
+        // dentro de fetchMundoRecommendations).
+        val docDeferred = GlobalScope.async { app.get(donghuaUrl, timeout = 120).document }
+        val poolDeferred = GlobalScope.async { fetchMundoListingPool() }
+        val doc = docDeferred.await()
         val poster = doc.selectFirst("div.md-detail-poster > img")?.let { getBestImgSrc(it) }
             ?: doc.selectFirst("div.md-detail-banner-bg > img")?.let { getBestImgSrc(it) }
             ?: doc.selectFirst("head meta[property=og:image]")?.attr("content")
             ?: ""
         val resolvedPoster = resolveUrl(poster)
+        // FIX: Usar getBestImgSrc para manejar lazy loading de imágenes (aplica a los select de arriba)
         val title = doc.selectFirst("h1.md-detail-title")?.text() ?: ""
         val description = doc.selectFirst("p.md-detail-synopsis")?.text() ?: ""
         val genres = doc.select("a.md-genre-tag").map { it.text() }
@@ -644,9 +652,8 @@ class MundoDonghuaProvider : MainAPI() {
             else -> TvType.Anime
         }
 
-        // ===== v22 Recomendaciones =====
-        // (implementadas en fetchMundoRecommendations más abajo)
-        val recommendations = fetchMundoRecommendations(donghuaUrl, title)
+        // ===== v27 Recomendaciones =====
+        val recommendations = fetchMundoRecommendations(donghuaUrl, title, poolDeferred.await())
 
         // Para películas sin episodios, devolver respuesta de película
         if (episodes.isEmpty() && tvType == TvType.AnimeMovie) {
@@ -692,7 +699,31 @@ class MundoDonghuaProvider : MainAPI() {
      * 2) el resto: títulos del directorio general (aleatorio), excluyendo la
      *    serie actual y las temporadas ya agregadas. Máximo 10.
      */
-    private suspend fun fetchMundoRecommendations(donghuaUrl: String, seriesTitle: String): List<SearchResponse> {
+    /** v27 SPEED: cache 30 min del pool del directorio para las recomendaciones. */
+    private val listingPoolCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<Pair<String, String>>>>()
+
+    private suspend fun fetchMundoListingPool(): List<Pair<String, String>> {
+        val now = System.currentTimeMillis()
+        listingPoolCache["pool"]?.let { (ts, v) -> if (now - ts < 30 * 60_000L) return v }
+        val out = ArrayList<Pair<String, String>>()
+        try {
+            val listing = app.get("$mainUrl/lista-donghuas", timeout = 60).document
+            listing.select("div.md-card").forEach { card ->
+                if (out.size >= 60) return@forEach
+                val a = card.selectFirst("a[href*='/donghua/']") ?: return@forEach
+                val slug = a.attr("href").substringAfterLast("/").trimEnd('/')
+                if (slug.isBlank()) return@forEach
+                val t = card.selectFirst("h3.md-card-title")?.text()?.trim()
+                    ?: card.selectFirst("h5.md-card-title")?.text()?.trim()
+                    ?: return@forEach
+                out.add(slug to t)
+            }
+        } catch (_: Exception) {}
+        if (out.isNotEmpty()) listingPoolCache["pool"] = now to out
+        return out
+    }
+
+    private suspend fun fetchMundoRecommendations(donghuaUrl: String, seriesTitle: String, listingPool: List<Pair<String, String>>): List<SearchResponse> {
         return try {
             val all = ArrayList<SearchResponse>()
 
@@ -743,25 +774,18 @@ class MundoDonghuaProvider : MainAPI() {
                 }
             }
 
-            // 2) Similares aleatorios del directorio general
+            // 2) Similares aleatorios del directorio general (v27: pool precargado/cacheado en paralelo)
             val seen = all.mapTo(HashSet()) { it.url }
             seen.add(donghuaUrl)
             val pool = ArrayList<SearchResponse>()
-            val listing = app.get("$mainUrl/lista-donghuas", timeout = 120).document
-            listing.select("div.md-card").forEach { card ->
-                if (pool.size >= 40) return@forEach
-                val a = card.selectFirst("a[href*='/donghua/']") ?: return@forEach
-                val href = a.attr("href")
-                val fullUrl = resolveUrl(href)
-                if (fullUrl in seen) return@forEach
-                val t = card.selectFirst("h3.md-card-title")?.text()?.trim()
-                    ?: card.selectFirst("h5.md-card-title")?.text()?.trim()
-                    ?: return@forEach
-                val poster = card.selectFirst("div.md-card-img img")?.let { getBestImgSrc(it) }
+            var poolCardsUsed = 0
+            for ((slug, t) in listingPool) {
+                if (poolCardsUsed >= 40) break
+                val fullUrl = "$mainUrl/donghua/$slug"
+                if (fullUrl in seen) continue
                 seen.add(fullUrl)
-                pool.add(newAnimeSearchResponse(t, fullUrl) {
-                    this.posterUrl = resolveUrl(poster ?: "")
-                })
+                poolCardsUsed++
+                pool.add(newAnimeSearchResponse(t, fullUrl) {})
             }
             pool.shuffle()
             all.addAll(pool)
@@ -890,7 +914,7 @@ class MundoDonghuaProvider : MainAPI() {
                                         // Paso 1: Llamar a la API
                                         val apiResp = app.get("$mainUrl/api_donghua.php?slug=$slug", headers = reqHEAD, timeout = 15).text
                                         // Paso 2: Parsear respuesta JSON: [{"url":"BASE64_KEY"}]
-                                        val keyRegex = Regex("""\"url\"\s*:\s*\"([^\"]+)\"""")
+                                        val keyRegex = Regex("\"url\"\\s*:\\s*\"([^\"]+)\"")
                                         val apiKey = keyRegex.find(apiResp)?.destructured?.component1()
                                         if (!apiKey.isNullOrEmpty()) {
                                             // Paso 3: Obtener página del reproductor Dailymotion

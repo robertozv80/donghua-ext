@@ -170,9 +170,32 @@ class DonghuaZoneProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val q = java.net.URLEncoder.encode(query.trim(), "UTF-8")
-        val feed = fetchFeed("$mainUrl$FEED?alt=json&q=$q&max-results=30")
-        return feed.entries.mapNotNull { entryToSearchResponse(it) }
-            .distinctBy { it.url }
+        val feed = fetchFeed("$mainUrl$FEED?alt=json&q=$q&max-results=60")
+        // v7: UN resultado por serie. Blogger indexa cada post de episodio por el
+        // titulo de la serie: el mismo titulo devolvia 40 resultados ("A Record...
+        // ep 39..197") y en Movies 2 resultados (ficha + post del player) del
+        // mismo video. Por serie se elige el post mas rico: el que trae nota
+        // (label "8.50") o el que NO es de episodio (ficha/pelicula); a igualdad
+        // gana el primero del feed (el mas reciente).
+        val chosen = LinkedHashMap<String, org.json.JSONObject>()
+        fun rank(e: org.json.JSONObject): Int {
+            var r = 0
+            val cats = e.optJSONArray("category")
+            (0 until (cats?.length() ?: 0)).forEach { i ->
+                cats?.optJSONObject(i)?.optString("term")?.trim()?.let {
+                    if (Regex("""^\d\.\d+$""").matchEntire(it) != null) r += 4
+                }
+            }
+            val t = e.optJSONObject("title")?.optString("\$t") ?: ""
+            if (!t.contains(Regex("""Episode\s+\d+""", RegexOption.IGNORE_CASE))) r += 2
+            return r
+        }
+        feed.entries.forEach { entry ->
+            val label = seriesLabelOf(entry) ?: return@forEach
+            val prev = chosen[label]
+            if (prev == null || rank(entry) > rank(prev)) chosen[label] = entry
+        }
+        return chosen.values.mapNotNull { entryToSearchResponse(it) }
     }
 
     // ==================== DETAIL ====================
@@ -215,12 +238,15 @@ class DonghuaZoneProvider : MainAPI() {
         var posterSelf = ""
         var yearSelf: Int? = null
         if (isEpisode) {
-            val slug = url.substringAfterLast("/").removeSuffix(".html")
-            // El feed q= del slug trae el post; sus labels incluyen la serie
-            val feed = fetchFeed("$mainUrl$FEED?alt=json&q=${java.net.URLEncoder.encode(slug, "UTF-8")}&max-results=5")
+            // v7: pedir el post por path= (labels REALES del post en Blogger).
+            // El feed q=slug fallaba cuando el slug lleva "_" (ej: to_01276901521)
+            // o no coincide con el label de la serie -> ficha vacia y titulo feo
+            // "A Record Of Mortals Journey To_01276901521".
+            val path = url.replace("$mainUrl", "").substringBefore("?").substringBefore("#")
+            val feed = fetchFeed("$mainUrl$FEED?alt=json&path=${java.net.URLEncoder.encode(path, "UTF-8")}")
             for (entry in feed.entries) {
                 val link = entryLink(entry)
-                if (link != null && (link == url || link.contains(slug))) {
+                if (link != null && link == url) {
                     val cats = entry.optJSONArray("category")
                     val labels = (0 until (cats?.length() ?: 0)).mapNotNull { cats?.optJSONObject(it)?.optString("term") }
                     // v5: "el ULTIMO label" era "Summer 2026"/"Eps. Movie"/etc. y la
@@ -262,6 +288,9 @@ class DonghuaZoneProvider : MainAPI() {
         // Feed de la serie = episodios (por fecha desc; ordenar por numero)
         val labelEnc = java.net.URLEncoder.encode(seriesLabel, "UTF-8")
         val episodes = mutableListOf<Episode>()
+        // v7 (3.3): posts del label feed SIN "Episode N" (fichas de Movie / posts
+        // de ficha). Se guardan para poder numerarlos si no hay episodios.
+        val noEpPosts = ArrayList<Pair<String, String>>() // (link, titulo)
         val seen = mutableSetOf<String>()
         var startIndex = 1
         // Datos de la ficha: poster/plot/año del post de serie + generos de los labels
@@ -288,7 +317,13 @@ class DonghuaZoneProvider : MainAPI() {
                 val link = entryLink(entry) ?: continue
                 if (!seen.add(link)) continue
 
-                val isEpisodeEntry = title.contains(Regex("""Episode\s+\d+""", RegexOption.IGNORE_CASE))
+                // v7 (5.2): un post de player de Movie lista 2 partes con
+                // botones "Part [ 01 ]" y su titulo termina en "Movie [4K|Indo
+                // Sub]" SIN "Episode N". Es el post que hay que REPRODUCIR. Se
+                // considera episodio si el content trae botones con serverURL.
+                val contentHtml = entry.optJSONObject("content")?.optString("\$t") ?: ""
+                val hasPlayerButtons = contentHtml.contains("changeServer(")
+                val isEpisodeEntry = title.contains(Regex("""Episode\s+\d+""", RegexOption.IGNORE_CASE)) || hasPlayerButtons
                 val thumb = entry.optJSONObject("media\$thumbnail")?.optString("url")
                     ?.replace(Regex("/s\\d+(-c)?/"), "/s0/") ?: ""
                 val cats = entry.optJSONArray("category")
@@ -298,17 +333,22 @@ class DonghuaZoneProvider : MainAPI() {
                     }
                 }
 
-                if (!isEpisodeEntry && seriesThumb.isEmpty()) {
-                    // Post de la serie: poster, sinopsis y año de publicacion
-                    seriesThumb = thumb
+                if (!isEpisodeEntry) {
+                    // v7 (3.1): SINOPSIS REAL del sitio. El post de ficha/movie la
+                    // trae en <h2 class="heading">Sinopsis. ...</h2> + <div
+                    // class="sinoposis"><p>Texto</p></div> (NO en "descNime").
                     val content = entry.optJSONObject("content")?.optString("\$t") ?: ""
-                    val plain = stripHtml(content)
-                    if (plain.length > 40) seriesPlot = plain.take(1200)
+                    val sin = content.substringAfter("class=\"sinoposis\"", "")
+                        .substringAfter("class='sinoposis'", "")
+                        .substringBefore("</div>")
+                    val plainSin = stripHtml(sin)
+                    if (plainSin.length > 40 && seriesPlot.isBlank()) seriesPlot = plainSin.take(1200)
+                    if (seriesThumb.isEmpty()) seriesThumb = thumb
                     seriesYear = entry.optString("published")?.take(4)?.toIntOrNull()
                 }
                 if (seriesThumb.isEmpty() && thumb.isNotEmpty()) seriesThumb = thumb
 
-                if (!isEpisodeEntry) continue
+                if (!isEpisodeEntry) { noEpPosts.add(link to title); continue }
                 val num = Regex("""Episode\s+(\d+(?:-\d+)?)""", RegexOption.IGNORE_CASE)
                     .find(title)?.groupValues?.get(1)?.substringBefore("-")?.toIntOrNull()
                 episodes.add(newEpisode(link) {
@@ -318,6 +358,22 @@ class DonghuaZoneProvider : MainAPI() {
             }
             if (!feed.fullPage) break
             startIndex += PAGE_SIZE
+        }
+
+        // v7 (3.3): fichas de Movie/series sin post de episodios: el label feed
+        // puede volver solo posts de ficha/player sin "Episode N" en el titulo.
+        // Si no hay episodios, se numeran esos posts (el mas viejo = 1) para poder
+        // reproducir la pelicula/ficha en vez de una ficha sin episodios.
+        if (episodes.isEmpty() && noEpPosts.isNotEmpty()) {
+            val n = noEpPosts.size
+            noEpPosts.forEachIndexed { i, (epLink, epTitle) ->
+                episodes.add(
+                    newEpisode(epLink) {
+                        this.name = epTitle
+                        this.episode = n - i
+                    }
+                )
+            }
         }
 
         // v5 (3.1): si el feed de serie no expuso sinopsis (posts de Movie o

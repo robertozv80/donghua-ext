@@ -756,7 +756,7 @@ class SeriesDonghuaProvider : MainAPI() {
             // hls-vod/..."} en el bloque m.f["VID"] (el mapa "360":{...} ya no
             // aparece; el patron viejo solo matcheaba la timeline de 180p).
             // HLS VOD valido con variantes 1080/720/480/360 (verificado en vivo).
-            Regex("\"hls\":[{]\"url\":\"(https://rumble[.]com/hls-vod/[^\"]+)\")")
+            Regex("\"hls\":\\{\"url\":\"(https://rumble[.]com/hls-vod/[^\"]+)\"")
                 .find(fixed)?.groupValues?.get(1)?.let { hlsUrl ->
                     try {
                         generateM3u8(name, hlsUrl, embedUrl).forEach(callback)

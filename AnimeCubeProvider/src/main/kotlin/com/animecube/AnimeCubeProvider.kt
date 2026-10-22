@@ -352,9 +352,12 @@ class AnimeCubeProvider : MainAPI() {
      */
     private fun acParseEpisodes(flight: String, slug: String): List<AcSeason> {
         val seasons = LinkedHashMap<String, MutableAcSeason>()
-        val epPattern = Regex(
-            """"id":"([^"]+)-(tab-[\w-]+)-ep-(\d+(?:-\d+)?)","number":(\d+),"numberDisplay":"((?:[^"\]|\.)*)","title":"((?:[^"\]|\.)*)"""
-        )
+        // v7 (2026-10-20 FIX "Enlaces no encontrados"): el patron anterior exigia
+        // `","number"` INMEDIATAMENTE despues de los digitos del id, pero el payload
+        // real termina el valor con LA COMILLA DE CIERRE ("id":"...-ep-1","number":1
+        // -> falta el ") y no matcheaba NUNCA -> 0 episodios y ficha/links vacios.
+        // Patrón tolerante: id + comilla de cierre opcional + campos number/numberDisplay/title.
+        val epPattern = Regex("\"id\":\"([^\"]+)-(tab-[\\w-]+)-ep-(\\d+(?:-\\d+)?)\"?,\"number\":(\\d+),\"numberDisplay\":\"([^\"]*)\",\"title\":\"([^\"]*)\"")
         epPattern.findAll(flight).forEach { em ->
             val seId = em.groupValues[2]
             val id = em.groupValues[1] + "-" + seId + "-ep-" + em.groupValues[3]
@@ -386,10 +389,17 @@ class AnimeCubeProvider : MainAPI() {
      * coge la primera >= 200 chars que no sea marketing.
      */
     private fun acSynopsis(flight: String): String {
-        val bad = listOf("stay updated", "stream quality", "premium anime", "watch donghua online")
+        // v7: BOILERPLATE completo del sitio (meta description real de hoy):
+        // "Watch anime online in high quality. Stay updated..." entra por >= 200
+        // chars y se mostraba como sinopsis. Se filtra por prefijo y por CONTIENE.
+        val bad = listOf(
+            "stay updated", "stream quality", "premium anime", "watch donghua online",
+            "watch anime online in high quality", "donate feedback", "contact us"
+        )
         Regex(""""description":"((?:[^"\\\\]|\\\\.)*)"""").findAll(flight).forEach { m ->
             val d = acUnescJson(m.groupValues[1]).trim()
-            if (d.length >= 200 && bad.none { d.lowercase().startsWith(it) }) return d
+            val dl = d.lowercase()
+            if (d.length >= 200 && bad.none { dl.startsWith(it) || dl.contains(it) }) return d
         }
         return ""
     }
@@ -648,18 +658,29 @@ class AnimeCubeProvider : MainAPI() {
             val slugM = Regex(""""([a-z0-9-]+)":\s*\{""").find(bySeason, i) ?: break
             val slugObj = acBalancedObject(bySeason, slugM.range.last)
             if (slugObj == null) { i = slugM.range.last + 1; continue }
+            val slug = slugM.groupValues[1]
             var j = 0
+            var addedForSlug = false
             while (j < slugObj.length) {
                 val ptM = Regex(""""(primary-[\w-]+)":\s*\{""").find(slugObj, j) ?: break
                 val ptObj = acBalancedObject(slugObj, ptM.range.last)
                 if (ptObj != null) {
                     Regex(""""(tab-[\w-]+)":\s*"([^"]+)"""").findAll(ptObj).forEach { m ->
                         out.add(
-                            AcVersionEntry(slugM.groupValues[1], ptM.groupValues[1], m.groupValues[1], m.groupValues[2])
+                            AcVersionEntry(slug, ptM.groupValues[1], m.groupValues[1], m.groupValues[2])
                         )
                     }
+                    addedForSlug = true
                 }
                 j = ptM.range.last + (ptObj?.length ?: 1)
+            }
+            // v7: SHAPE PLANO {"tab-1":"ver"} (sin nivel primary-) — el sitio lo
+            // emite para series nuevas (p.ej. a-good-day-to-ascend) y el parser
+            // anterior las ignoraba; el /sources exige un primaryTabId igualmente.
+            if (!addedForSlug) {
+                Regex(""""(tab-[\w-]+)":\s*"([^"]+)"""").findAll(slugObj).forEach { m ->
+                    out.add(AcVersionEntry(slug, "primary-1", m.groupValues[1], m.groupValues[2]))
+                }
             }
             i = slugM.range.last + slugObj.length
         }
