@@ -426,6 +426,8 @@ class SeriesDonghuaProvider : MainAPI() {
     ): Boolean {
         var links = 0
         val cb: (ExtractorLink) -> Unit = { links++; callback(it) }
+        // v8: dedupe DM por episodio (el set es de instancia).
+        sdEmittedDmVids.clear()
 
         // data = URL del episodio (serie) o de la ficha (pelicula)
         val pageResp = try { pageGet(data) } catch (_: Exception) { null }

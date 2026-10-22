@@ -875,6 +875,8 @@ class AnimeGratisProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ): Boolean {
         val doc = app.get(data, headers = headers, timeout = 30L).document
+        // v8: dedupe DM por episodio (el set es de instancia).
+        agEmittedDmVids.clear()
         var foundLinks = false
 
         // v22.8 FIX: la página usa botones class="server-option-btn" con data-url

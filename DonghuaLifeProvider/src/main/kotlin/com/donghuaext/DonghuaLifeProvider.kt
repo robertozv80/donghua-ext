@@ -972,6 +972,10 @@ class DonghuaLifeProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // v8: los sets de dedupe DM son por instancia; limpiarlos por episodio.
+        dlEmittedDmVids.clear()
+        dlEmittedDmSubs.clear()
+
         val (cleanUrl, preloadedContentId) = if (data.contains("##")) {
             val parts = data.split("##")
             val cid = parts.getOrNull(1)?.substringAfter("=") ?: ""

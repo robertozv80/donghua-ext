@@ -380,6 +380,8 @@ class LmAnimeProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = app.get(data, headers = mapOf("User-Agent" to UA)).document
+        // v8: dedupe DM por episodio (el set es de instancia).
+        emittedDmVids.clear()
 
         // Select.mirror con etiqueta de idioma por servidor ("English", "Espanol", ...)
         val mirrors = document.select("select.mirror option").mapNotNull { opt ->

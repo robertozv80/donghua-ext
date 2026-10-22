@@ -230,6 +230,10 @@ object CommonExtractors {
                     app.get(u, referer = DM_REFERER, headers = headersWithUA(customUA), timeout = 12L)
                         .text.trimStart().startsWith("#EXT")
                 } catch (_: Exception) { false }
+                android.util.Log.d(
+                    "DMExtract",
+                    "tryPlaylist ${u.substringAfter("://").substringBefore("/")} -> $isPlaylist"
+                )
                 return if (isPlaylist) { emit(u, true, hlsQ); true } else false
             }
 
@@ -296,6 +300,30 @@ object CommonExtractors {
                     // skip AV1: negro / sin audio
                 } else {
                     emit(url, url.contains(".m3u8"), q)
+                }
+            }
+
+            // v9 (2026-10): ULTIMO recurso para videos privados de Dailymotion.
+            // El metadata SOLO trae qualities.auto (cdndirector). La validacion
+            // con app.get (OkHttp) puede devolver 403 por fingerprint TLS, pero
+            // el reproductor de CloudStream usa Cronet (stack de Chrome) y si
+            // puede abrirlo. Se emite UNICAMENTE el master real: jamas el
+            // advertising.ad_url / dmxleo (VMAP -> ERROR_CODE_PARSING).
+            if (!found) {
+                val candidate = Regex("""auto":\[\{[^}]*"url":"(https://[^"]+)"""").find(json)
+                    ?.groupValues?.get(1)?.let { unescJson(it) }
+                    ?: Regex("""https://[a-z0-9.-]+\.dailymotion\.com/cdn/manifest/video/[a-z0-9]+\.m3u8[^"']*""",
+                        RegexOption.IGNORE_CASE).find(json)?.value
+                if (candidate != null &&
+                    !candidate.contains("dmxleo", true) &&
+                    !candidate.contains("advertising", true) &&
+                    !candidate.contains("auth=", true)
+                ) {
+                    android.util.Log.d(
+                        "DMExtract",
+                        "fallback master sin validar ${candidate.substringAfter("://").substringBefore("/")}"
+                    )
+                    emit(candidate, true, Qualities.Unknown.value)
                 }
             }
             found

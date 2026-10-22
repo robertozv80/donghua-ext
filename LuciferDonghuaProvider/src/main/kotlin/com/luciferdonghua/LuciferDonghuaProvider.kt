@@ -413,6 +413,8 @@ class LuciferDonghuaProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = app.get(data, headers = mapOf("User-Agent" to UA)).document
+        // v8: dedupe DM por episodio (el set es de instancia).
+        emittedDmVids.clear()
 
         // select.mirror con iframes completos en base64
         val mirrors = mutableListOf<Pair<String, String>>() // label -> iframe html

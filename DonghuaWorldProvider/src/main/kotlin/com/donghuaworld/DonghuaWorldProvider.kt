@@ -618,6 +618,8 @@ class DonghuaWorldProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = app.get(data).document
+        // v8: dedupe DM por episodio (el set es de instancia).
+        dwEmittedDmVids.clear()
 
         val serverButtons = document.select("a[data-hash], .btn[data-hash], .server-item[data-hash]")
         if (serverButtons.isEmpty()) return false

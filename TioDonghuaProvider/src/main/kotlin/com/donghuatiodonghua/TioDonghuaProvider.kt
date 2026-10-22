@@ -728,6 +728,9 @@ class TioDonghuaProvider : MainAPI() {
         var foundLinks = false
         var links = 0
         val cb: (ExtractorLink) -> Unit = { links++; callback(it) }
+        // v8: dedupe DM por episodio (los sets son de instancia).
+        tdEmittedDmVids.clear()
+        tdEmittedDmSubs.clear()
 
         // Opciones de servidor Dooplay (AJAX).
         // v24.3: los episodios nuevos solo exponen <li class="... is-vip-server">

@@ -384,24 +384,31 @@ class AnimeCubeProvider : MainAPI() {
     }
 
     /**
-     * v6: SINOPSIS REAL del anime. En el flight hay varias "description": la
-     * PRIMERA es el boilerplate del sitio y la del anime es la mas larga. Se
-     * coge la primera >= 200 chars que no sea marketing.
+     * v8: SINOPSIS REAL del anime. En el flight hay varias "description": la
+     * del sitio es boilerplate y la del anime es la mas larga. Se elige la
+     * mas larga (>= 80 chars) que no sea marketing.
      */
     private fun acSynopsis(flight: String): String {
-        // v7: BOILERPLATE completo del sitio (meta description real de hoy):
-        // "Watch anime online in high quality. Stay updated..." entra por >= 200
-        // chars y se mostraba como sinopsis. Se filtra por prefijo y por CONTIENE.
+        // v7: filtros del boilerplate del sitio (meta description actual).
         val bad = listOf(
             "stay updated", "stream quality", "premium anime", "watch donghua online",
             "watch anime online in high quality", "donate feedback", "contact us"
         )
-        Regex(""""description":"((?:[^"\\\\]|\\\\.)*)"""").findAll(flight).forEach { m ->
-            val d = acUnescJson(m.groupValues[1]).trim()
-            val dl = d.lowercase()
-            if (d.length >= 200 && bad.none { dl.startsWith(it) || dl.contains(it) }) return d
+        var best = ""
+        // v8: el RSC trae comillas normales y el HTML las trae escapadas. Se
+        // escanean ambas variantes y se elige la sinopsis real MAS LARGA (antes
+        // se exigian 200 chars y se devolvia la PRIMERA: si el payload cambia
+        // de orden o acorta el texto, la ficha quedaba en "Trama no encontrada").
+        for (text in listOf(flight, flight.replace("\\\"", "\""))) {
+            Regex(""""description":"((?:[^"\\\\]|\\\\.)*)"""").findAll(text).forEach { m ->
+                val d = acUnescJson(m.groupValues[1]).trim()
+                val dl = d.lowercase()
+                if (d.length < 80) return@forEach
+                if (bad.any { dl.startsWith(it) || dl.contains(it) }) return@forEach
+                if (d.length > best.length) best = d
+            }
         }
-        return ""
+        return best
     }
 
     private fun parseRscSeasons(flight: String, slug: String): List<AcSeason> {
@@ -456,25 +463,43 @@ class AnimeCubeProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val slug = url.trimEnd('/').substringAfterLast('/')
+        val noCache = mapOf("Cache-Control" to "no-cache", "Pragma" to "no-cache")
+        val ts = System.currentTimeMillis()
+        // v8: cache-buster. El http_cache de OkHttp puede conservar un RSC
+        // antiguo (p.ej. solo temporada 1 y sin sinopsis) y la ficha queda
+        // con "Trama no encontrada" y episodios incompletos.
         val flight = app.get(
-            "$mainUrl/anime/$slug?_rsc=1",
-            headers = mapOf("User-Agent" to UA, "RSC" to "1"),
+            "$mainUrl/anime/$slug?_rsc=1&_t=$ts",
+            headers = mapOf("User-Agent" to UA, "RSC" to "1") + noCache,
             timeout = 25L
         ).text
 
-        val seasons = acParseEpisodes(flight, slug)
-
         // Titulo: og:title del HTML SSR ("<slug> - Watch Online | Anime Cube")
-        val html = app.get("$mainUrl/anime/$slug", headers = mapOf("User-Agent" to UA)).text
+        val html = app.get(
+            "$mainUrl/anime/$slug?_t=$ts",
+            headers = mapOf("User-Agent" to UA) + noCache
+        ).text
+        // El HTML trae el mismo flight escapado: respaldo si el RSC llega
+        // corto o sin los campos nuevos.
+        val htmlFlight = html.replace("\\\"", "\"")
+        val bySeason = LinkedHashMap<String, AcSeason>()
+        for (s in acParseEpisodes(flight, slug) + acParseEpisodes(htmlFlight, slug)) {
+            val prev = bySeason[s.id]
+            bySeason[s.id] = if (prev == null) s
+            else prev.copy(episodes = (prev.episodes + s.episodes).distinctBy { it.id })
+        }
+        val seasons = bySeason.values.toList()
         val doc = Jsoup.parse(html)
         val title = doc.selectFirst("meta[property=og:title]")?.attr("content")
             ?.removeSuffix(" - Watch Online | Anime Cube")?.trim()
             ?: acSlugToTitle(slug)
         val description = run {
             val meta = doc.selectFirst("meta[name=description]")?.attr("content")?.trim() ?: ""
-            // v6: la meta es boilerplate del sitio; usar la sinopsis del flight
-            if (meta.isBlank() || meta.endsWith("Watch anime online in high quality.")) acSynopsis(flight)
-            else meta
+            val fromMeta = if (meta.isBlank() || meta.endsWith("Watch anime online in high quality.")) "" else meta
+            if (fromMeta.isNotBlank()) fromMeta
+            // v8: si el RSC no trae la descripcion, el flight del HTML
+            // (desescapado) la contiene.
+            else acSynopsis(flight).ifBlank { acSynopsis(htmlFlight) }
         }
 
         val episodes = mutableListOf<Episode>()
@@ -627,22 +652,29 @@ class AnimeCubeProvider : MainAPI() {
     /** Registro de versiones: soporta respuesta plana y cifrada (con X-Obf propio). */
     private suspend fun fetchRegistry(): List<AcVersionEntry> {
         return try {
-            val baseHeaders = mapOf("User-Agent" to UA, "Accept" to "application/json")
-            val r = app.get("$mainUrl/api/anime-sources-versions", headers = baseHeaders, timeout = 20L)
-            val body = r.text
+            val baseHeaders = mapOf(
+                "User-Agent" to UA,
+                "Accept" to "application/json",
+                "Cache-Control" to "no-cache",
+                "Pragma" to "no-cache"
+            )
+            // Cache-buster: el http_cache de OkHttp puede devolver un registro
+            // antiguo (versiones de /sources caducadas -> 403/sin fuentes).
+            val u = "$mainUrl/api/anime-sources-versions?_t=${System.currentTimeMillis()}"
+            val body = app.get(u, headers = baseHeaders, timeout = 20L).text
             if (body.contains("\"bySeason\"")) {
                 parseRegistryPlain(body)
             } else {
                 // Cifrado: reintentar con X-Obf propio y descifrar con etag+obf
                 val obf = acRandomHex()
-                val resp = app.get(
-                    "$mainUrl/api/anime-sources-versions",
-                    headers = baseHeaders + mapOf("X-Obf" to obf), timeout = 20L
-                )
-                val etag = resp.headers["X-Registry-ETag"] ?: return emptyList()
-                val d = resp.text.substringAfter("\"d\":\"").substringBefore("\"")
-                if (d.isBlank()) return emptyList()
-                acDecrypt(d, "$obf|$etag")?.let { parseRegistryPlain(it) } ?: emptyList()
+                val resp = app.get(u, headers = baseHeaders + mapOf("X-Obf" to obf), timeout = 20L)
+                val etag = resp.headers["X-Registry-ETag"]
+                val d = resp.text.substringAfter("\"d\":\"", "").substringBefore("\"")
+                if (d.isBlank()) emptyList()
+                else {
+                    val key = if (etag.isNullOrBlank()) obf else "$obf|$etag"
+                    acDecrypt(d, key)?.let { parseRegistryPlain(it) } ?: emptyList()
+                }
             }
         } catch (_: Exception) {
             emptyList()
@@ -651,83 +683,94 @@ class AnimeCubeProvider : MainAPI() {
 
     private fun parseRegistryPlain(raw: String): List<AcVersionEntry> {
         val out = mutableListOf<AcVersionEntry>()
-        // {"bySeason":{"<slug>":{"<ptId>":{"<seId>":"<version>"}}}}
-        val bySeason = acBalancedObject(raw, raw.indexOf("\"bySeason\"")) ?: return out
-        var i = 0
-        while (i < bySeason.length) {
-            val slugM = Regex(""""([a-z0-9-]+)":\s*\{""").find(bySeason, i) ?: break
-            val slugObj = acBalancedObject(bySeason, slugM.range.last)
-            if (slugObj == null) { i = slugM.range.last + 1; continue }
-            val slug = slugM.groupValues[1]
-            var j = 0
-            var addedForSlug = false
-            while (j < slugObj.length) {
-                val ptM = Regex(""""(primary-[\w-]+)":\s*\{""").find(slugObj, j) ?: break
-                val ptObj = acBalancedObject(slugObj, ptM.range.last)
-                if (ptObj != null) {
-                    Regex(""""(tab-[\w-]+)":\s*"([^"]+)"""").findAll(ptObj).forEach { m ->
-                        out.add(
-                            AcVersionEntry(slug, ptM.groupValues[1], m.groupValues[1], m.groupValues[2])
-                        )
+        try {
+            val bySeason = org.json.JSONObject(raw).optJSONObject("bySeason") ?: return out
+            for (slug in bySeason.keys()) {
+                val perSlug = bySeason.optJSONObject(slug) ?: continue
+                val keys = perSlug.keys().asSequence().toList()
+                val hasPrimary = keys.any { it.startsWith("primary-") }
+                if (hasPrimary) {
+                    for (pt in keys) {
+                        val perPt = perSlug.optJSONObject(pt) ?: continue
+                        for (se in perPt.keys()) {
+                            val ver = perPt.optString(se)
+                            if (se.startsWith("tab-") && ver.isNotBlank())
+                                out.add(AcVersionEntry(slug, pt, se, ver))
+                        }
                     }
-                    addedForSlug = true
-                }
-                j = ptM.range.last + (ptObj?.length ?: 1)
-            }
-            // v7: SHAPE PLANO {"tab-1":"ver"} (sin nivel primary-) — el sitio lo
-            // emite para series nuevas (p.ej. a-good-day-to-ascend) y el parser
-            // anterior las ignoraba; el /sources exige un primaryTabId igualmente.
-            if (!addedForSlug) {
-                Regex(""""(tab-[\w-]+)":\s*"([^"]+)"""").findAll(slugObj).forEach { m ->
-                    out.add(AcVersionEntry(slug, "primary-1", m.groupValues[1], m.groupValues[2]))
+                } else {
+                    // Shape plano {"tab-1":"ver"} de series nuevas.
+                    for (se in keys) {
+                        val ver = perSlug.optString(se)
+                        if (se.startsWith("tab-") && ver.isNotBlank())
+                            out.add(AcVersionEntry(slug, "primary-1", se, ver))
+                    }
                 }
             }
-            i = slugM.range.last + slugObj.length
+        } catch (_: Exception) {
+            out.clear()
         }
         return out
     }
 
-    /** Llama a /sources; soporta respuesta plana {"sources":[...]} y cifrada {"d":...}. */
+    /**
+     * v8 (2026-10): /sources se parsea con org.json. El regex anterior exigia
+     * objetos PLANOS (`{[^{}]*"platform":...}`) y el sitio añadio
+     * `"skipTiming":{"intro":24}` DENTRO de cada source: ningun objeto
+     * matcheaba -> sources vacio -> "Enlaces no encontrados".
+     */
     private suspend fun fetchSources(
         slug: String, epId: String, ptId: String, seId: String, version: String
     ): List<AcSourceEntry> {
+        val obf = acRandomHex()
+        // Cache-buster: el movil puede conservar respuestas viejas en el
+        // http_cache de OkHttp y la lista de fuentes se queda desactualizada.
+        val u = "$mainUrl/api/anime/$slug/episode/$epId/sources" +
+            "?v=" + java.net.URLEncoder.encode(version, "UTF-8") +
+            "&primaryTabId=" + java.net.URLEncoder.encode(ptId, "UTF-8") +
+            "&seasonId=" + java.net.URLEncoder.encode(seId, "UTF-8") +
+            "&_t=" + System.currentTimeMillis()
+        val baseHeaders = mapOf(
+            "User-Agent" to UA,
+            "Accept" to "application/json",
+            "Cache-Control" to "no-cache",
+            "Pragma" to "no-cache"
+        )
+
+        fun parsePayload(payload: String): List<AcSourceEntry> = try {
+            val arr = org.json.JSONObject(payload).optJSONArray("sources") ?: org.json.JSONArray()
+            (0 until arr.length()).mapNotNull { i ->
+                val o = arr.optJSONObject(i) ?: return@mapNotNull null
+                val platform = o.optString("platform").trim()
+                // La metadata DM necesita el id LARGO (privateId); el corto
+                // responde "Contenido privado".
+                val id = o.optString("privateId").trim()
+                    .ifBlank { o.optString("videoId").trim() }
+                if (platform.isBlank() || id.isBlank()) null
+                else AcSourceEntry(platform, id, o.optString("quality").trim())
+            }.distinctBy { "${it.platform}|${it.videoId}" }
+        } catch (_: Exception) {
+            emptyList()
+        }
+
         return try {
-            val obf = acRandomHex()
-            val u = "$mainUrl/api/anime/$slug/episode/$epId/sources" +
-                "?v=" + java.net.URLEncoder.encode(version, "UTF-8") +
-                "&primaryTabId=" + java.net.URLEncoder.encode(ptId, "UTF-8") +
-                "&seasonId=" + java.net.URLEncoder.encode(seId, "UTF-8")
             val text = app.get(
                 u,
-                headers = mapOf("User-Agent" to UA, "Accept" to "application/json", "X-Obf" to obf),
+                headers = baseHeaders + mapOf("X-Obf" to obf),
                 timeout = 20L
             ).text
             val payload = if (text.contains("\"sources\"")) text
             else {
-                val d = text.substringAfter("\"d\":\"").substringBefore("\"")
+                val d = text.substringAfter("\"d\":\"", "").substringBefore("\"")
                 if (d.isBlank()) "" else acDecrypt(d, "$obf|$version") ?: ""
             }
-            if (payload.isEmpty()) return emptyList()
-
-            // FIX v4 (2026-10): la API de metadata de Dailymotion necesita el id LARGO
-            // (privateId, p.ej. "k5Vsp1UXQ2vIA2HSWyi") para los videos no listados del
-            // sitio; el videoId corto ("xaq348m") responde error -> 0 HLS/0 subs y la
-            // ficha mostraba "No se encontraron enlaces". Preferir privateId.
-            // El orden de propiedades no es estable; no acoplar el parser a
-            // platform -> privateId -> quality -> videoId.
-            Regex("""\{[^{}]*"platform":"([\w-]+)"[^{}]*\}""")
-                .findAll(payload)
-                .mapNotNull { m ->
-                    val item = m.value
-                    val platform = m.groupValues[1]
-                    val privateId = Regex(""""privateId":"([^"]*)"""").find(item)?.groupValues?.get(1).orEmpty()
-                    val videoId = Regex(""""videoId":"([\w-]+)"""").find(item)?.groupValues?.get(1).orEmpty()
-                    val quality = Regex(""""quality":"([^"]*)"""").find(item)?.groupValues?.get(1).orEmpty()
-                    val id = privateId.ifBlank { videoId }
-                    if (id.isBlank()) null else AcSourceEntry(platform, id, quality)
-                }
-                .distinctBy { "${it.platform}|${it.videoId}" }
-                .toList()
+            val encrypted = parsePayload(payload)
+            if (encrypted.isNotEmpty()) encrypted
+            else {
+                // Fallback: sin X-Obf la API responde JSON plano. Evita
+                // depender del cifrado GCM si el sitio cambia la clave.
+                parsePayload(app.get(u, headers = baseHeaders, timeout = 20L).text)
+            }
         } catch (_: Exception) {
             emptyList()
         }
@@ -745,15 +788,30 @@ class AnimeCubeProvider : MainAPI() {
         val slug = m.groupValues[1]
         val seId = m.groupValues[2]
 
-        // v4: emparejar por slug+seasonId. El fallback anterior (registry.firstOrNull())
-        // tomaba una version de OTRA serie y las fuentes fallaban en silencio.
-        val registry = fetchRegistry()
-        val entry = registry.firstOrNull { it.slug == slug && it.seasonId == seId }
-            ?: registry.firstOrNull { it.slug == slug && it.version.isNotBlank() }
-            ?: return false
+        // v8: el dedupe DM es POR EPISODIO. Al ser un campo de instancia, sin
+        // limpiarlo el segundo loadLinks del mismo episodio devolvia true sin
+        // emitir ningun enlace (fuentes que "desaparecen" al reabrir).
+        emittedDmVids.clear()
 
-        val sources = fetchSources(slug, data, entry.primaryTabId, entry.seasonId, entry.version)
+        val registry = fetchRegistry()
+        // v8: probar las entradas de la serie, priorizando la temporada exacta.
+        // Si el registro cambio de shape/version, el episodio no queda muerto.
+        val entries = registry.filter { it.slug == slug }
+            .sortedBy { if (it.seasonId == seId) 0 else 1 }
+        if (entries.isEmpty()) return false
+
+        var sources = emptyList<AcSourceEntry>()
+        var used: AcVersionEntry? = null
+        for (entry in entries.take(3)) {
+            sources = fetchSources(slug, data, entry.primaryTabId, entry.seasonId, entry.version)
+            if (sources.isNotEmpty()) { used = entry; break }
+        }
         if (sources.isEmpty()) return false
+        android.util.Log.d(
+            "AnimeCube",
+            "loadLinks $data sources=${sources.map { it.platform }} " +
+                "entry=${used?.primaryTabId}/${used?.seasonId}"
+        )
 
         val emittedSubs = mutableSetOf<String>()
         var found = false
@@ -765,12 +823,15 @@ class AnimeCubeProvider : MainAPI() {
                         "Dailymotion${if (s.quality.isNotBlank()) " (${s.quality})" else ""}",
                         emittedSubs, subtitleCallback, callback
                     )
+                    android.util.Log.d("AnimeCube", "DM ${s.videoId} q=${s.quality} ok=$ok")
                     if (ok) found = true
                 }
                 "rumble" -> {
                     val ok = extractRumble(s.videoId, "Rumble", callback)
+                    android.util.Log.d("AnimeCube", "Rumble ${s.videoId} ok=$ok")
                     if (ok) found = true
                 }
+                else -> android.util.Log.d("AnimeCube", "platform no soportada: ${s.platform}")
             }
         }
         return found
