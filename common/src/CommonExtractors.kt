@@ -234,7 +234,21 @@ object CommonExtractors {
                     "DMExtract",
                     "tryPlaylist ${u.substringAfter("://").substringBefore("/")} -> $isPlaylist"
                 )
-                return if (isPlaylist) { emit(u, true, hlsQ); true } else false
+                if (!isPlaylist) return false
+                // Keep the master as a fallback, but expand its variant playlists
+                // first so CloudStream can show the real 1080/720/480 qualities.
+                var expanded = false
+                try {
+                    generateM3u8(linkName, u, DM_REFERER).forEach { link ->
+                        callback(link)
+                        expanded = true
+                        found = true
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.d("DMExtract", "generateM3u8 failed: ${e.message}")
+                }
+                if (!expanded) emit(u, true, hlsQ)
+                return true
             }
 
             // 1) Master HLS del campo qualities del metadata. El propio URL
