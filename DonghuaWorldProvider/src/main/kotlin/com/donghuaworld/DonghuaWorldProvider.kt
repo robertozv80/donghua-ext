@@ -642,6 +642,10 @@ class DonghuaWorldProvider : MainAPI() {
                         serverName.contains("Dailymotion", ignoreCase = true) ||
                         serverName.contains("DM Player", ignoreCase = true) ||
                         serverName.contains("DM", ignoreCase = true) -> engSubUrl = iframeSrc
+                    // El texto del boton no es fiable (el sitio agreg6 "4K Player");
+                    // si el iframe decodificado es de Dailymotion se pierde el
+                    // mirror solo por no conocer la etiqueta.
+                    iframeSrc.contains("dailymotion", ignoreCase = true) -> engSubUrl = iframeSrc
                 }
             } catch (_: Exception) {
                 // Skip invalid base64
@@ -1037,7 +1041,9 @@ class DonghuaWorldProvider : MainAPI() {
      */
     private fun parseQualityFromLabel(label: String): Int {
         return when {
-            label.contains("4K", ignoreCase = true) -> Qualities.P2160.value
+            label.contains("4K", ignoreCase = true) ||
+                label.contains("2160", ignoreCase = true) -> Qualities.P2160.value
+            label.contains("1440", ignoreCase = true) -> Qualities.P1440.value
             label.contains("1080", ignoreCase = true) -> Qualities.P1080.value
             label.contains("720", ignoreCase = true) -> Qualities.P720.value
             label.contains("480", ignoreCase = true) -> Qualities.P480.value

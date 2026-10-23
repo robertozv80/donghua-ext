@@ -439,7 +439,14 @@ class LmAnimeProvider : MainAPI() {
             val page = app.get(mirror.url, referer = referer, headers = mapOf("User-Agent" to UA)).document
             val iframes = page.select("#pembed iframe[src], .player-embed iframe[src], iframe[src]")
                 .map { it.attr("abs:src") }
-                .filter { it.contains("dailymotion", ignoreCase = true) || it.contains("ok.ru", ignoreCase = true) }
+                // El filtro debe cubrir TODOS los hosts que se despachan abajo;
+                // si no, la rama fembed/freeplayer queda inalcanzable.
+                .filter {
+                    it.contains("dailymotion", ignoreCase = true) ||
+                        it.contains("ok.ru", ignoreCase = true) ||
+                        it.contains("fembed", ignoreCase = true) ||
+                        it.contains("freeplayer", ignoreCase = true)
+                }
             if (iframes.isEmpty()) return false
 
             // v4: "Multisub" se etiqueta como tal (antes salia como "Español").

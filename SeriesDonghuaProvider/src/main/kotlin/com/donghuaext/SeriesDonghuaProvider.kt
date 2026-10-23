@@ -428,6 +428,9 @@ class SeriesDonghuaProvider : MainAPI() {
         val cb: (ExtractorLink) -> Unit = { links++; callback(it) }
         // v8: dedupe DM por episodio (el set es de instancia).
         sdEmittedDmVids.clear()
+        // Los subtítulos comparten el mismo ciclo de vida: sin limpiarlos, el
+        // segundo loadLinks del episodio reabría la lista sin subtítulos.
+        sdEmittedSubs.clear()
 
         // data = URL del episodio (serie) o de la ficha (pelicula)
         val pageResp = try { pageGet(data) } catch (_: Exception) { null }
@@ -562,6 +565,18 @@ class SeriesDonghuaProvider : MainAPI() {
             .replaceFirstChar { it.uppercase() }
     }
 
+    /**
+     * v26.1: el JS anti-bot de VOE (y clones) publica en el HTML un clip de
+     * prueba —Big Buck Bunny en AV1, test-videos.co.uk— que antes se emitia como
+     * fuente "Unknown" seleccionable. Tambien descarta los ".mp4" que son parte
+     * del host (mp4upload.com/embed-x.html), no un archivo real.
+     */
+    private fun isJunkVideoUrl(u: String): Boolean =
+        u.contains("test-videos.co.uk", ignoreCase = true) ||
+            u.contains("av01", ignoreCase = true) ||
+            Regex("""/av1/""", RegexOption.IGNORE_CASE).containsMatchIn(u) ||
+            Regex("""\.mp4[A-Za-z0-9]""", RegexOption.IGNORE_CASE).containsMatchIn(u)
+
     /** Enruta cada embed al extractor apropiado. */
     private suspend fun processSdEmbed(
         embedUrl: String, referer: String, serverName: String,
@@ -570,7 +585,7 @@ class SeriesDonghuaProvider : MainAPI() {
         val u = embedUrl.trim()
         return when {
             u.contains("dailymotion.com") || u.contains("dai.ly") ->
-                extractSdDailymotion(u, referer, serverName, callback)
+                extractSdDailymotion(u, referer, serverName, subtitleCallback, callback)
             u.contains("ok.ru") || u.contains("odnoklassniki") ->
                 extractSdOkRu(u, referer, serverName, callback)
             u.contains("rumble.com") ->
@@ -613,7 +628,8 @@ class SeriesDonghuaProvider : MainAPI() {
      * conservando el pre-warm de cookies del embed que necesitaba el sitio.
      */
     private suspend fun extractSdDailymotion(
-        embedUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
+        embedUrl: String, referer: String, serverName: String,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ): Boolean {
         val videoId = Regex("(?:dailymotion\\.com|dai\\.ly)/(?:embed/)?(?:video/|player(?:/[a-z0-9]+)?\\.html\\?video=)([a-zA-Z0-9]+)")
             .find(embedUrl)?.groupValues?.get(1) ?: return false
@@ -621,7 +637,7 @@ class SeriesDonghuaProvider : MainAPI() {
         try { app.get(canonical, referer = referer, headers = mapOf("User-Agent" to SD_USER_AGENT), timeout = 15L) } catch (_: Exception) {}
         return CE.extractDailymotion(
             canonical, referer, serverName, SD_USER_AGENT,
-            sdEmittedSubs, sdEmittedDmVids, { }, callback
+            sdEmittedSubs, sdEmittedDmVids, subtitleCallback, callback
         )
     }
 
@@ -820,6 +836,7 @@ class SeriesDonghuaProvider : MainAPI() {
                 try { generateM3u8(serverName, m.value, videoUrl).forEach(callback); return true } catch (_: Exception) {}
             }
             for (m in Regex("(https?://[^\"'\\s<>]+\\.mp4[^\\s\"'<>]*)").findAll(html)) {
+                if (isJunkVideoUrl(m.value)) continue
                 callback(newExtractorLink(source = serverName, name = serverName, url = m.value) {
                     this.referer = videoUrl; this.quality = Qualities.Unknown.value
                 })
@@ -843,6 +860,7 @@ class SeriesDonghuaProvider : MainAPI() {
                 try { generateM3u8(serverName, m.value, playerUrl).forEach(callback); return true } catch (_: Exception) {}
             }
             for (m in Regex("(https?://[^\"'\\s<>]+\\.mp4[^\"'\\s<>]*)").findAll(text)) {
+                if (isJunkVideoUrl(m.value)) continue
                 callback(newExtractorLink(source = serverName, name = serverName, url = m.value) {
                     this.referer = playerUrl; this.quality = Qualities.Unknown.value
                 })
@@ -856,6 +874,7 @@ class SeriesDonghuaProvider : MainAPI() {
                     try { generateM3u8(serverName, m.value, playerUrl).forEach(callback); return true } catch (_: Exception) {}
                 }
                 for (m in Regex("(https?://[^\"'\\s<>]+\\.mp4[^\"'\\s<>]*)").findAll(unpacked)) {
+                    if (isJunkVideoUrl(m.value)) continue
                     callback(newExtractorLink(source = serverName, name = serverName, url = m.value) {
                         this.referer = playerUrl; this.quality = Qualities.Unknown.value
                     })

@@ -673,7 +673,9 @@ class AnimeCubeProvider : MainAPI() {
                 if (d.isBlank()) emptyList()
                 else {
                     val key = if (etag.isNullOrBlank()) obf else "$obf|$etag"
-                    acDecrypt(d, key)?.let { parseRegistryPlain(it) } ?: emptyList()
+                    val plain = acDecrypt(d, key) ?: acDecrypt(d, obf)
+                    if (plain == null) android.util.Log.d("AnimeCube", "fetchRegistry: descifrado fallo (etag=$etag len=${d.length})")
+                    plain?.let { parseRegistryPlain(it) } ?: emptyList()
                 }
             }
         } catch (_: Exception) {
@@ -761,8 +763,21 @@ class AnimeCubeProvider : MainAPI() {
             ).text
             val payload = if (text.contains("\"sources\"")) text
             else {
+                // v9 FIX: probar TODAS las combinaciones de clave GCM que usa el
+                // sitio (feedback del/a tester). Si ninguna abre, queda "" y el
+                // fallback dispara la peticion SIN X-Obf.
                 val d = text.substringAfter("\"d\":\"", "").substringBefore("\"")
-                if (d.isBlank()) "" else acDecrypt(d, "$obf|$version") ?: ""
+                var decrypted = ""
+                if (d.isNotBlank()) {
+                    for (keyMaterial in listOf("$obf|$version", "$obf", "$version", "$version|$obf")) {
+                        val p = acDecrypt(d, keyMaterial)
+                        if (p != null) { decrypted = p; break }
+                    }
+                }
+                if (decrypted.isBlank()) {
+                    android.util.Log.d("AnimeCube", "fetchSources: ninguna clave GCM abrio el payload (len=${d.length}) vetr=$version")
+                }
+                decrypted
             }
             val encrypted = parsePayload(payload)
             if (encrypted.isNotEmpty()) encrypted
@@ -798,7 +813,10 @@ class AnimeCubeProvider : MainAPI() {
         // Si el registro cambio de shape/version, el episodio no queda muerto.
         val entries = registry.filter { it.slug == slug }
             .sortedBy { if (it.seasonId == seId) 0 else 1 }
-        if (entries.isEmpty()) return false
+        if (entries.isEmpty()) {
+            android.util.Log.d("AnimeCube", "loadLinks $data registry sin entradas")
+            return false
+        }
 
         var sources = emptyList<AcSourceEntry>()
         var used: AcVersionEntry? = null
@@ -806,7 +824,10 @@ class AnimeCubeProvider : MainAPI() {
             sources = fetchSources(slug, data, entry.primaryTabId, entry.seasonId, entry.version)
             if (sources.isNotEmpty()) { used = entry; break }
         }
-        if (sources.isEmpty()) return false
+        if (sources.isEmpty()) {
+            android.util.Log.d("AnimeCube", "loadLinks $data fuentes vacias (registro ok, /sources sin data)")
+            return false
+        }
         android.util.Log.d(
             "AnimeCube",
             "loadLinks $data sources=${sources.map { it.platform }} " +

@@ -170,7 +170,7 @@ object CommonExtractors {
         val vid = dmVideoId(iframeSrc) ?: iframeSrc.trim().takeIf { it.matches(Regex("[A-Za-z0-9]+")) }
             ?: return false
         // Dedupe por video: el mismo video puede listarse en varios mirrors.
-        if (!emittedVids.add(vid)) return true
+        if (emittedVids.contains(vid)) return true
         val referer = embedderReferer.ifBlank { "https://animexin.dev" }
         return try {
             val metaUrl = "https://www.dailymotion.com/player/metadata/video/$vid" +
@@ -189,6 +189,8 @@ object CommonExtractors {
                 val url = u.takeIf { it.startsWith("http") } ?: return
                 if (!emittedUrls.add(url)) return
                 val qualitySuffix = when (q) {
+                    Qualities.P2160.value -> " 2160p"
+                    Qualities.P1440.value -> " 1440p"
                     Qualities.P1080.value -> " 1080p"
                     Qualities.P720.value -> " 720p"
                     Qualities.P480.value -> " 480p"
@@ -226,28 +228,51 @@ object CommonExtractors {
 
             suspend fun tryPlaylist(u: String, hlsQ: Int?): Boolean {
                 if (u.isBlank() || !u.startsWith("http")) return false
-                val isPlaylist = try {
-                    app.get(u, referer = DM_REFERER, headers = headersWithUA(customUA), timeout = 12L)
-                        .text.trimStart().startsWith("#EXT")
-                } catch (_: Exception) { false }
-                android.util.Log.d(
-                    "DMExtract",
-                    "tryPlaylist ${u.substringAfter("://").substringBefore("/")} -> $isPlaylist"
-                )
-                if (!isPlaylist) return false
-                // Keep the master as a fallback, but expand its variant playlists
-                // first so CloudStream can show the real 1080/720/480 qualities.
-                var expanded = false
-                try {
-                    generateM3u8(linkName, u, DM_REFERER).forEach { link ->
-                        callback(link)
-                        expanded = true
-                        found = true
-                    }
-                } catch (e: Exception) {
-                    android.util.Log.d("DMExtract", "generateM3u8 failed: ${e.message}")
+                if (u.contains("dmxleo", true) || u.contains("advertising", true) || u.contains("auth=", true)) {
+                    return false
                 }
-                if (!expanded) emit(u, true, hlsQ)
+                // El token "sec" del master es de vida corta y esta casado con
+                // el referer de Dailymotion: a veces la validacion responde 403
+                // aunque el reproductor (otra pila TLS) lo abre. Por eso el
+                // master SIEMPRE se emite como respaldo, nunca se descarta.
+                val master = try {
+                    app.get(u, referer = DM_REFERER, headers = headersWithUA(customUA), timeout = 12L).text
+                } catch (_: Exception) { "" }
+                if (!master.trimStart().startsWith("#EXTM3U")) {
+                    emit(u, true, hlsQ)
+                    return true
+                }
+                // Expansion propia (no generateM3u8): las variantes 4K del master
+                // suelen ser AV1/HEVC y dan pantalla negra sin audio en dispositivos
+                // sin decodificador, asi que solo se publican las H264 con audio
+                // muxed (mp4a). El master se conserva como opcion "Auto".
+                Regex("""#EXT-X-STREAM-INF:([^\n]*)\n([^\n]+)""").findAll(master).forEach { m ->
+                    val attrs = m.groupValues[1]
+                    val variant = m.groupValues[2].trim()
+                    val codecs = Regex("""CODECS="([^"]+)"""").find(attrs)?.groupValues?.get(1).orEmpty()
+                    if (codecs.contains("av01", true) || codecs.contains("hev1", true) ||
+                        codecs.contains("hvc1", true)
+                    ) return@forEach
+                    val h = Regex("""RESOLUTION=\d+x(\d+)""").find(attrs)?.groupValues?.get(1)?.toIntOrNull()
+                    val q = when {
+                        h == null -> hlsQ ?: Qualities.Unknown.value
+                        h >= 2160 -> Qualities.P2160.value
+                        h >= 1440 -> Qualities.P1440.value
+                        h >= 1080 -> Qualities.P1080.value
+                        h >= 720 -> Qualities.P720.value
+                        h >= 480 -> Qualities.P480.value
+                        h >= 360 -> Qualities.P360.value
+                        else -> Qualities.Unknown.value
+                    }
+                    val origin = Regex("""^https?://[^/]+""").find(u)?.value ?: u
+                    val abs = when {
+                        variant.startsWith("http") -> variant
+                        variant.startsWith("/") -> origin + variant
+                        else -> "$origin/$variant"
+                    }
+                    emit(abs, true, q)
+                }
+                emit(u, true, hlsQ)   // "Auto": conserva las variantes AV1 para quien las soporte
                 return true
             }
 
@@ -294,7 +319,10 @@ object CommonExtractors {
                     .filter { !it.contains("/av1", true) && !it.contains("_av1_", true) }
                     .forEach { if (!emittedAny && tryPlaylist(it, null)) emittedAny = true }
             }
-            if (emittedAny) return found   // UN RUTA por video: evita duplicados.
+            if (emittedAny) {
+                emittedVids.add(vid)
+                return found   // Una ruta por video: evita duplicados.
+            }
 
             // 4) Último recurso: progresivos mp4 del qualities map. Los fMP4 de
             //    DM son streams video-only (por eso el histórico "sin audio");
@@ -317,12 +345,9 @@ object CommonExtractors {
                 }
             }
 
-            // v9 (2026-10): ULTIMO recurso para videos privados de Dailymotion.
-            // El metadata SOLO trae qualities.auto (cdndirector). La validacion
-            // con app.get (OkHttp) puede devolver 403 por fingerprint TLS, pero
-            // el reproductor de CloudStream usa Cronet (stack de Chrome) y si
-            // puede abrirlo. Se emite UNICAMENTE el master real: jamas el
-            // advertising.ad_url / dmxleo (VMAP -> ERROR_CODE_PARSING).
+            // Último recurso para videos privados de Dailymotion. El metadata
+            // suele traer solo qualities.auto (cdndirector); se emite únicamente
+            // el master real, nunca advertising.ad_url / dmxleo.
             if (!found) {
                 val candidate = Regex("""auto":\[\{[^}]*"url":"(https://[^"]+)"""").find(json)
                     ?.groupValues?.get(1)?.let { unescJson(it) }
@@ -340,6 +365,7 @@ object CommonExtractors {
                     emit(candidate, true, Qualities.Unknown.value)
                 }
             }
+            if (found) emittedVids.add(vid)
             found
         } catch (_: Exception) {
             false
@@ -421,7 +447,7 @@ object CommonExtractors {
                 .firstOrNull { it.contains("atob(") && it.contains("k=\"") } ?: return false
             val key = Regex("k=\"([0-9a-f]+)\"").find(script)?.groupValues?.get(1) ?: return false
             val b64 = Regex("atob(\"([^\"]+)\")").find(script)?.groupValues?.get(1) ?: return false
-            val raw = try { java.util.Base64.getDecoder().decode(b64) } catch (_: Exception) { return false }
+            val raw = try { android.util.Base64.decode(b64, android.util.Base64.DEFAULT) } catch (_: Exception) { return false }
             val keyBytes = key.toByteArray(Charsets.ISO_8859_1)
             val out = ByteArray(raw.size)
             for (i in raw.indices) out[i] = (raw[i].toInt() xor keyBytes[i % keyBytes.size].toInt()).toByte()

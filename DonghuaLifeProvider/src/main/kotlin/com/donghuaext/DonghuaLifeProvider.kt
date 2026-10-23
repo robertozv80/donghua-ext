@@ -912,9 +912,10 @@ class DonghuaLifeProvider : MainAPI() {
             // Variante watch page: groups 3-6; variante series page: groups 7-8
             val isSpecial = m.groupValues[5].takeIf { it.isNotEmpty() }?.equals("true", ignoreCase = true)
                 ?: m.groupValues[7].equals("true", ignoreCase = true)
-            val episodeCount = m.groupValues[6].takeIf { it.isNotEmpty() }?.toIntOrNull()
-                ?: m.groupValues[8].takeIf { it.isNotEmpty() }?.toIntOrNull()
-                ?: 0
+            // La variante watch page (grupos 3-6) solo trae "order": no hay
+            // episodeCount. Usar el order como conteo fabricaba una lista de
+            // episodios falsa cuando la temporada no venia con initialEpisodes.
+            val episodeCount = m.groupValues[8].takeIf { it.isNotEmpty() }?.toIntOrNull() ?: 0
             val order = m.groupValues[6].takeIf { it.isNotEmpty() }?.toIntOrNull()
                 ?: (seasons.size + 1)
 
@@ -995,13 +996,18 @@ class DonghuaLifeProvider : MainAPI() {
             "hasCloudflare=${html.contains("cloudflare") || html.contains("cf-")} " +
             "httpCode=${response.code}")
 
-        if (rscPayload.isNotEmpty() && rscPayload.length < 50000) {
+        val rscNeedsWebView = rscPayload.isBlank() ||
+            (rscPayload.length < 50000 &&
+                !rscPayload.contains("\"activeEpisodeId\":") &&
+                !rscPayload.contains("\"sources\":") &&
+                !rscPayload.contains("\"token\":"))
+        if (rscNeedsWebView) {
             Log.i(TAG, "loadLinks BOT_DETECTED: RSC reduced (${rscPayload.length} chars), " +
                 "skipping retries and JS_ANALYZE, going directly to WebView fallback")
         }
 
         var webViewCaptured: String = ""
-        if (rscPayload.isNotEmpty() && rscPayload.length < 50000) {
+        if (rscNeedsWebView) {
             val webViewResult = tryWebViewResolver(cleanUrl, "loadLinks")
             if (webViewResult != null) {
                 val (renderedHtml, capturedJson) = webViewResult
@@ -1654,10 +1660,13 @@ class DonghuaLifeProvider : MainAPI() {
                 ""
             } else {
                 val resolvedUrl = Regex("\"url\"\\s*:\\s*\"([^\"]+)\"").find(resp)?.groupValues?.get(1) ?: ""
+                // El /api/player/source devuelve rutas relativas ("/api/r2-media?u=…"):
+                // sin absolutizar, ExoPlayer no puede cargar el enlace.
                 if (resolvedUrl.isNotBlank()) {
-                    Log.i(TAG, "$logKey v17 PLAYER_API resuelto: $resolvedUrl")
-                }
-                resolvedUrl
+                    val absolute = resolveUrl(resolvedUrl)
+                    Log.i(TAG, "$logKey v17 PLAYER_API resuelto: $absolute")
+                    absolute
+                } else resolvedUrl
             }
         } catch (e: Exception) {
             Log.w(TAG, "$logKey v17 PLAYER_API falló: ${e.message}")
@@ -1675,15 +1684,17 @@ class DonghuaLifeProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         var anyEmitted = false
-        val trackingCallback: (ExtractorLink) -> Unit = { link ->
-            anyEmitted = true
-            callback(link)
-        }
         val cdnHeaders = mapOf(
             "Origin" to mainUrl,
             "User-Agent" to browserUA,
         )
         for ((serverName, serverUrl) in servers) {
+            var emittedHere = false
+            val trackingCallback: (ExtractorLink) -> Unit = { link ->
+                emittedHere = true
+                anyEmitted = true
+                callback(link)
+            }
             val name = serverName.trim().ifBlank { "Server" }
             val serverUrlFixed = when {
                 serverUrl.endsWith(".m3") -> serverUrl + "u8"
@@ -1703,15 +1714,15 @@ class DonghuaLifeProvider : MainAPI() {
                 when {
                     serverUrlFixed.contains("vidhide") || serverUrlFixed.contains("morencius.com") -> {
                         // v16: Vidhide (ads) — morencius.com/vidhide*/embed/xxx
-                        val emittedHere = extractVidhide(serverUrlFixed, referer, name, subtitleCallback, trackingCallback)
-                        if (!emittedHere) {
+                        val extractOk = extractVidhide(serverUrlFixed, referer, name, subtitleCallback, trackingCallback)
+                        if (!extractOk) {
                             Log.i(TAG, "v16 Vidhide: extractVidhide failed, trying loadExtractor for $serverUrlFixed")
                             try { loadExtractor(serverUrlFixed, referer, subtitleCallback, trackingCallback) } catch (_: Exception) {}
                         }
                     }
                     serverUrlFixed.contains("rumble.com") -> {
-                        val emittedHere = extractRumble(serverUrlFixed, referer, name, trackingCallback)
-                        if (!emittedHere && !anyEmitted) {
+                        val extractOk = extractRumble(serverUrlFixed, referer, name, trackingCallback)
+                        if (!extractOk && !emittedHere) {
                             Log.i(TAG, "v15 Rumble: custom extractRumble failed, trying loadExtractor fallback for $serverUrlFixed")
                             try { loadExtractor(serverUrlFixed, referer, subtitleCallback, trackingCallback) } catch (e: Exception) {
                                 Log.w(TAG, "v15 Rumble: loadExtractor also failed: ${e.message}")
@@ -1719,8 +1730,8 @@ class DonghuaLifeProvider : MainAPI() {
                         }
                     }
                     serverUrlFixed.contains("dailymotion.com") || serverUrlFixed.contains("geo.dailymotion.com") -> {
-                        val emittedHere = extractDailymotion(serverUrlFixed, referer, name, trackingCallback)
-                        if (!emittedHere && !anyEmitted) {
+                        val extractOk = extractDailymotion(serverUrlFixed, referer, name, subtitleCallback, trackingCallback)
+                        if (!extractOk && !emittedHere) {
                             Log.i(TAG, "v15 Dailymotion: custom extractDailymotion failed, trying loadExtractor fallback for $serverUrlFixed")
                             try { loadExtractor(serverUrlFixed, referer, subtitleCallback, trackingCallback) } catch (e: Exception) {
                                 Log.w(TAG, "v15 Dailymotion: loadExtractor also failed: ${e.message}")
@@ -1729,7 +1740,7 @@ class DonghuaLifeProvider : MainAPI() {
                     }
                     serverUrlFixed.contains("streamable.com") -> {
                         extractStreamable(serverUrlFixed, referer, name, subtitleCallback, trackingCallback)
-                        if (!anyEmitted) {
+                        if (!emittedHere) {
                             try { loadExtractor(serverUrlFixed, referer, subtitleCallback, trackingCallback) } catch (_: Exception) {}
                         }
                     }
@@ -1737,10 +1748,10 @@ class DonghuaLifeProvider : MainAPI() {
                     serverUrlFixed.contains("ok.ru") -> {
                         if (!extractOkRu(serverUrlFixed, referer, name, trackingCallback)) {
                             loadExtractor(normalizedUrl, referer, subtitleCallback, trackingCallback)
-                            if (!anyEmitted) {
+                            if (!emittedHere) {
                                 try { loadExtractor(serverUrlFixed, referer, subtitleCallback, trackingCallback) } catch (_: Exception) {}
                             }
-                            if (!anyEmitted) {
+                            if (!emittedHere) {
                                 try { extractOkRuDirect(serverUrlFixed, referer, name, trackingCallback) } catch (_: Exception) {}
                             }
                         }
@@ -1764,7 +1775,7 @@ class DonghuaLifeProvider : MainAPI() {
                         } else {
                             ExtractorLinkType.VIDEO
                         }
-                        callback(
+                        trackingCallback(
                             newExtractorLink(
                                 source = name,
                                 name = name,
@@ -1776,7 +1787,6 @@ class DonghuaLifeProvider : MainAPI() {
                                 this.headers = cdnHeaders
                             }
                         )
-                        anyEmitted = true
                     }
                     serverUrlFixed.contains("voe.sx") -> {
                         loadExtractor(serverUrlFixed, referer, subtitleCallback, trackingCallback)
@@ -2008,7 +2018,7 @@ class DonghuaLifeProvider : MainAPI() {
                                     error: WebResourceError?
                                 ) {
                                     super.onReceivedError(view, request, error)
-                                    Log.i(TAG, "$logKey v14 WEBVIEW error: ${error?.description} url=${request?.url}")
+                                    Log.i(TAG, "$logKey v14 WEBVIEW error url=${request?.url}")
                                 }
                             }
 
@@ -2689,7 +2699,9 @@ class DonghuaLifeProvider : MainAPI() {
             }
 
             try {
-                val embedJsUrl = "https://rumble.com/embedjs/$vkey"
+                // Shape real del embedJS de Rumble (el path /embedjs/<vkey> solo
+                // devuelve el HTML del player, nunca el JSON con las fuentes).
+                val embedJsUrl = "https://rumble.com/embedJS/u3/?request=video&v=$vkey"
                 val resp = app.get(embedJsUrl, headers = altHeaders, timeout = 20L)
                 val jsText = resp.text
                 Log.i(TAG, "extractRumble: embedJS vkey=$vkey httpCode=${resp.code} jsLen=${jsText.length} head=${jsText.take(200)}")
@@ -3091,9 +3103,9 @@ class DonghuaLifeProvider : MainAPI() {
             .replace(Regex("\\\\+/"), "/")
             .replace(Regex("\\\\+u0026"), "&")
 
-                Log.i(TAG, "extractRumble v20: block len=" + data.length + " head=" + data.take(140))
+        Log.i(TAG, "extractRumble v20: block len=" + data.length + " head=" + data.take(140))
 
-var emitted = false
+        var emitted = false
 
         // 1) Master HLS (hls-vod o live-hls-dvr) — jugable directamente (verificado 200)
         val hlsMaster = Regex(""""hls"\s*:\s*\{\s*"url"\s*:\s*"(https://rumble\.com/(?:hls-vod|live-hls-dvr)/[^"]+\.m3u8)"""").find(data)
@@ -3207,6 +3219,7 @@ var emitted = false
         embedUrl: String,
         referer: String,
         serverName: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         var emitted = false
@@ -3228,7 +3241,7 @@ var emitted = false
             if (CE.extractDailymotion(
                     "https://www.dailymotion.com/embed/video/$videoId",
                     referer, serverName, browserUA, dlEmittedDmSubs, dlEmittedDmVids,
-                    { }, trackingCb
+                    subtitleCallback, trackingCb
                 )
             ) return true
         } catch (_: Exception) {}
@@ -3246,17 +3259,25 @@ var emitted = false
                 timeout = 15L).text
             Log.i(TAG, "extractDailymotion: videoId=$videoId jsonLen=${jsonText.length}")
 
+            // DM escapa las barras del JSON: sin desescapar, los regex de abajo
+            // nunca casan y esta rama era codigo muerto.
+            val json = jsonText.replace("\\/", "/").replace("\\u0026", "&")
+
             // Solo aceptar el master HLS firmado de Dailymotion. Expandir
             // variantes fMP4 individuales puede eliminar la pista de audio.
             val masterRegex = Regex("""(https?://[^"'\s<>]+dailymotion\.com/cdn/manifest/video/[^\s"'<>]+\.m3u8[^\s"'<>]*)""", RegexOption.IGNORE_CASE)
-            for (match in masterRegex.findAll(jsonText)) {
-                trackingCb(newExtractorLink(source = serverName, name = serverName, url = match.groupValues[1], type = ExtractorLinkType.M3U8) {
+            for (match in masterRegex.findAll(json)) {
+                val u = match.groupValues[1]
+                // El advertising.ad_url responde VMAP XML, no m3u8: ExoPlayer lo
+                // rechaza con ERROR_CODE_PARSING.
+                if (u.contains("dmxleo", true) || u.contains("advertising", true) || u.contains("auth=", true)) continue
+                trackingCb(newExtractorLink(source = serverName, name = serverName, url = u, type = ExtractorLinkType.M3U8) {
                     this.referer = "https://www.dailymotion.com/"
                     this.quality = Qualities.Unknown.value
                 })
                 if (emitted) return true
             }
-            val mp4Urls = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(jsonText).map { it.value }.distinct().toList()
+            val mp4Urls = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(json).map { it.value }.distinct().toList()
             for (u in mp4Urls) {
                 val q = when {
                     u.contains("1080") -> Qualities.P1080.value
@@ -3275,7 +3296,7 @@ var emitted = false
         }
 
         try {
-            loadExtractor("https://www.dailymotion.com/embed/video/$videoId", referer, subtitleCallback = {}, trackingCb)
+            loadExtractor("https://www.dailymotion.com/embed/video/$videoId", referer, subtitleCallback, trackingCb)
         } catch (e: Exception) {
             Log.w(TAG, "extractDailymotion: loadExtractor fallback failed: ${e.message}")
         }

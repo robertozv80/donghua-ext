@@ -890,6 +890,33 @@ class AnimeGratisProvider : MainAPI() {
             }
         }
 
+        // Método 1.5: las páginas de ANIME solo publican los servidores dentro
+        // del JSON <script id="player-ui-data"> (los botones data-url existen
+        // solo en donghua), así que sin leerlo el episodio quedaba sin enlaces.
+        if (!foundLinks) {
+            val uiData = doc.select("script#player-ui-data").firstOrNull()?.data()?.ifBlank { null }
+            if (uiData != null) {
+                try {
+                    val groups = org.json.JSONObject(uiData).optJSONObject("groups") ?: org.json.JSONObject()
+                    for (lang in groups.keys()) {
+                        val arr = groups.optJSONArray(lang) ?: continue
+                        for (i in 0 until arr.length()) {
+                            val group = arr.optJSONObject(i) ?: continue
+                            val players = group.optJSONArray("players") ?: continue
+                            for (k in 0 until players.length()) {
+                                val url = players.optJSONObject(k)?.optString("url")?.trim()
+                                    ?.takeIf { it.startsWith("http") } ?: continue
+                                val serverName = group.optString("name")
+                                    .ifBlank { serverNameFromUrl(url) }
+                                foundLinks =
+                                    processVideoUrl(url, data, serverName, subtitleCallback, callback) || foundLinks
+                            }
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+
         // Método 2: Iframe
         if (!foundLinks) {
             doc.select("iframe").forEach { iframe ->
@@ -912,7 +939,7 @@ class AnimeGratisProvider : MainAPI() {
                         try { generateM3u8("Server", url, data).forEach(callback); foundLinks = true } catch (_: Exception) {}
                     }
                     if (!foundLinks) {
-                        Regex("""(https?://[^\s"'<>]+\.mp4[^\s"'<>]*)""").find(scriptData)?.value?.let { url ->
+                        Regex("""(https?://[^\s"'<>]+\.mp4(?![A-Za-z0-9])[^\s"'<>]*)""").find(scriptData)?.value?.let { url ->
                             callback(newExtractorLink(source = "Server", name = "Server", url = url) {
                                 this.referer = data; this.quality = Qualities.Unknown.value
                             })
@@ -961,7 +988,7 @@ class AnimeGratisProvider : MainAPI() {
             videoUrl.contains("dailymotion.com") -> {
                 val videoId = Regex("dailymotion\\.com/(?:embed/)?video/([a-zA-Z0-9]+)")
                     .find(videoUrl)?.destructured?.component1()
-                if (!videoId.isNullOrEmpty()) extractDailymotionApi(videoId, referer, serverName, counting)
+                if (!videoId.isNullOrEmpty()) extractDailymotionApi(videoId, referer, serverName, subtitleCallback, counting)
             }
             videoUrl.contains("ok.ru") ->
                 extractOkRu(videoUrl, referer, serverName, counting)
@@ -987,12 +1014,18 @@ class AnimeGratisProvider : MainAPI() {
         return try {
             val text = app.get(playerUrl, referer = referer, headers = headers, timeout = 15L).text
             var found = false
-            Regex("""(https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)""").findAll(text).forEach { m ->
-                try { generateM3u8(serverName, m.value, playerUrl).forEach(callback); found = true } catch (_: Exception) {}
-            }
+            // El reproductor repite el mismo .m3u8 varias veces en el HTML: sin
+            // dedupe y sin parada, cada repeticion expandía las mismas calidades
+            // y la lista salía duplicada.
+            Regex("""(https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)""").findAll(text)
+                .map { it.value }.distinct().forEach { u ->
+                    if (found) return@forEach
+                    try { generateM3u8(serverName, u, playerUrl).forEach(callback); found = true } catch (_: Exception) {}
+                }
             if (!found) {
-                Regex("""(https?://[^"'\s<>]+\.mp4[^"'\s<>]*)""").findAll(text).forEach { m ->
-                    callback(newExtractorLink(source = serverName, name = serverName, url = m.value) {
+                Regex("""(https?://[^"'\s<>]+\.mp4(?![A-Za-z0-9])[^"'\s<>]*)""").findAll(text)
+                    .map { it.value }.distinct().forEach { u ->
+                    callback(newExtractorLink(source = serverName, name = serverName, url = u) {
                         this.referer = playerUrl; this.quality = Qualities.Unknown.value
                     })
                     found = true
@@ -1032,7 +1065,7 @@ class AnimeGratisProvider : MainAPI() {
             }
             // 4) mp4
             if (!found) {
-                Regex("""["']?file["']?\s*:\s*["']([^"']+\.mp4[^"']*)["']""").findAll(unpacked).forEach { m ->
+                Regex("""["']?file["']?\s*:\s*["']([^"']+\.mp4(?![A-Za-z0-9])[^"']*)["']""").findAll(unpacked).forEach { m ->
                     callback(newExtractorLink(source = serverName, name = serverName, url = m.destructured.component1()) {
                         this.referer = referer; this.quality = Qualities.Unknown.value
                     })
@@ -1051,7 +1084,7 @@ class AnimeGratisProvider : MainAPI() {
             for (match in Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""").findAll(text)) {
                 try { generateM3u8(serverName, match.value, playerUrl).forEach(callback); return true } catch (_: Exception) {}
             }
-            for (match in Regex("""(https?://[^\s"'<>]+\.mp4[^\s"'<>]*)""").findAll(text)) {
+            for (match in Regex("""(https?://[^\s"'<>]+\.mp4(?![A-Za-z0-9])[^\s"'<>]*)""").findAll(text)) {
                 callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
                     this.referer = playerUrl; this.quality = Qualities.Unknown.value
                 })
@@ -1061,23 +1094,34 @@ class AnimeGratisProvider : MainAPI() {
         return false
     }
 
-    private suspend fun extractDailymotionApi(videoId: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit): Boolean {
+    private suspend fun extractDailymotionApi(
+        videoId: String,
+        referer: String,
+        serverName: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
         // v27: primero el extractor COMÚN (master completo con audio, dedupe
         // de videos y subs multi-idioma). El flujo legacy queda como fallback.
         if (CE.extractDailymotion(
                 "https://www.dailymotion.com/embed/video/$videoId",
                 referer, serverName, USER_AGENT, mutableSetOf(), agEmittedDmVids,
-                { }, callback
+                subtitleCallback, callback
             )
         ) return true
         try {
             val apiUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
             val jsonText = app.get(apiUrl, referer = "https://www.dailymotion.com/embed/video/$videoId",
                 headers = mapOf("User-Agent" to USER_AGENT, "Accept" to "application/json"), timeout = 15L).text
+                // DM escapa las barras: sin desescapar los regex de abajo no casan.
+                .replace("\\/", "/").replace("\\u0026", "&")
             for (match in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(jsonText)) {
-                try { generateM3u8(serverName, match.value, "https://www.dailymotion.com").forEach(callback); return true } catch (_: Exception) {}
+                val u = match.value
+                // Nunca emitir el VMAP de anuncios: ExoPlayer lo rechaza.
+                if (u.contains("dmxleo", true) || u.contains("advertising", true) || u.contains("auth=", true)) continue
+                try { generateM3u8(serverName, u, "https://www.dailymotion.com").forEach(callback); return true } catch (_: Exception) {}
             }
-            val mp4Urls = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(jsonText).map { it.value }.distinct().toList()
+            val mp4Urls = Regex("""(https?://[^"'\s<>]+\.mp4(?![A-Za-z0-9])[^\s"'<>]*)""").findAll(jsonText).map { it.value }.distinct().toList()
             if (mp4Urls.isNotEmpty()) {
                 for (url in mp4Urls) {
                     val q = when {
@@ -1098,7 +1142,7 @@ class AnimeGratisProvider : MainAPI() {
             for (match in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(html)) {
                 try { generateM3u8(serverName, match.value, embedUrl).forEach(callback); return true } catch (_: Exception) {}
             }
-            for (match in Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(html)) {
+            for (match in Regex("""(https?://[^"'\s<>]+\.mp4(?![A-Za-z0-9])[^\s"'<>]*)""").findAll(html)) {
                 callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
                     this.referer = embedUrl; this.quality = Qualities.Unknown.value
                 })

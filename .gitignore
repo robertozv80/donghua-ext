@@ -1,5 +1,6 @@
 *.iml
 .gradle
+.kotlin
 /local.properties
 /.idea
 .DS_Store
@@ -15,3 +16,23 @@ local.properties
 # Artefactos de compilación de los módulos (generados, no versionar)
 */build/
 build/
+
+# Scratch de diagnóstico local: scripts one-off, dumps y logs del runner
+androidRunner-*.log
+tools/dbg_*
+tools/diag_*
+tools/dm_*
+tools/ag_card*.py
+tools/*.class
+tools/*.java
+tools/*.bak
+tools/_*
+tools/cs3chk*/
+tools/m1*.json
+tools/ac_*.mjs
+tools/sim_*.mjs
+tools/check_*.mjs
+tools/__pycache__/
+tools/logs/
+tools/tmp/
+com/
