@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Base64
 import android.util.Log
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
@@ -13,7 +14,10 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.donghuaext.common.CommonExtractors as CE
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
@@ -37,6 +41,19 @@ class DonghuaWorldProvider : MainAPI() {
         private const val DWW_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
 
+        private const val DWW_PAGE_TTL_MS = 120_000L
+        private const val DWW_IMAGE_TTL_MS = 10 * 60_000L
+        private const val DWW_IMAGE_CACHE_MAX = 600
+
+        // v25: CS3 corta getMainPage a los 120s y el reto de Cloudflare tarda
+        // ~2min en el WebView del emulador. Cache de paginas en disco (4h) para
+        // que el home abra al instante en sesiones posteriores mientras un
+        // prewarm en segundo plano la refresca.
+        private const val DWW_DISK_TTL_MS = 4 * 60 * 60_000L
+        private const val DWW_DISK_PAGE_MAX = 40
+        private const val DWW_DISK_IMG_MAX_BYTES = 8_000_000L
+        private const val DWW_DISK_IMG_SAVE_MIN_MS = 5_000L
+
         /** Regex to match episode numbers or ranges like "Episode 263" or "Episode 254-255" */
         private val EPISODE_NUM_REGEX = Regex("""Episode\s+(\d+(?:-\d+)?)""", RegexOption.IGNORE_CASE)
 
@@ -50,13 +67,170 @@ class DonghuaWorldProvider : MainAPI() {
         private val ENGLISH_KEYWORDS = listOf("english", "eng", "en-us", "en-gb")
     }
 
-    // ==================== CLOUDFLARE (v23) ====================
+    // ==================== CLOUDFLARE (v23) + cache y puente de imagenes (v24) ====================
+
+    /** Pagina ya resuelta: HTML sin challenge + (opcional) imagenes puenteadas. */
+    private class DwwPage(val html: String)
 
     @Volatile
     private var dwwCookies: String? = null
 
     @Volatile
     private var dwwUaCache: String? = null
+
+    @Volatile
+    private var dwwLastImgSave: Long = 0L
+
+    @Volatile
+    private var dwwLastImgCollectAt: Long = 0L
+
+    private val dwwScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + Dispatchers.IO
+    )
+
+    /** v25: al cargar el plugin resolvemos el reto y refrescamos la cache en
+     *  segundo plano, para que getMainPage (tope 120s de CS3) nunca espere el
+     *  reto si la cache de disco sigue valida. */
+    init {
+        // Los posters del disco cargan SIN delay: el home puede renderizar
+        // antes de que termine el prewarm y los necesita ya puenteados.
+        dwwScope.launch { dwwDiskLoadImages() }
+        dwwScope.launch {
+            kotlinx.coroutines.delay(3_000L)
+            try {
+                dwwFetch("$mainUrl/", collectImages = true)
+            } catch (_: Throwable) {}
+            try {
+                dwwFetch("$mainUrl/anime/?status=completed&sub=&order=latest", collectImages = true)
+            } catch (_: Throwable) {}
+            // v26: si las paginas salieron de disco, nunca hubo WebView y el
+            // puente no refresco -> forzar un pase por WebView sobre el home
+            // para puentear posters y thumbs de episodios (los data URI no se
+            // pueden descargar por OkHttp: Cloudflare rechaza el fingerprint).
+            val bridge = synchronized(dwwImageCache) { dwwImageCache.size }
+            val stale = System.currentTimeMillis() - dwwLastImgCollectAt > 30 * 60_000L
+            if (bridge < 10 || stale) {
+                try {
+                    dwwFetch("$mainUrl/", collectImages = true, bypassCache = true)
+                } catch (_: Throwable) {}
+            }
+            Log.i(TAG, "dwwPrewarm: listo bridge=$bridge stale=$stale")
+        }
+    }
+
+    // FIX v24 (home lento): el home pide la MISMA url para 2 secciones (Latest
+    // Release y Recommendation); sin cache se lanzaban 2 retos WebView completos
+    // en paralelo y el home tardaba el doble. TTL corto + mutex para que la
+    // segunda seccion reutilice el fetch de la primera.
+    private val dwwPageCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, DwwPage>>()
+    private val dwwPageMutex = kotlinx.coroutines.sync.Mutex()
+
+    // FIX v24 (posters grises): Cloudflare tambien rechaza las peticiones de
+    // imagen de la app (Coil/OkHttp, mismo fingerprint TLS que el resto). La
+    // unica pila que pasa es el WebView, asi que en la misma sesion se descargan
+    // las imagenes de las cards via fetch() del propio WebView (con
+    // cf_clearance) y se guardan como data URI para los posters.
+    private val dwwImageCache = java.util.LinkedHashMap<String, Pair<Long, String>>()
+
+    private fun dwwCacheImages(images: Map<String, String>) {
+        val now = System.currentTimeMillis()
+        synchronized(dwwImageCache) {
+            for ((k, v) in images) dwwImageCache[k] = now to v
+            dwwImageCache.entries.removeAll { now - it.value.first > DWW_IMAGE_TTL_MS }
+            while (dwwImageCache.size > DWW_IMAGE_CACHE_MAX) {
+                val oldest = dwwImageCache.entries.minByOrNull { it.value.first } ?: break
+                dwwImageCache.remove(oldest.key)
+            }
+        }
+        // v25: persistir el puente para que los posters sobrevivan al reinicio.
+        if (now - dwwLastImgSave > DWW_DISK_IMG_SAVE_MIN_MS) {
+            dwwLastImgSave = now
+            dwwScope.launch { dwwDiskSaveImages() }
+        }
+    }
+
+    // ==================== CACHE EN DISCO (v25) ====================
+
+    private fun dwwDiskDir(): java.io.File? = try {
+        val d = java.io.File(dwwContext()?.filesDir, "dwwcache")
+        if (!d.exists()) d.mkdirs()
+        if (d.isDirectory) d else null
+    } catch (_: Throwable) {
+        null
+    }
+
+    private fun dwwPageFile(url: String): java.io.File? =
+        dwwDiskDir()?.let { java.io.File(it, "p" + Integer.toHexString(url.hashCode()) + ".html") }
+
+    private fun dwwDiskLoadPage(url: String): String? = try {
+        val f = dwwPageFile(url) ?: return null
+        if (!f.isFile) return null
+        val raw = f.readText()
+        val nl = raw.indexOf('\n')
+        val ts = if (nl > 0) raw.substring(0, nl).toLongOrNull() ?: 0L else 0L
+        if (System.currentTimeMillis() - ts < DWW_DISK_TTL_MS) raw.substring(nl + 1) else null
+    } catch (_: Throwable) {
+        null
+    }
+
+    private fun dwwDiskSavePage(url: String, html: String) {
+        dwwScope.launch {
+            try {
+                val f = dwwPageFile(url) ?: return@launch
+                f.writeText(System.currentTimeMillis().toString() + "\n" + html)
+                Log.i(TAG, "dwwDiskSavePage: ${f.name} bytes=${html.length}")
+                val dir = dwwDiskDir() ?: return@launch
+                val pages = dir.listFiles { n -> n.name.startsWith("p") && n.name.endsWith(".html") }
+                if (pages != null && pages.size > DWW_DISK_PAGE_MAX) {
+                    pages.sortedBy { it.lastModified() }
+                        .take(pages.size - DWW_DISK_PAGE_MAX)
+                        .forEach { it.delete() }
+                }
+            } catch (_: Throwable) {}
+        }
+    }
+
+    private fun dwwDiskLoadImages() {
+        try {
+            val f = dwwDiskDir()?.let { java.io.File(it, "img.json") } ?: return
+            if (!f.isFile) return
+            val obj = org.json.JSONObject(f.readText())
+            val m = LinkedHashMap<String, String>()
+            for (k in obj.keys()) {
+                val v = obj.optString(k)
+                if (v.startsWith("data:image")) m[k] = v
+            }
+            if (m.isNotEmpty()) {
+                dwwCacheImages(m)
+                Log.i(TAG, "dwwDiskLoadImages: ${m.size} posters desde disco")
+            }
+        } catch (_: Throwable) {}
+    }
+
+    private suspend fun dwwDiskSaveImages() {
+        try {
+            val snapshot = synchronized(dwwImageCache) { LinkedHashMap(dwwImageCache) }
+            val obj = org.json.JSONObject()
+            var total = 0L
+            for ((k, v) in snapshot.entries.sortedByDescending { it.value.first }) {
+                val d = v.second
+                if (d.isEmpty() || d.length > 300_000) continue
+                if (total + d.length > DWW_DISK_IMG_MAX_BYTES) break
+                obj.put(k, d)
+                total += d.length
+            }
+            val f = dwwDiskDir()?.let { java.io.File(it, "img.json") } ?: return
+            f.writeText(obj.toString())
+            Log.i(TAG, "dwwDiskSaveImages: entries=${obj.length()} bytes=$total")
+        } catch (_: Throwable) {}
+    }
+
+    /** URL de poster puenteada: data URI si la descargo el WebView, si no la original. */
+    private fun dwwBridgeImg(url: String?): String {
+        val u = url?.trim().orEmpty()
+        if (u.isEmpty() || u.startsWith("data:")) return u
+        return synchronized(dwwImageCache) { dwwImageCache[u]?.second } ?: u
+    }
 
     /** UA real del WebView: si hardcodeamos otro Chrome, el fingerprint (sec-ch-ua)
      *  no coincide y Cloudflare manda el reto en bucle sin resolverlo nunca. */
@@ -96,98 +270,265 @@ class DonghuaWorldProvider : MainAPI() {
         }
     }
 
+    /** JS que corre dentro del WebView: descarga las imagenes de las cards
+     *  (mismo origen, cookies y fingerprint del navegador) y empuja cada una al
+     *  puente __dwwSink (JavascriptInterface) apenas esta lista. El callback de
+     *  evaluateJavascript se congela con WebViews sin adjuntar a la ventana
+     *  (renderer suspendido), por eso los datos via por la interfaz JS->Java.
+     *  Sin template literals ni arrow funcs para WebViews viejos. */
+    private val DWW_IMAGE_JS = """
+        (function() {
+          var seen = {};
+          var urls = [];
+          var els = document.querySelectorAll('article img, .thumb img, .ts-post-image');
+          for (var i = 0; i < els.length; i++) {
+            var el = els[i];
+            var s = el.getAttribute('data-src') || el.getAttribute('data-lazy-src') || el.currentSrc || el.src || '';
+            if (s.indexOf('https://') === 0 && s.indexOf('/wp-content/uploads/') > 0 && !seen[s]) {
+              seen[s] = 1; urls.push(s);
+            }
+          }
+          urls = urls.slice(0, 90);
+          var ka = 0;
+          setInterval(function() { ka++; }, 1500);
+          for (var j = 0; j < urls.length; j++) {
+            (function(u) {
+              fetch(u, { credentials: 'include' }).then(function(r) {
+                if (!r.ok) return null;
+                return r.blob();
+              }).then(function(b) {
+                if (!b || !b.size || b.size > 250000) return;
+                return b.arrayBuffer().then(function(ab) {
+                  var buf = new Uint8Array(ab);
+                  var bin = '';
+                  for (var i = 0; i < buf.length; i += 0x8000) {
+                    bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+                  }
+                  var d = 'data:' + (b.type || 'image/webp') + ';base64,' + btoa(bin);
+                  try { window.__dwwSink.onImage(JSON.stringify({ u: u, d: d })); } catch (e2) {}
+                });
+              }).catch(function(e) {});
+            })(urls[j]);
+          }
+        })()
+    """.trimIndent()
+
     /** Carga url en un WebView (su Chromium pasa el fingerprint TLS/JS que Cloudflare
-     *  le exige a OkHttp) y devuelve el HTML final ya sin challenge. */
-    private suspend fun dwwWebViewFetch(url: String): String? = withContext(Dispatchers.Main) {
-        val ctx = dwwContext()
-        if (ctx == null) {
-            Log.w(TAG, "dwwWebViewFetch: sin Context, no se puede resolver el challenge")
-            return@withContext null
-        }
-        suspendCancellableCoroutine { cont ->
-            var webView: WebView? = null
-            var done = false
-            val startedAt = android.os.SystemClock.elapsedRealtime()
-            fun finish(html: String?) {
-                if (done) return
-                done = true
-                try { webView?.stopLoading() } catch (_: Throwable) {}
-                try { webView?.destroy() } catch (_: Throwable) {}
-                if (html != null) {
-                    Log.i(TAG, "dwwWebViewFetch: OK en ${android.os.SystemClock.elapsedRealtime() - startedAt}ms")
-                } else {
-                    Log.w(TAG, "dwwWebViewFetch: timeout/sin HTML limpio tras ${android.os.SystemClock.elapsedRealtime() - startedAt}ms")
+     *  le exige a OkHttp) y devuelve el HTML final ya sin challenge. Con
+     *  collectImages ademas descarga en la MISMA sesion las imagenes de las cards
+     *  y las deja en el cache-puente (Cloudflare rechaza las peticiones de
+     *  imagen de la app). */
+    private suspend fun dwwWebViewPage(url: String, collectImages: Boolean): DwwPage? =
+        withContext(Dispatchers.Main) {
+            val ctx = dwwContext()
+            if (ctx == null) {
+                Log.w(TAG, "dwwWebViewPage: sin Context, no se puede resolver el challenge")
+                return@withContext null
+            }
+            suspendCancellableCoroutine { cont ->
+                var webView: WebView? = null
+                // v26: los postDelayed de un WebView sin adjuntar a ventana NUNCA
+                // corren (View.postDelayed espera al attach) -> programar todo con
+                // un Handler propio, que si funciona.
+                val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+                var done = false
+                var html: String? = null
+                var imagesDone = false
+                var imagesStartedAt = 0L
+                var imgReceived = 0
+                var lastImageAt = 0L
+                val imgQueue = java.util.concurrent.ConcurrentLinkedQueue<String>()
+                val imgSink = object : Any() {
+                    @JavascriptInterface
+                    fun onImage(json: String?) {
+                        if (!json.isNullOrEmpty()) imgQueue.add(json)
+                    }
                 }
-                if (cont.isActive) cont.resume(html) {}
-            }
-            fun unjson(s: String?): String? = try {
-                org.json.JSONTokener(s ?: "\"\"").nextValue() as? String
-            } catch (_: Throwable) {
-                null
-            }
-            try {
-                CookieManager.getInstance().setAcceptCookie(true)
-                val wv = WebView(ctx)
-                webView = wv
-                wv.settings.javaScriptEnabled = true
-                wv.settings.domStorageEnabled = true
-                wv.settings.setSupportMultipleWindows(false)
-                wv.settings.javaScriptCanOpenWindowsAutomatically = false
-                var attempts = 0
-                fun checkPage(view: WebView) {
-                    view.evaluateJavascript("document.documentElement.outerHTML") { htmlJson ->
-                        val html = unjson(htmlJson)
-                        if (!html.isNullOrBlank() && !isDwwChallenge(html)) {
-                            val ck = CookieManager.getInstance().getCookie(mainUrl) ?: ""
-                            if (ck.isNotBlank()) dwwCookies = ck
-                            finish(html)
-                        } else if (++attempts <= 30) {
-                            // El reto (Just a moment / Un momento…) puede tardar ~70s en
-                            // resolver solo; sondear el HTML en vez de fiarse del titulo
-                            // (viene localizado).
-                            view.postDelayed({ checkPage(view) }, 4000L)
-                        } else {
-                            finish(null)
+                val startedAt = android.os.SystemClock.elapsedRealtime()
+                fun finish() {
+                    if (done) return
+                    done = true
+                    mainHandler.removeCallbacksAndMessages(null)
+                    try { webView?.stopLoading() } catch (_: Throwable) {}
+                    try { webView?.destroy() } catch (_: Throwable) {}
+                    val h = html
+                    if (h != null) {
+                        Log.i(TAG, "dwwWebViewPage: OK en ${android.os.SystemClock.elapsedRealtime() - startedAt}ms imgs=$imgReceived")
+                        // v25: guardar aqui y no en dwwFetch -> si CS3 cancelo al
+                        // llamador (tope de 120s del home) justo al resolver, el
+                        // trabajo del WebView no se pierde y el prewarm lo reutiliza.
+                        dwwPageCache[url] = System.currentTimeMillis() to DwwPage(h)
+                        dwwDiskSavePage(url, h)
+                    } else {
+                        Log.w(TAG, "dwwWebViewPage: timeout/sin HTML limpio tras ${android.os.SystemClock.elapsedRealtime() - startedAt}ms")
+                    }
+                    if (cont.isActive) cont.resume(h?.let { DwwPage(it) }) {}
+                }
+                fun maybeFinish() {
+                    if (html != null && (!collectImages || imagesDone)) finish()
+                }
+                fun unjson(s: String?): String? = try {
+                    org.json.JSONTokener(s ?: "\"\"").nextValue() as? String
+                } catch (_: Throwable) {
+                    null
+                }
+                /** Watchdog del hilo principal: drena la cola del sink y termina la
+                 *  fase de imagenes por quietud (8s sin llegar una nueva) o tope.
+                 *  No depende de evaluateJavascript, cuyos callbacks se congelan. */
+                fun imgWatchdog() {
+                    if (done) return
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    var fresh = 0
+                    var s = imgQueue.poll()
+                    while (s != null) {
+                        try {
+                            val obj = org.json.JSONTokener(s).nextValue() as? org.json.JSONObject
+                            if (obj != null) {
+                                val u = obj.optString("u")
+                                val d = obj.optString("d")
+                                if (u.isNotEmpty() && d.startsWith("data:image")) {
+                                    dwwCacheImages(mapOf(u to d))
+                                    fresh++
+                                }
+                            }
+                        } catch (_: Throwable) {}
+                        s = imgQueue.poll()
+                    }
+                    if (fresh > 0) {
+                        imgReceived += fresh
+                        lastImageAt = now
+                    }
+                    val inPhase = now - imagesStartedAt
+                    val finished = (imgReceived > 0 && now - lastImageAt > 8000L) ||
+                        (imgReceived == 0 && inPhase > 45_000L) || inPhase > 120_000L
+                    if (finished) {
+                        Log.i(TAG, "dwwWebViewPage: imagenes=$imgReceived en ${now - startedAt}ms")
+                        if (imgReceived > 0) dwwLastImgCollectAt = System.currentTimeMillis()
+                        imagesDone = true
+                        maybeFinish()
+                    } else {
+                        mainHandler.postDelayed({ imgWatchdog() }, 2000L)
+                    }
+                }
+                try {
+                    CookieManager.getInstance().setAcceptCookie(true)
+                    val wv = WebView(ctx)
+                    webView = wv
+                    wv.settings.javaScriptEnabled = true
+                    wv.settings.domStorageEnabled = true
+                    wv.settings.setSupportMultipleWindows(false)
+                    wv.settings.javaScriptCanOpenWindowsAutomatically = false
+                    try { wv.addJavascriptInterface(imgSink, "__dwwSink") } catch (_: Throwable) {}
+                    var attempts = 0
+                    var imagesStarted = false
+                    fun checkPage(view: WebView) {
+                        view.evaluateJavascript("document.documentElement.outerHTML") { htmlJson ->
+                            val h = unjson(htmlJson)
+                            if (!h.isNullOrBlank() && !isDwwChallenge(h)) {
+                                val ck = CookieManager.getInstance().getCookie(mainUrl) ?: ""
+                                if (ck.isNotBlank()) dwwCookies = ck
+                                html = h
+                                if (collectImages) {
+                                    // Un solo arranque: onPageFinished puede dispararse
+                                    // varias veces y un reinicio perderia lo recibido.
+                                    if (!imagesStarted) {
+                                        imagesStarted = true
+                                        imagesStartedAt = android.os.SystemClock.elapsedRealtime()
+                                        lastImageAt = imagesStartedAt
+                                        view.evaluateJavascript(DWW_IMAGE_JS, null)
+                                        mainHandler.postDelayed({ imgWatchdog() }, 2000L)
+                                    }
+                                } else {
+                                    maybeFinish()
+                                }
+                            } else if (++attempts <= 30) {
+                                // El reto (Just a moment / Un momento…) puede tardar ~70s en
+                                // resolver solo; sondear el HTML en vez de fiarse del titulo
+                                // (viene localizado).
+                                mainHandler.postDelayed({ checkPage(view) }, 4000L)
+                            } else {
+                                finish()
+                            }
                         }
                     }
-                }
-                wv.webViewClient = object : WebViewClient() {
-                    override fun onPageFinished(view: WebView, vurl: String) {
-                        checkPage(view)
+                    wv.webViewClient = object : WebViewClient() {
+                        override fun onPageFinished(view: WebView, vurl: String) {
+                            checkPage(view)
+                        }
                     }
+                    wv.loadUrl(url)
+                    mainHandler.postDelayed({ finish() }, 150_000L)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "dwwWebViewPage: ${t.message}")
+                    finish()
                 }
-                wv.loadUrl(url)
-                wv.postDelayed({ finish(null) }, 150_000L)
-            } catch (t: Throwable) {
-                Log.w(TAG, "dwwWebViewFetch: ${t.message}")
-                finish(null)
+                cont.invokeOnCancellation { finish() }
             }
-            cont.invokeOnCancellation { finish(null) }
         }
-    }
 
-    /** HTML de una página: OkHttp rápido y, si el sitio exige el reto de Cloudflare
-     *  (403 / "Just a moment"), repite la petición dentro de un WebView. */
-    private suspend fun dwwGetRaw(url: String, referer: String? = null): String {
-        fun headers(): Map<String, String> {
-            val h = mutableMapOf("User-Agent" to dwwUserAgent())
-            dwwCookies?.let { h["Cookie"] = it }
-            return h
-        }
-        val resp = app.get(url, headers = headers(), referer = referer, timeout = 25L)
-        if (resp.code == 403 || isDwwChallenge(resp.text)) {
-            Log.i(TAG, "dwwGet: challenge Cloudflare en $url -> WebView")
-            val html = dwwWebViewFetch(url)
-            if (!html.isNullOrBlank() && !isDwwChallenge(html)) {
-                return html
+    /** HTML (+ imagenes si se piden) de una pagina: cache TTL -> OkHttp rapido
+     *  y, si el sitio exige el reto de Cloudflare (403 / "Just a moment"),
+     *  WebView. El mutex evita que dos secciones del home lancen el mismo reto
+     *  en paralelo. */
+    private suspend fun dwwFetch(
+        url: String,
+        referer: String? = null,
+        collectImages: Boolean = false,
+        bypassCache: Boolean = false
+    ): DwwPage {
+        val now = System.currentTimeMillis()
+        if (!bypassCache) {
+            dwwPageCache[url]?.let { (ts, p) -> if (now - ts < DWW_PAGE_TTL_MS) return p }
+            // v26: cache de disco FUERA del mutex -> si un load() de arranque
+            // esta resolviendo el reto (~2min), el home igual abre al instante
+            // desde disco sin esperar el mutex.
+            dwwDiskLoadPage(url)?.let { html ->
+                Log.i(TAG, "dwwFetch: cache disco para $url")
+                val p = DwwPage(html)
+                dwwPageCache[url] = System.currentTimeMillis() to p
+                return p
             }
         }
-        return resp.text
+        return dwwPageMutex.withLock {
+            val t2 = System.currentTimeMillis()
+            if (!bypassCache) {
+                dwwPageCache[url]?.let { (ts, p) -> if (t2 - ts < DWW_PAGE_TTL_MS) return p }
+                dwwDiskLoadPage(url)?.let { html ->
+                    val p = DwwPage(html)
+                    dwwPageCache[url] = System.currentTimeMillis() to p
+                    return p
+                }
+            }
+            fun headers(): Map<String, String> {
+                val h = mutableMapOf("User-Agent" to dwwUserAgent())
+                dwwCookies?.let { h["Cookie"] = it }
+                return h
+            }
+            var page: DwwPage? = null
+            try {
+                val resp = app.get(url, headers = headers(), referer = referer, timeout = 25L)
+                if (resp.code != 403 && !isDwwChallenge(resp.text)) {
+                    page = DwwPage(resp.text)
+                }
+            } catch (_: Throwable) {}
+            if (page == null) {
+                Log.i(TAG, "dwwFetch: challenge Cloudflare en $url -> WebView")
+                page = dwwWebViewPage(url, collectImages)
+            }
+            page?.let {
+                dwwPageCache[url] = System.currentTimeMillis() to it
+                dwwDiskSavePage(url, it.html)
+            }
+            page ?: DwwPage("")
+        }
     }
 
     /** Document con baseUri=url para que abs:href resuelva bien. */
-    private suspend fun dwwGet(url: String, referer: String? = null): Document =
-        Jsoup.parse(dwwGetRaw(url, referer), url)
+    private suspend fun dwwGet(
+        url: String,
+        referer: String? = null,
+        collectImages: Boolean = false
+    ): Document = Jsoup.parse(dwwFetch(url, referer, collectImages).html, url)
 
     // ==================== MAIN PAGE ====================
     // FIX 2026-08-11: Refactorizado para usar selectores CSS basados en clases en lugar
@@ -231,7 +572,8 @@ class DonghuaWorldProvider : MainAPI() {
             } else {
                 sectionUrl
             }
-            val document = dwwGet(url)
+            // v24: collectImages puentea las imagenes de las cards por el WebView.
+            val document = dwwGet(url, collectImages = true)
             val items = document.select(".listupd article").mapNotNull { art ->
                 parseArticleCard(art)
             }
@@ -246,11 +588,13 @@ class DonghuaWorldProvider : MainAPI() {
         // === Homepage sections (Latest/Recommendation; "Hot Series Update" eliminada en v22) ===
         // Solo la primera pagina trae el HTML del homepage; a partir de pagina 2
         // cargamos /page/N/ para la seccion Latest Release.
+        // v24: ambas secciones piden la MISMA url -> el cache TTL de dwwFetch
+        // resuelve el reto una sola vez. collectImages puentea los posters.
         val document = if (page == 1) {
-            dwwGet(sectionUrl.substringBefore("##"))
+            dwwGet(sectionUrl.substringBefore("##"), collectImages = true)
         } else {
             if (sectionUrl.contains("latest")) {
-                dwwGet("$mainUrl/page/$page/")
+                dwwGet("$mainUrl/page/$page/", collectImages = true)
             } else {
                 return newHomePageResponse(emptyList(), hasNext = false)
             }
@@ -307,7 +651,9 @@ class DonghuaWorldProvider : MainAPI() {
 
         // Pasamos la URL de episodio; load() la resuelve via breadcrumb (ver resolveSeriesUrlFromEpisode)
         return newAnimeSearchResponse(cleanTitle, episodeUrl) {
-            this.posterUrl = img
+            // v24: si el WebView puentéo la imagen (Cloudflare la bloquea para Coil),
+            // servimos el data URI; si no, la URL original.
+            this.posterUrl = dwwBridgeImg(img)
             addDubStatus(DubStatus.Subbed, epNum)
         }
     }
@@ -343,7 +689,7 @@ class DonghuaWorldProvider : MainAPI() {
     // ==================== SEARCH ====================
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val document = dwwGet("$mainUrl/?s=${java.net.URLEncoder.encode(query, "UTF-8")}")
+        val document = dwwGet("$mainUrl/?s=${java.net.URLEncoder.encode(query, "UTF-8")}", collectImages = true)
         val items = mutableListOf<SearchResponse>()
         val seenUrls = mutableSetOf<String>()
 
@@ -370,7 +716,7 @@ class DonghuaWorldProvider : MainAPI() {
             val cleanTitle = title.replace(Regex("""\s*Episode\s+\d+(?:-\d+)?[^|]*$""", RegexOption.IGNORE_CASE), "").trim()
 
             items.add(newAnimeSearchResponse(cleanTitle, url) {
-                this.posterUrl = img
+                this.posterUrl = dwwBridgeImg(img)
                 addDubStatus(DubStatus.Subbed, epNum)
             })
         }
@@ -387,16 +733,18 @@ class DonghuaWorldProvider : MainAPI() {
             resolveSeriesUrlFromEpisode(url)
         }
 
-        val document = dwwGet(seriesUrl)
+        // v24: collectImages puentea el poster de la ficha por el WebView.
+        val document = dwwGet(seriesUrl, collectImages = true)
 
         // Extract title
         val title = document.selectFirst("h1")?.text()?.trim() ?: "Unknown"
 
         // Extract poster image
-        val poster = document.selectFirst(".thumb img")?.let { getImgSrc(it) }
-            ?: document.selectFirst(".bigcontent .ts-post-image")?.let { getImgSrc(it) }
-            ?: document.selectFirst(".ts-post-image")?.let { getImgSrc(it) }
-            ?: ""
+        val poster = dwwBridgeImg(
+            document.selectFirst(".thumb img")?.let { getImgSrc(it) }
+                ?: document.selectFirst(".bigcontent .ts-post-image")?.let { getImgSrc(it) }
+                ?: document.selectFirst(".ts-post-image")?.let { getImgSrc(it) }
+        )
 
         // FIX 2026-07-29: Extraer la SINOPSIS real desde .bixbox.synp .entry-content.
         // Antes se usaba ".mindes, .alldes, .entry-content, .desc" pero:
@@ -830,7 +1178,7 @@ class DonghuaWorldProvider : MainAPI() {
     ) {
         try {
             Log.d(TAG, "extractDarkServer: fetching $playerUrl")
-            val playerHtml = dwwGetRaw(playerUrl, referer = "$mainUrl/")
+            val playerHtml = dwwFetch(playerUrl, referer = "$mainUrl/").html
             Log.d(TAG, "extractDarkServer: got ${playerHtml.length} chars")
 
             // === Extract Subtitle Tracks ===

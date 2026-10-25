@@ -237,21 +237,12 @@ object CommonExtractors {
             suspend fun emit(u: String, hls: Boolean, q: Int?) {
                 val url = u.takeIf { it.startsWith("http") } ?: return
                 if (!emittedUrls.add(url)) return
-                val qualitySuffix = when (q) {
-                    Qualities.P2160.value -> " 2160p"
-                    Qualities.P1440.value -> " 1440p"
-                    Qualities.P1080.value -> " 1080p"
-                    Qualities.P720.value -> " 720p"
-                    Qualities.P480.value -> " 480p"
-                    Qualities.P360.value -> " 360p"
-                    else -> ""
-                }
-                val displayName = if (qualitySuffix.isNotEmpty() &&
-                    !Regex("\\b\\d{3,4}p\\b", RegexOption.IGNORE_CASE).containsMatchIn(linkName)
-                ) linkName + qualitySuffix else linkName
+                // FIX v9 (2026-10): CS3 ya muestra la calidad aparte del nombre
+                // ("Dailymotion  |  720p"); anadir el sufijo duplicaba la etiqueta
+                // ("Dailymotion 1080p 1080p").
                 callback(
                     newExtractorLink(
-                        source = linkName, name = displayName, url = url,
+                        source = linkName, name = linkName, url = url,
                         type = if (hls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                     ) {
                         this.referer = DM_REFERER
@@ -295,6 +286,12 @@ object CommonExtractors {
                 // suelen ser AV1/HEVC y dan pantalla negra sin audio en dispositivos
                 // sin decodificador, asi que solo se publican las H264 con audio
                 // muxed (mp4a). El master se conserva como opcion "Auto".
+                // FIX v9 (2026-10, "sin audio" en algunos episodios): si la variante
+                // declara AUDIO="grupo" su audio vive en un EXT-X-MEDIA EXTERNO y
+                // abrirla suelta reproduce solo video. Igual si CODECS trae solo
+                // video (sin mp4a/aac/opus...). Esas variantes no se emiten: queda
+                // el master Auto, que ExoPlayer resuelve con el grupo de audio.
+                val audioCodecRe = Regex("""mp4a|aac|ac-3|eac-3|ec-3|opus|flac|mp3""", RegexOption.IGNORE_CASE)
                 Regex("""#EXT-X-STREAM-INF:([^\n]*)\n([^\n]+)""").findAll(master).forEach { m ->
                     val attrs = m.groupValues[1]
                     val variant = m.groupValues[2].trim()
@@ -302,6 +299,8 @@ object CommonExtractors {
                     if (codecs.contains("av01", true) || codecs.contains("hev1", true) ||
                         codecs.contains("hvc1", true)
                     ) return@forEach
+                    if (Regex("""\bAUDIO=""").containsMatchIn(attrs)) return@forEach
+                    if (codecs.isNotBlank() && !audioCodecRe.containsMatchIn(codecs)) return@forEach
                     val h = Regex("""RESOLUTION=\d+x(\d+)""").find(attrs)?.groupValues?.get(1)?.toIntOrNull()
                     val q = when {
                         h == null -> hlsQ ?: Qualities.Unknown.value

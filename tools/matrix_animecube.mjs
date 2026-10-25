@@ -26,7 +26,7 @@ const BASE = 'https://animecube.live';
 // companion object UA (AnimeCubeProvider.kt:214)
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36';
 const DM_REFERER = 'https://www.dailymotion.com/'; // CommonExtractors.kt:26
-const QUAL = { Unknown: 0, P360: 360, P480: 480, P720: 720, P1080: 1080 };
+const QUAL = { Unknown: 0, P360: 360, P480: 480, P720: 720, P1080: 1080, P1440: 1440, P2160: 2160 };
 
 const RAWARGS = process.argv.slice(2);
 const args = RAWARGS.filter(a => !a.startsWith('--'));
@@ -442,16 +442,35 @@ async function extractDailymotion(iframeSrc, embedderReferer, linkName, emittedS
       if (!u || !u.startsWith('http')) return;
       if (emittedUrls.has(u)) return;
       emittedUrls.add(u);
-      const suffix = q === QUAL.P1080 ? ' 1080p' : q === QUAL.P720 ? ' 720p' : q === QUAL.P480 ? ' 480p' : q === QUAL.P360 ? ' 360p' : '';
-      let name = linkName;
-      if (suffix && !new RegExp('\\b\\d{3,4}p\\b', 'i').test(name)) name += suffix;
-      links.push({ source: linkName, name, url: u, type: hls ? 'M3U8' : 'VIDEO', quality: q ?? QUAL.Unknown, referer: DM_REFERER, platform: 'dailymotion', vid });
+      // FIX v9: CS3 muestra la calidad aparte; el nombre ya no lleva sufijo.
+      links.push({ source: linkName, name: linkName, url: u, type: hls ? 'M3U8' : 'VIDEO', quality: q ?? QUAL.Unknown, referer: DM_REFERER, platform: 'dailymotion', vid });
       found = true;
     };
-    const tryPlaylist = (u, hlsQ) => {
+    // FIX v9 (audio): refleja CommonExtractors.tryPlaylist — expande variantes
+    // del master salvo las que declaran AUDIO="grupo" externo o CODECS sin
+    // audio (standalone = video sin audio). El master Auto siempre se emite.
+    const tryPlaylist = async (u, hlsQ) => {
       if (!u || !u.startsWith('http')) return false;
       if (/dmxleo/i.test(u) || /advertising/i.test(u) || u.includes('auth=')) return false;
-      emit(u, true, hlsQ);
+      const masterResp = await httpGet(u, { referer: DM_REFERER, headers: { 'User-Agent': UA } });
+      const master = masterResp.text;
+      if (!master.trimStart().startsWith('#EXTM3U')) { emit(u, true, hlsQ); return true; }
+      const audioCodecRe = /mp4a|aac|ac-3|eac-3|ec-3|opus|flac|mp3/i;
+      for (const m of master.matchAll(/#EXT-X-STREAM-INF:([^\n]*)\n([^\n]+)/g)) {
+        const attrs = m[1], variant = m[2].trim();
+        const codecs = (/CODECS="([^"]+)"/.exec(attrs)?.[1]) || '';
+        if (/av01|hev1|hvc1/i.test(codecs)) continue;
+        if (/\bAUDIO=/.test(attrs)) continue;
+        if (codecs && !audioCodecRe.test(codecs)) continue;
+        const h = /RESOLUTION=\d+x(\d+)/.exec(attrs)?.[1];
+        const q = h == null ? (hlsQ ?? QUAL.Unknown)
+          : h >= 2160 ? QUAL.P2160 : h >= 1440 ? QUAL.P1440 : h >= 1080 ? QUAL.P1080
+          : h >= 720 ? QUAL.P720 : h >= 480 ? QUAL.P480 : h >= 360 ? QUAL.P360 : QUAL.Unknown;
+        const origin = /^https?:\/\/[^/]+/.exec(u)?.[0] || u;
+        const abs = variant.startsWith('http') ? variant : variant.startsWith('/') ? origin + variant : `${origin}/${variant}`;
+        emit(abs, true, q);
+      }
+      emit(u, true, hlsQ); // Auto
       return true;
     };
 
@@ -459,12 +478,12 @@ async function extractDailymotion(iframeSrc, embedderReferer, linkName, emittedS
     let emittedAny = false;
     for (const m of json.matchAll(/"auto":\[\{"url":"(https:\/\/[^"]+)"/g)) {
       if (emittedAny) break;
-      if (m[1].includes('dailymotion.com')) emittedAny = tryPlaylist(acUnescJson(m[1]), QUAL.Unknown);
+      if (m[1].includes('dailymotion.com')) emittedAny = await tryPlaylist(acUnescJson(m[1]), QUAL.Unknown);
     }
     if (!emittedAny) {
       for (const m of json.matchAll(/"auto":\[\{[^}]*?"type":"[^"]+","url":"(https:\/\/[^"]+)"/g)) {
         if (emittedAny) break;
-        if (m[1].includes('dailymotion.com')) emittedAny = tryPlaylist(acUnescJson(m[1]), QUAL.Unknown);
+        if (m[1].includes('dailymotion.com')) emittedAny = await tryPlaylist(acUnescJson(m[1]), QUAL.Unknown);
       }
     }
     // 2) muxed vCRN presets (:260)
@@ -474,7 +493,7 @@ async function extractDailymotion(iframeSrc, embedderReferer, linkName, emittedS
       const vid2 = masterAuto ? /video\/([a-z0-9]+)\.m3u8/i.exec(masterAuto)?.[1] : null;
       if (dc && vid2 && !dc.startsWith('cdndirector')) {
         for (const preset of ['H264-1280x720', 'H264-1920x1080', 'H264-854x480']) {
-          if (tryPlaylist(`https://${dc}.dailymotion.com/cdn/${preset}/vCRN/mp4_h264_aac.m3u8?video=${vid2}`, QUAL.P720)) { emittedAny = true; break; }
+          if (await tryPlaylist(`https://${dc}.dailymotion.com/cdn/${preset}/vCRN/mp4_h264_aac.m3u8?video=${vid2}`, QUAL.P720)) { emittedAny = true; break; }
         }
       }
     }
@@ -483,7 +502,7 @@ async function extractDailymotion(iframeSrc, embedderReferer, linkName, emittedS
       for (const m of json.matchAll(/https:\/\/[^"']+?dmcdn[^"']*?\.m3u8[^"']*/g)) {
         const u = m[0];
         if (/\/av1/i.test(u) || /_av1_/i.test(u)) continue;
-        if (tryPlaylist(u, null)) { emittedAny = true; break; }
+        if (await tryPlaylist(u, null)) { emittedAny = true; break; }
       }
     }
     if (emittedAny) { emittedVids.add(vid); return found; }
@@ -537,20 +556,23 @@ async function extractRumble(vid, linkName, links) {
   // answers embedJS to non-browser ones (okhttp/4.x, com.android.vending).
   const RUA = process.env.AC_RUMBLE_UA || UA;
   const api = `https://rumble.com/embedJS/u3/?request=video&v=${vid}&embed=${encodeURIComponent(embed)}`;
+  // FIX: curlGet directo — Rumble puso su embedJS detras de Cloudflare y
+  // responde HTTP 200 con pagina "Just a moment" a Node/curl-unsupported UAs,
+  // por lo que playerGet no detecta el fallo (status 200). curl pasa siempre.
   let json = '';
-  try { json = (await httpGet(api, { referer: 'https://rumble.com/', headers: { 'User-Agent': RUA } })).text; } catch { json = ''; }
+  try { json = (await curlGet(api, { headers: { 'User-Agent': RUA, Referer: 'https://rumble.com/' } })).text; } catch { json = ''; }
   if (DEBUG) dbg(`    rumble embedJS #1 (ua=${RUA.slice(0, 24)}): ${json.slice(0, 200).replace(/\s+/g, ' ')}`);
   let count = json.trim() ? await rumbleEmit(json, linkName, links) : 0;
   if (count === 0) {
-    try { await httpGet(embed, { referer: `${BASE}/`, headers: { 'User-Agent': RUA } }); } catch {}
-    try { json = (await httpGet(api, { referer: embed, headers: { 'User-Agent': RUA } })).text; } catch { json = ''; }
+    try { await curlGet(embed, { headers: { 'User-Agent': RUA, Referer: `${BASE}/` } }); } catch {}
+    try { json = (await curlGet(api, { headers: { 'User-Agent': RUA, Referer: embed } })).text; } catch { json = ''; }
     if (DEBUG) dbg(`    rumble embedJS #2: ${json.slice(0, 200).replace(/\s+/g, ' ')}`);
     if (json.trim()) count = await rumbleEmit(json, linkName, links);
   }
   if (count > 0) return true;
   // provider fallback HLS (AnimeCubeProvider.kt:926)
   try {
-    const r = await httpGet(api, { referer: embed, headers: { 'User-Agent': UA } });
+    const r = await curlGet(api, { headers: { 'User-Agent': UA, Referer: embed } });
     const fixed = r.text.replaceAll('\\/', '/');
     if (DEBUG) dbg(`    rumble fallback HLS: status=${r.status} hls=${/"hls":\{"url":"[^"]+"/.exec(fixed)?.[0] || 'NONE'} keys=${Object.keys(JSON.parse(fixed) || {}).join(',')}`.slice(0, 400));
     const m = /"hls":\{"url":"(https:\/\/rumble\.com\/hls-vod\/[^"]+)"/.exec(fixed);

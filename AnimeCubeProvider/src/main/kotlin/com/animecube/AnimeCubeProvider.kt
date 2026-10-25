@@ -7,9 +7,18 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
 import org.jsoup.Jsoup
+import android.content.Context
+import android.webkit.CookieManager
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
  * AnimeCube (https://animecube.live/) — SPA Next.js con API JSON propia.
@@ -213,6 +222,117 @@ class AnimeCubeProvider : MainAPI() {
     companion object {
         private const val UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
+
+        private const val AC_HTML_TTL_MS = 90_000L
+        private val acHtmlCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, String>>()
+        private val acHtmlMutex = Mutex()
+
+        private fun acContext(): Context? {
+            // Mismo patron de 3 niveles que DWW: el helper de la API no es
+            // visible desde el classloader del plugin, y AcraApplication
+            // cambia de nombre de campo entre builds.
+            try {
+                val m = Class.forName("com.lagradost.api.ContextHelper_jvmKt")
+                    .declaredMethods.firstOrNull { it.name == "getContext" }
+                (m?.invoke(null) as? Context)?.let { return it }
+            } catch (_: Throwable) {}
+            try {
+                val f = Class.forName("com.lagradost.cloudstream3.AcraApplication")
+                    .getDeclaredField("context")
+                f.isAccessible = true
+                (f.get(null) as? Context)?.let { return it }
+            } catch (_: Throwable) {}
+            return try {
+                val m = Class.forName("android.app.ActivityThread")
+                    .getDeclaredMethod("currentApplication")
+                m.isAccessible = true
+                m.invoke(null) as? Context
+            } catch (_: Throwable) {
+                null
+            }
+        }
+
+        /** HTML fresco via WebView: el Chromium del app pasa el fingerprint que
+         *  Cloudflare/Next.js le exige; el flight embebido en el SSR trae TODAS
+         *  las temporadas y los titulos actuales ("Season N Episode M").
+         *  Los puentes OkHttp (app.get y cliente propio) reciben variantes
+         *  viejas cacheadas (sin Season 4, titulos "Episode N") que ni el
+         *  cache-buster ni los headers logran esquivar. */
+        private suspend fun acWebViewHtml(url: String): String? = withContext(Dispatchers.Main) {
+            val now = System.currentTimeMillis()
+            acHtmlCache[url]?.let { (ts, h) -> if (now - ts < AC_HTML_TTL_MS) return@withContext h }
+            val ctx = acContext()
+            if (ctx == null) return@withContext null
+            acHtmlMutex.withLock {
+                val t2 = System.currentTimeMillis()
+                acHtmlCache[url]?.let { (ts, h) -> if (t2 - ts < AC_HTML_TTL_MS) return@withContext h }
+                val html = suspendCancellableCoroutine { cont ->
+                    var webView: WebView? = null
+                    // Los postDelayed de un WebView sin adjuntar a ventana NUNCA
+                    // corren -> programar con Handler propio.
+                    val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+                    var done = false
+                    var result: String? = null
+                    fun finish() {
+                        if (done) return
+                        done = true
+                        mainHandler.removeCallbacksAndMessages(null)
+                        try { webView?.stopLoading() } catch (_: Throwable) {}
+                        try { webView?.destroy() } catch (_: Throwable) {}
+                        if (cont.isActive) cont.resume(result) {}
+                    }
+                    fun unjson(s: String?): String? = try {
+                        org.json.JSONTokener(s ?: "\"\"").nextValue() as? String
+                    } catch (_: Throwable) {
+                        null
+                    }
+                    fun goodHtml(h: String?): Boolean {
+                        if (h.isNullOrBlank() || h.length < 20000) return false
+                        val lower = h.lowercase()
+                        return !lower.contains("just a moment") &&
+                            !lower.contains("un momento") &&
+                            !h.contains("_cf_chl_opt")
+                    }
+                    var attempts = 0
+                    fun checkPage(view: WebView) {
+                        view.evaluateJavascript("document.documentElement.outerHTML") { htmlJson ->
+                            val h = unjson(htmlJson)
+                            if (goodHtml(h)) {
+                                result = h
+                                finish()
+                            } else if (++attempts <= 20) {
+                                mainHandler.postDelayed({ checkPage(view) }, 3000L)
+                            } else {
+                                finish()
+                            }
+                        }
+                    }
+                    try {
+                        CookieManager.getInstance().setAcceptCookie(true)
+                        val wv = WebView(ctx)
+                        webView = wv
+                        wv.settings.javaScriptEnabled = true
+                        wv.settings.domStorageEnabled = true
+                        wv.settings.setSupportMultipleWindows(false)
+                        wv.settings.javaScriptCanOpenWindowsAutomatically = false
+                        wv.webViewClient = object : WebViewClient() {
+                            override fun onPageFinished(view: WebView, vurl: String) {
+                                checkPage(view)
+                            }
+                        }
+                        wv.loadUrl(url)
+                        mainHandler.postDelayed({ finish() }, 90_000L)
+                    } catch (_: Throwable) {
+                        finish()
+                    }
+                    cont.invokeOnCancellation { finish() }
+                }
+                if (html != null) {
+                    acHtmlCache[url] = System.currentTimeMillis() to html
+                }
+                html
+            }
+        }
 
         /** Palabras vacias para la similitud de nombres de las recomendaciones. */
         private val AC_STOPWORDS = setOf(
@@ -463,22 +583,38 @@ class AnimeCubeProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val slug = url.trimEnd('/').substringAfterLast('/')
-        val noCache = mapOf("Cache-Control" to "no-cache", "Pragma" to "no-cache")
+        // FIX v15 (2026-10): desde el app, Cloudflare/Next.js entrega variantes
+        // VIEJAS del flight/HTML (sin Season 4, titulos "Episode N") a cualquier
+        // puente OkHttp — ni el cache-buster, los headers (Vary: RSC,
+        // Next-Router-*) ni un cliente propio lo evitan; es el fingerprint TLS.
+        // El HTML se pide ahora via WebView (mismo truco que DonghuaWorld) y el
+        // RSC via app.get como ruta rapida paralela: se parsean y fusionan ambos.
+        val noCache = mapOf(
+            "Cache-Control" to "no-cache", "Pragma" to "no-cache",
+            "Accept-Encoding" to "identity"
+        )
         val ts = System.currentTimeMillis()
-        // v8: cache-buster. El http_cache de OkHttp puede conservar un RSC
-        // antiguo (p.ej. solo temporada 1 y sin sinopsis) y la ficha queda
-        // con "Trama no encontrada" y episodios incompletos.
-        val flight = app.get(
-            "$mainUrl/anime/$slug?_rsc=1&_t=$ts",
-            headers = mapOf("User-Agent" to UA, "RSC" to "1") + noCache,
-            timeout = 25L
-        ).text
-
-        // Titulo: og:title del HTML SSR ("<slug> - Watch Online | Anime Cube")
-        val html = app.get(
-            "$mainUrl/anime/$slug?_t=$ts",
-            headers = mapOf("User-Agent" to UA) + noCache
-        ).text
+        val pageUrl = "$mainUrl/anime/$slug"
+        val (flight, html) = coroutineScope {
+            val f = async {
+                runCatching {
+                    app.get(
+                        "$pageUrl?_rsc=1&_t=$ts",
+                        headers = mapOf("User-Agent" to UA, "RSC" to "1") + noCache,
+                        timeout = 25L
+                    ).text
+                }.getOrDefault("")
+            }
+            val h = async {
+                try {
+                    acWebViewHtml(pageUrl)
+                        ?: app.get("$pageUrl?_t=$ts", headers = mapOf("User-Agent" to UA) + noCache, timeout = 25L).text
+                } catch (_: Throwable) {
+                    app.get("$pageUrl?_t=$ts", headers = mapOf("User-Agent" to UA) + noCache, timeout = 25L).text
+                }
+            }
+            f.await() to h.await()
+        }
         // El HTML trae el mismo flight escapado: respaldo si el RSC llega
         // corto o sin los campos nuevos.
         val htmlFlight = html.replace("\\\"", "\"")
@@ -510,25 +646,39 @@ class AnimeCubeProvider : MainAPI() {
             // episodio de la temporada real y NO aparece en el registro de sources ->
             // si el numero ya salio, se omite para no dejar un episodio muerto.
             val isPseudo = season.title.isBlank() && season.episodes.size <= 1
+            // FIX v13 (2026-10): establecer el campo season de CS3. Sin el, episodios
+            // de temporadas distintas comparten numero (S3E1..26 y S4E1..12 -> dos
+            // "Episode 1") y la app solo mostraba los de la primera temporada. El
+            // numero sale del titulo ("Season 3" -> 3); si no hay, ordinal.
+            val seasonNum = Regex("""(\d+)""").find(season.title)
+                ?.groupValues?.get(1)?.toIntOrNull()
+                ?: (seasons.indexOf(season) + 1)
             for (ep in season.episodes) {
                 if (!seen.add(ep.id)) continue
                 if (isPseudo && seenNums.contains(ep.number)) continue
                 seenNums.add(ep.number)
+                // El titulo del sitio es "Season N Episode M" (a veces con nombre
+                // real detras): se quita el prefijo; si queda vacio, name = null
+                // para que CS3 muestre "Episode N" agrupado por temporada, sin
+                // repetir "Season 3" dos veces.
+                val cleanTitle = ep.title.ifBlank { ep.numberDisplay }
+                    .replace(Regex("""^Season\s*\d+\s*Episode\s*[\d-]+\s*""", RegexOption.IGNORE_CASE), "")
+                    .trim()
+                    .trimStart('-', '–')
+                    .trim()
                 episodes.add(
                     newEpisode(ep.id) {
-                        this.name = buildString {
-                            append(if (ep.title.isNotBlank()) ep.title else "Episode ${ep.numberDisplay}")
-                            if (seasons.size > 1) append(" · ${season.title}")
-                        }
+                        this.season = seasonNum
                         this.episode = ep.number
+                        if (cleanTitle.isNotBlank()) this.name = cleanTitle
                     }
                 )
             }
         }
-        val sorted = episodes.sortedBy { it.episode ?: 0 }
+        val sorted = episodes.sortedWith(compareBy({ it.season ?: 0 }, { it.episode ?: 0 }))
 
         // FIX v3: objeto principal de la serie en el flight (poster/rating/status/year/genres)
-        val main = acMainAnimeObject(flight, slug)
+        val main = acMainAnimeObject(flight, slug) ?: acMainAnimeObject(htmlFlight, slug)
         val cover = main?.let { Regex("\"coverImage\":\"([^\"]+)\"").find(it)?.groupValues?.get(1) } ?: ""
         val rating = main?.let { Regex("\"rating\":([0-9.]+)").find(it)?.groupValues?.get(1)?.toDoubleOrNull() }
         val acStatus = main?.let { Regex("\"status\":\"([\\w-]+)\"").find(it)?.groupValues?.get(1) }
