@@ -31,6 +31,55 @@ object CommonExtractors {
 
     private fun headersWithUA(custom: String?) = mapOf("User-Agent" to (custom ?: UA))
 
+    /**
+     * Decoys que los embebidos traen como relleno (muestras de test-videos.co.uk,
+     * clips AV1 que dan pantalla negra, o ".mp4" pegado a un caracter mas).
+     */
+    fun isJunkVideoUrl(u: String): Boolean =
+        u.contains("test-videos.co.uk", ignoreCase = true) ||
+            u.contains("av01", ignoreCase = true) ||
+            Regex("""/av1/""", RegexOption.IGNORE_CASE).containsMatchIn(u) ||
+            Regex("""\.mp4[A-Za-z0-9]""", RegexOption.IGNORE_CASE).containsMatchIn(u)
+
+    /**
+     * Fallback comun de Dailymotion para providers cuyo intento contra
+     * [extractDailymotion] no dio enlaces: relee el metadata y emite UN master
+     * HLS, sin partirlo en variantes (las fMP4 sueltas pierden la pista de audio)
+     * y nunca un VMAP de anuncios. Sin escaneos mp4: ahi solo vivian los decoys.
+     */
+    suspend fun extractDailymotionMaster(
+        videoId: String,
+        referer: String,
+        linkName: String,
+        customUA: String? = null,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val json = try {
+            app.get(
+                "https://www.dailymotion.com/player/metadata/video/$videoId" +
+                    "?embedder=" + java.net.URLEncoder.encode(referer, "UTF-8") + "&integration=inline",
+                referer = referer, headers = headersWithUA(customUA), timeout = 15L
+            ).text.replace("\\/", "/").replace("\\u0026", "&")
+        } catch (_: Exception) {
+            return false
+        }
+        val master = Regex(
+            """https://[a-z0-9.-]+\.dailymotion\.com/cdn/manifest/video/[a-z0-9]+\.m3u8[^"']*""",
+            RegexOption.IGNORE_CASE
+        ).findAll(json).map { it.value }.firstOrNull {
+            !it.contains("dmxleo", true) && !it.contains("advertising", true) && !it.contains("auth=", true)
+        } ?: return false
+        // No se valida con app.get: un 403 suele ser el fingerprint TLS de
+        // OkHttp, no una URL muerta; el reproductor (Cronet) si lo abre.
+        callback(
+            newExtractorLink(source = linkName, name = linkName, url = master, type = ExtractorLinkType.M3U8) {
+                this.referer = DM_REFERER
+                this.quality = Qualities.Unknown.value
+            }
+        )
+        return true
+    }
+
     /** Desescapa un string JSON (\\uXXXX, \\/, \\n, ...). */
     fun unescJson(s: String): String {
         val sb = StringBuilder(s.length)
@@ -338,8 +387,10 @@ object CommonExtractors {
                     h >= 360 -> Qualities.P360.value
                     else -> Qualities.Unknown.value
                 }
-                if (url.contains("/av1", ignoreCase = true) || url.contains("_av1_", ignoreCase = true)) {
-                    // skip AV1: negro / sin audio
+                if (isJunkVideoUrl(url) || url.contains("/av1", ignoreCase = true) ||
+                    url.contains("_av1_", ignoreCase = true)
+                ) {
+                    // skip AV1 y decoys: negro / sin audio
                 } else {
                     emit(url, url.contains(".m3u8"), q)
                 }

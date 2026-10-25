@@ -3182,6 +3182,7 @@ class DonghuaLifeProvider : MainAPI() {
         if (!emitted) {
             for (m in Regex("""(https?://[^"]+?\.mp4[^"]*)""").findAll(data)) {
                 val u = m.groupValues[1]
+                if (CE.isJunkVideoUrl(u)) continue
                 try {
                     callback(
                         newExtractorLink(
@@ -3246,59 +3247,11 @@ class DonghuaLifeProvider : MainAPI() {
             ) return true
         } catch (_: Exception) {}
 
-        try {
-            val apiUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
-            val jsonText = app.get(apiUrl,
-                referer = "https://www.dailymotion.com/embed/video/$videoId",
-                headers = mapOf(
-                    "User-Agent" to browserUA,
-                    "Accept" to "application/json",
-                    "Accept-Language" to "en-US,en;q=0.9",
-                    "Origin" to "https://www.dailymotion.com",
-                ),
-                timeout = 15L).text
-            Log.i(TAG, "extractDailymotion: videoId=$videoId jsonLen=${jsonText.length}")
-
-            // DM escapa las barras del JSON: sin desescapar, los regex de abajo
-            // nunca casan y esta rama era codigo muerto.
-            val json = jsonText.replace("\\/", "/").replace("\\u0026", "&")
-
-            // Solo aceptar el master HLS firmado de Dailymotion. Expandir
-            // variantes fMP4 individuales puede eliminar la pista de audio.
-            val masterRegex = Regex("""(https?://[^"'\s<>]+dailymotion\.com/cdn/manifest/video/[^\s"'<>]+\.m3u8[^\s"'<>]*)""", RegexOption.IGNORE_CASE)
-            for (match in masterRegex.findAll(json)) {
-                val u = match.groupValues[1]
-                // El advertising.ad_url responde VMAP XML, no m3u8: ExoPlayer lo
-                // rechaza con ERROR_CODE_PARSING.
-                if (u.contains("dmxleo", true) || u.contains("advertising", true) || u.contains("auth=", true)) continue
-                trackingCb(newExtractorLink(source = serverName, name = serverName, url = u, type = ExtractorLinkType.M3U8) {
-                    this.referer = "https://www.dailymotion.com/"
-                    this.quality = Qualities.Unknown.value
-                })
-                if (emitted) return true
-            }
-            val mp4Urls = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(json).map { it.value }.distinct().toList()
-            for (u in mp4Urls) {
-                val q = when {
-                    u.contains("1080") -> Qualities.P1080.value
-                    u.contains("720") -> Qualities.P720.value
-                    u.contains("480") -> Qualities.P480.value
-                    else -> Qualities.Unknown.value
-                }
-                trackingCb(newExtractorLink(source = serverName, name = "$serverName ${q/1000}p", url = u) {
-                    this.referer = "https://www.dailymotion.com"
-                    this.quality = q
-                })
-            }
-            if (emitted) return true
-        } catch (e: Exception) {
-            Log.w(TAG, "extractDailymotion: metadata fetch failed for videoId=$videoId: ${e.message}")
-        }
-
-        try {
-            loadExtractor("https://www.dailymotion.com/embed/video/$videoId", referer, subtitleCallback, trackingCb)
-        } catch (e: Exception) {
-            Log.w(TAG, "extractDailymotion: loadExtractor fallback failed: ${e.message}")
+        // v28: el unico respaldo que queda es el master HLS del metadata. Se
+        // quitaron el escaneo de mp4 (solo casaba decoys) y el loadExtractor de
+        // CloudStream, que vuelve a partir el master en variantes fMP4 sin audio.
+        if (!CE.extractDailymotionMaster(videoId, referer, serverName, browserUA, trackingCb)) {
+            Log.w(TAG, "extractDailymotion: metadata sin master HLS para videoId=$videoId")
         }
         return emitted
     }
@@ -3384,6 +3337,7 @@ class DonghuaLifeProvider : MainAPI() {
                 // MP4
                 for (match in Regex("""(https?://[^"]+\.mp4[^"]*)""").findAll(unescaped)) {
                     val u = match.groupValues[1]
+                    if (CE.isJunkVideoUrl(u)) continue
                     callback(
                         newExtractorLink(
                             source = serverName,
@@ -3515,6 +3469,7 @@ class DonghuaLifeProvider : MainAPI() {
                 }
                 if (emitted) return true
                 for (match in Regex("""(https?://[^"]+\.mp4[^"]*)""").findAll(unescaped)) {
+                    if (CE.isJunkVideoUrl(match.groupValues[1])) continue
                     callback(newExtractorLink(source = serverName, name = serverName, url = match.groupValues[1], type = ExtractorLinkType.VIDEO) {
                         this.referer = videoUrl
                         this.quality = Qualities.Unknown.value
@@ -3579,6 +3534,7 @@ class DonghuaLifeProvider : MainAPI() {
                 if (emittedAny) return
                 for (m in mp4Pattern.findAll(decoded)) {
                     val u = m.groupValues[1]
+                    if (CE.isJunkVideoUrl(u)) continue
                     callback(
                         newExtractorLink(
                             source = serverName,
@@ -3717,6 +3673,7 @@ class DonghuaLifeProvider : MainAPI() {
                 for (m in Regex("""(https?://[^"'\s\\]+\.mp4[^"'\s\\]*)""").findAll(unpacked)) {
                     val u = m.groupValues[1]
                         .replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&")
+                    if (CE.isJunkVideoUrl(u)) continue
                     val q = when {
                         u.contains("1080") -> Qualities.P1080.value
                         u.contains("720") -> Qualities.P720.value

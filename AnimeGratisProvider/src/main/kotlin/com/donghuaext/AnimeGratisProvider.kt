@@ -939,7 +939,8 @@ class AnimeGratisProvider : MainAPI() {
                         try { generateM3u8("Server", url, data).forEach(callback); foundLinks = true } catch (_: Exception) {}
                     }
                     if (!foundLinks) {
-                        Regex("""(https?://[^\s"'<>]+\.mp4(?![A-Za-z0-9])[^\s"'<>]*)""").find(scriptData)?.value?.let { url ->
+                        Regex("""(https?://[^\s"'<>]+\.mp4(?![A-Za-z0-9])[^\s"'<>]*)""").find(scriptData)?.value
+                            ?.takeIf { !CE.isJunkVideoUrl(it) }?.let { url ->
                             callback(newExtractorLink(source = "Server", name = "Server", url = url) {
                                 this.referer = data; this.quality = Qualities.Unknown.value
                             })
@@ -1024,7 +1025,7 @@ class AnimeGratisProvider : MainAPI() {
                 }
             if (!found) {
                 Regex("""(https?://[^"'\s<>]+\.mp4(?![A-Za-z0-9])[^"'\s<>]*)""").findAll(text)
-                    .map { it.value }.distinct().forEach { u ->
+                    .map { it.value }.distinct().filterNot { CE.isJunkVideoUrl(it) }.forEach { u ->
                     callback(newExtractorLink(source = serverName, name = serverName, url = u) {
                         this.referer = playerUrl; this.quality = Qualities.Unknown.value
                     })
@@ -1066,6 +1067,7 @@ class AnimeGratisProvider : MainAPI() {
             // 4) mp4
             if (!found) {
                 Regex("""["']?file["']?\s*:\s*["']([^"']+\.mp4(?![A-Za-z0-9])[^"']*)["']""").findAll(unpacked).forEach { m ->
+                    if (CE.isJunkVideoUrl(m.destructured.component1())) return@forEach
                     callback(newExtractorLink(source = serverName, name = serverName, url = m.destructured.component1()) {
                         this.referer = referer; this.quality = Qualities.Unknown.value
                     })
@@ -1085,6 +1087,7 @@ class AnimeGratisProvider : MainAPI() {
                 try { generateM3u8(serverName, match.value, playerUrl).forEach(callback); return true } catch (_: Exception) {}
             }
             for (match in Regex("""(https?://[^\s"'<>]+\.mp4(?![A-Za-z0-9])[^\s"'<>]*)""").findAll(text)) {
+                if (CE.isJunkVideoUrl(match.value)) continue
                 callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
                     this.referer = playerUrl; this.quality = Qualities.Unknown.value
                 })
@@ -1109,47 +1112,11 @@ class AnimeGratisProvider : MainAPI() {
                 subtitleCallback, callback
             )
         ) return true
-        try {
-            val apiUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
-            val jsonText = app.get(apiUrl, referer = "https://www.dailymotion.com/embed/video/$videoId",
-                headers = mapOf("User-Agent" to USER_AGENT, "Accept" to "application/json"), timeout = 15L).text
-                // DM escapa las barras: sin desescapar los regex de abajo no casan.
-                .replace("\\/", "/").replace("\\u0026", "&")
-            for (match in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(jsonText)) {
-                val u = match.value
-                // Nunca emitir el VMAP de anuncios: ExoPlayer lo rechaza.
-                if (u.contains("dmxleo", true) || u.contains("advertising", true) || u.contains("auth=", true)) continue
-                try { generateM3u8(serverName, u, "https://www.dailymotion.com").forEach(callback); return true } catch (_: Exception) {}
-            }
-            val mp4Urls = Regex("""(https?://[^"'\s<>]+\.mp4(?![A-Za-z0-9])[^\s"'<>]*)""").findAll(jsonText).map { it.value }.distinct().toList()
-            if (mp4Urls.isNotEmpty()) {
-                for (url in mp4Urls) {
-                    val q = when {
-                        url.contains("1080") -> Qualities.P1080.value; url.contains("720") -> Qualities.P720.value
-                        url.contains("480") -> Qualities.P480.value; else -> Qualities.Unknown.value
-                    }
-                    callback(newExtractorLink(source = serverName, name = "$serverName ${q/1000}p", url = url) {
-                        this.referer = "https://www.dailymotion.com"; this.quality = q
-                    })
-                }
-                return true
-            }
-        } catch (_: Exception) {}
-        // Fallback: scrape embed page
-        try {
-            val embedUrl = "https://www.dailymotion.com/embed/video/$videoId"
-            val html = app.get(embedUrl, referer = referer, headers = mapOf("User-Agent" to USER_AGENT), timeout = 15L).text
-            for (match in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(html)) {
-                try { generateM3u8(serverName, match.value, embedUrl).forEach(callback); return true } catch (_: Exception) {}
-            }
-            for (match in Regex("""(https?://[^"'\s<>]+\.mp4(?![A-Za-z0-9])[^\s"'<>]*)""").findAll(html)) {
-                callback(newExtractorLink(source = serverName, name = serverName, url = match.value) {
-                    this.referer = embedUrl; this.quality = Qualities.Unknown.value
-                })
-                return true
-            }
-        } catch (_: Exception) {}
-        return false
+        // v28: unico respaldo = el master HLS del metadata. Se quitaron el
+        // generateM3u8 del master (partia el manifest y dejaba el video sin
+        // audio), el escaneo de mp4 (solo casaba decoys) y el scrapeo de la
+        // pagina del embed, que volvia a publicar el VMAP de anuncios.
+        return CE.extractDailymotionMaster(videoId, referer, serverName, USER_AGENT, callback)
     }
 
     /** Dedupe de videos de DM entre servers del episodio. */

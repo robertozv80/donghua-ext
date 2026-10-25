@@ -596,16 +596,19 @@ async function generateM3u8(serverName, masterUrl, referer, links, subs) {
 const emittedDmVids = new Set(); // private val emittedDmVids (:911) - instance field
 
 async function loadLinks(data, registry) {
-  const m = /^(.+)-(tab-[\w-]+)-ep-(\d+(?:-\d+)?)$/.exec(data);
+  // La app pasa el dato por fixUrl(): siempre llega como URL absoluta del mainUrl.
+  const m = /^(?:https?:\/\/[^\/]+\/)?(.+)-(tab-[\w-]+)-ep-(\d+(?:-\d+)?)$/.exec(data);
   if (!m) return { ok: false, reason: 'episode id no match', links: [], subs: [], skipped: [] };
   const slug = m[1];
   const seId = m[2];
+  // Id desnudo para /sources (el provider reconstruye tras el parse).
+  const epId = `${slug}-${seId}-ep-${m[3]}`;
   emittedDmVids.clear(); // v8 (:809)
   const entries = registry.filter(e => e.slug === slug).sort((a, b) => (a.seasonId === seId ? 0 : 1) - (b.seasonId === seId ? 0 : 1));
   if (!entries.length) return { ok: false, reason: 'registry sin entradas', links: [], subs: [], skipped: [] };
   let sources = [], used = null, via = '';
   for (const entry of entries.slice(0, 3)) {
-    const res = await fetchSources(slug, data, entry.primaryTabId, entry.seasonId, entry.version);
+    const res = await fetchSources(slug, epId, entry.primaryTabId, entry.seasonId, entry.version);
     via = res.via;
     if (res.list.length) { sources = res.list; used = entry; break; }
   }
@@ -810,7 +813,7 @@ async function main() {
     const label = `${p.ser.slug} ep${p.ep.number}`;
     log(`\n---- ${label} [${p.kind}] id=${p.ep.id}`);
     const t0 = Date.now();
-    const r = await loadLinks(p.ep.id, registry);
+    const r = await loadLinks('https://animecube.live/' + p.ep.id, registry);
     log(`     sources=${r.nSources ?? 0} via=${r.via || '-'} entry=${r.used ? r.used.primaryTabId + '/' + r.used.seasonId : '-'} links=${r.links.length} subs=${r.subs.length} skipped=[${r.skipped.join(',')}] loadLinks.returned=${r.ok} (${Date.now() - t0}ms)`);
     if (!r.ok && !r.links.length) {
       rows.push({ ep: label, sources: r.nSources ?? 0, emitted: 0, playable: 0, verdict: 'FAIL', reason: r.reason || 'no links' });

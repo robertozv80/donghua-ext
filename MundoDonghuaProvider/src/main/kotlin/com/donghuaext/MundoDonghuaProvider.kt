@@ -8,6 +8,7 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.getAndUnpack
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.extractors.StreamWishExtractor
+import com.donghuaext.common.CommonExtractors as CE
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import android.util.Base64
 import java.util.UUID
@@ -813,6 +814,9 @@ class MundoDonghuaProvider : MainAPI() {
         // dependen de www.mdnemonicplayer.xyz) se emiten en el ultimo lugar.
         val embedsFound = LinkedHashSet<String>()
         val deadLinks = ArrayList<ExtractorLink>()
+        // Dedupe de videos/subs de DM dentro del mismo episodio.
+        val mdEmittedDmSubs = mutableSetOf<String>()
+        val mdEmittedDmVids = mutableSetOf<String>()
 
         val reqHEAD = mapOf(
             "User-Agent" to USER_AGENT,
@@ -931,42 +935,27 @@ class MundoDonghuaProvider : MainAPI() {
                                             for (dmPattern in dmIdPatterns) {
                                                 val vidID = dmPattern.find(playerResp)?.destructured?.component1()
                                                 if (!vidID.isNullOrEmpty()) {
-                                                    // Intentar extracción directa via API
-                                                    try {
-                                                        val apiUrl = "https://www.dailymotion.com/player/metadata/video/$vidID"
-                                                        val jsonText = app.get(apiUrl,
-                                                            referer = "https://www.dailymotion.com/embed/video/$vidID",
-                                                            headers = mapOf("User-Agent" to USER_AGENT, "Accept" to "application/json"),
-                                                            timeout = 15L).text
-                                                        // v26 SPEED: enlaces en crudo, sin expandir el master.
-                                                        for (m in Regex("""(https?://[^"'\s<>]+\.m3u8[^\s"'<>]*)""").findAll(jsonText)) {
-                                                            deadLinks.add(
-                                                                newExtractorLink(source = "Tamamo", name = "Tamamo", url = m.value) {
-                                                                    this.referer = "https://www.dailymotion.com"
-                                                                    this.quality = Qualities.Unknown.value
-                                                                }
-                                                            )
-                                                            break
-                                                        }
-                                                        val mp4Urls = Regex("""(https?://[^"'\s<>]+\.mp4[^\s"'<>]*)""").findAll(jsonText).map { it.value }.distinct().toList()
-                                                        if (mp4Urls.isNotEmpty()) {
-                                                            for (mp4Url in mp4Urls) {
-                                                                val q = when {
-                                                                    mp4Url.contains("1080") -> Qualities.P1080.value
-                                                                    mp4Url.contains("720") -> Qualities.P720.value
-                                                                    mp4Url.contains("480") -> Qualities.P480.value
-                                                                    else -> Qualities.Unknown.value
-                                                                }
-                                                                deadLinks.add(newExtractorLink(source = "Tamamo", name = "Tamamo ${q/1000}p", url = mp4Url) {
-                                                                    this.referer = "https://www.dailymotion.com"
-                                                                    this.quality = q
-                                                                })
-                                                            }
-                                                        }
-                                                    } catch (_: Exception) {}
-                                                    // Fallback: loadExtractor
-                                                    val dmUrl = "https://www.dailymotion.com/embed/video/$vidID"
-                                                    try { loadExtractor(dmUrl, data, subtitleCallback, callback) } catch (_: Exception) {}
+                                                    // v28: antes se cogía el PRIMER .m3u8 del
+                                                    // metadata, que suele ser el VMAP de anuncios
+                                                    // (ERROR_CODE_PARSING) y se completaba con mp4
+                                                    // decoys. Ahora manda el extractor comun (master
+                                                    // con audio + subs) y el unico respaldo es el
+                                                    // master HLS.
+                                                    val dmEmbed = "https://www.dailymotion.com/embed/video/$vidID"
+                                                    val viaCommon = try {
+                                                        CE.extractDailymotion(
+                                                            dmEmbed, data, "Tamamo", USER_AGENT,
+                                                            mdEmittedDmSubs, mdEmittedDmVids,
+                                                            subtitleCallback
+                                                        ) { deadLinks.add(it) }
+                                                    } catch (_: Exception) { false }
+                                                    if (!viaCommon) {
+                                                        try {
+                                                            CE.extractDailymotionMaster(
+                                                                vidID, dmEmbed, "Tamamo", USER_AGENT
+                                                            ) { deadLinks.add(it) }
+                                                        } catch (_: Exception) {}
+                                                    }
                                                     break
                                                 }
                                             }

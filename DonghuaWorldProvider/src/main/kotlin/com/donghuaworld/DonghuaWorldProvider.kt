@@ -1,13 +1,22 @@
 package com.donghuaworld
 
+import android.content.Context
 import android.util.Base64
 import android.util.Log
+import android.webkit.CookieManager
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.donghuaext.common.CommonExtractors as CE
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 
 class DonghuaWorldProvider : MainAPI() {
     override var mainUrl = "https://donghuaworld.com"
@@ -21,6 +30,13 @@ class DonghuaWorldProvider : MainAPI() {
         private const val TAG = "DonghuaWorld"
         private const val PLAYER_BASE = "https://player.donghuaplanet.com"
 
+        // v23: el sitio activo el challenge de Cloudflare ("Just a moment") y las
+        // peticiones de OkHttp reciben 403. Se resuelve una vez en WebView y se
+        // reutiliza la cookie cf_clearance; DEBE ser la misma UA que envian las
+        // peticiones porque Cloudflare la vincula al emitir la cookie.
+        private const val DWW_UA =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
+
         /** Regex to match episode numbers or ranges like "Episode 263" or "Episode 254-255" */
         private val EPISODE_NUM_REGEX = Regex("""Episode\s+(\d+(?:-\d+)?)""", RegexOption.IGNORE_CASE)
 
@@ -33,6 +49,145 @@ class DonghuaWorldProvider : MainAPI() {
         /** Keywords that identify English subtitle tracks (case-insensitive matching) */
         private val ENGLISH_KEYWORDS = listOf("english", "eng", "en-us", "en-gb")
     }
+
+    // ==================== CLOUDFLARE (v23) ====================
+
+    @Volatile
+    private var dwwCookies: String? = null
+
+    @Volatile
+    private var dwwUaCache: String? = null
+
+    /** UA real del WebView: si hardcodeamos otro Chrome, el fingerprint (sec-ch-ua)
+     *  no coincide y Cloudflare manda el reto en bucle sin resolverlo nunca. */
+    private fun dwwUserAgent(): String {
+        val cached = dwwUaCache
+        if (cached != null) return cached
+        val ua = try {
+            android.webkit.WebSettings.getDefaultUserAgent(dwwContext()!!)
+        } catch (_: Throwable) {
+            DWW_UA
+        }
+        dwwUaCache = ua
+        return ua
+    }
+
+    private fun isDwwChallenge(text: String): Boolean =
+        text.contains("Just a moment", ignoreCase = true) ||
+            text.contains("Un momento…") ||
+            text.contains("_cf_chl_opt")
+
+    private fun dwwContext(): Context? = try {
+        Class.forName("com.lagradost.api.ContextHelper_jvmKt")
+            .declaredMethods.firstOrNull { it.name == "getContext" }?.invoke(null) as? Context
+    } catch (_: Throwable) {
+        try {
+            val f = Class.forName("com.lagradost.cloudstream3.AcraApplication").getDeclaredField("context")
+            f.isAccessible = true
+            f.get(null) as? Context
+        } catch (_: Throwable) {
+            try {
+                val m = Class.forName("android.app.ActivityThread").getDeclaredMethod("currentApplication")
+                m.isAccessible = true
+                m.invoke(null) as? Context
+            } catch (_: Throwable) {
+                null
+            }
+        }
+    }
+
+    /** Carga url en un WebView (su Chromium pasa el fingerprint TLS/JS que Cloudflare
+     *  le exige a OkHttp) y devuelve el HTML final ya sin challenge. */
+    private suspend fun dwwWebViewFetch(url: String): String? = withContext(Dispatchers.Main) {
+        val ctx = dwwContext()
+        if (ctx == null) {
+            Log.w(TAG, "dwwWebViewFetch: sin Context, no se puede resolver el challenge")
+            return@withContext null
+        }
+        suspendCancellableCoroutine { cont ->
+            var webView: WebView? = null
+            var done = false
+            val startedAt = android.os.SystemClock.elapsedRealtime()
+            fun finish(html: String?) {
+                if (done) return
+                done = true
+                try { webView?.stopLoading() } catch (_: Throwable) {}
+                try { webView?.destroy() } catch (_: Throwable) {}
+                if (html != null) {
+                    Log.i(TAG, "dwwWebViewFetch: OK en ${android.os.SystemClock.elapsedRealtime() - startedAt}ms")
+                } else {
+                    Log.w(TAG, "dwwWebViewFetch: timeout/sin HTML limpio tras ${android.os.SystemClock.elapsedRealtime() - startedAt}ms")
+                }
+                if (cont.isActive) cont.resume(html) {}
+            }
+            fun unjson(s: String?): String? = try {
+                org.json.JSONTokener(s ?: "\"\"").nextValue() as? String
+            } catch (_: Throwable) {
+                null
+            }
+            try {
+                CookieManager.getInstance().setAcceptCookie(true)
+                val wv = WebView(ctx)
+                webView = wv
+                wv.settings.javaScriptEnabled = true
+                wv.settings.domStorageEnabled = true
+                wv.settings.setSupportMultipleWindows(false)
+                wv.settings.javaScriptCanOpenWindowsAutomatically = false
+                var attempts = 0
+                fun checkPage(view: WebView) {
+                    view.evaluateJavascript("document.documentElement.outerHTML") { htmlJson ->
+                        val html = unjson(htmlJson)
+                        if (!html.isNullOrBlank() && !isDwwChallenge(html)) {
+                            val ck = CookieManager.getInstance().getCookie(mainUrl) ?: ""
+                            if (ck.isNotBlank()) dwwCookies = ck
+                            finish(html)
+                        } else if (++attempts <= 30) {
+                            // El reto (Just a moment / Un momento…) puede tardar ~70s en
+                            // resolver solo; sondear el HTML en vez de fiarse del titulo
+                            // (viene localizado).
+                            view.postDelayed({ checkPage(view) }, 4000L)
+                        } else {
+                            finish(null)
+                        }
+                    }
+                }
+                wv.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView, vurl: String) {
+                        checkPage(view)
+                    }
+                }
+                wv.loadUrl(url)
+                wv.postDelayed({ finish(null) }, 150_000L)
+            } catch (t: Throwable) {
+                Log.w(TAG, "dwwWebViewFetch: ${t.message}")
+                finish(null)
+            }
+            cont.invokeOnCancellation { finish(null) }
+        }
+    }
+
+    /** HTML de una página: OkHttp rápido y, si el sitio exige el reto de Cloudflare
+     *  (403 / "Just a moment"), repite la petición dentro de un WebView. */
+    private suspend fun dwwGetRaw(url: String, referer: String? = null): String {
+        fun headers(): Map<String, String> {
+            val h = mutableMapOf("User-Agent" to dwwUserAgent())
+            dwwCookies?.let { h["Cookie"] = it }
+            return h
+        }
+        val resp = app.get(url, headers = headers(), referer = referer, timeout = 25L)
+        if (resp.code == 403 || isDwwChallenge(resp.text)) {
+            Log.i(TAG, "dwwGet: challenge Cloudflare en $url -> WebView")
+            val html = dwwWebViewFetch(url)
+            if (!html.isNullOrBlank() && !isDwwChallenge(html)) {
+                return html
+            }
+        }
+        return resp.text
+    }
+
+    /** Document con baseUri=url para que abs:href resuelva bien. */
+    private suspend fun dwwGet(url: String, referer: String? = null): Document =
+        Jsoup.parse(dwwGetRaw(url, referer), url)
 
     // ==================== MAIN PAGE ====================
     // FIX 2026-08-11: Refactorizado para usar selectores CSS basados en clases en lugar
@@ -76,7 +231,7 @@ class DonghuaWorldProvider : MainAPI() {
             } else {
                 sectionUrl
             }
-            val document = app.get(url).document
+            val document = dwwGet(url)
             val items = document.select(".listupd article").mapNotNull { art ->
                 parseArticleCard(art)
             }
@@ -92,10 +247,10 @@ class DonghuaWorldProvider : MainAPI() {
         // Solo la primera pagina trae el HTML del homepage; a partir de pagina 2
         // cargamos /page/N/ para la seccion Latest Release.
         val document = if (page == 1) {
-            app.get(sectionUrl.substringBefore("##")).document
+            dwwGet(sectionUrl.substringBefore("##"))
         } else {
             if (sectionUrl.contains("latest")) {
-                app.get("$mainUrl/page/$page/").document
+                dwwGet("$mainUrl/page/$page/")
             } else {
                 return newHomePageResponse(emptyList(), hasNext = false)
             }
@@ -188,7 +343,7 @@ class DonghuaWorldProvider : MainAPI() {
     // ==================== SEARCH ====================
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val document = app.get("$mainUrl/?s=${java.net.URLEncoder.encode(query, "UTF-8")}").document
+        val document = dwwGet("$mainUrl/?s=${java.net.URLEncoder.encode(query, "UTF-8")}")
         val items = mutableListOf<SearchResponse>()
         val seenUrls = mutableSetOf<String>()
 
@@ -232,7 +387,7 @@ class DonghuaWorldProvider : MainAPI() {
             resolveSeriesUrlFromEpisode(url)
         }
 
-        val document = app.get(seriesUrl).document
+        val document = dwwGet(seriesUrl)
 
         // Extract title
         val title = document.selectFirst("h1")?.text()?.trim() ?: "Unknown"
@@ -462,7 +617,7 @@ class DonghuaWorldProvider : MainAPI() {
         if (baseSlug.isNotBlank() && baseSlug != selfSlug) {
             try {
                 val q = java.net.URLEncoder.encode(baseSlug.replace("-", " "), "UTF-8")
-                val searchDoc = app.get("$mainUrl/?s=$q").document
+                val searchDoc = dwwGet("$mainUrl/?s=$q")
                 data class SeasonCandidate(val url: String, val response: SearchResponse, val seasonNum: Int)
                 val seasons = ArrayList<SeasonCandidate>()
                 searchDoc.select("article").forEach { art ->
@@ -501,7 +656,7 @@ class DonghuaWorldProvider : MainAPI() {
                 val q = java.net.URLEncoder.encode(
                     (baseNorm.ifBlank { baseSlug.replace("-", " ") }).take(60), "UTF-8"
                 )
-                val searchDoc = app.get("$mainUrl/?s=$q").document
+                val searchDoc = dwwGet("$mainUrl/?s=$q")
                 searchDoc.select("article").forEach { art ->
                     if (candidatePool.size >= 60) return@forEach
                     val parsed = parseArticleCard(art) ?: return@forEach
@@ -517,7 +672,7 @@ class DonghuaWorldProvider : MainAPI() {
         // DonghuaLife usa con /donghuas?page=N). Así las recomendaciones varían cada vez.
         if (candidatePool.size < 16) {
             try {
-                val catDoc = app.get("$mainUrl/anime/").document
+                val catDoc = dwwGet("$mainUrl/anime/")
                 val lastPage = catDoc.select("a[href*=/anime/page/]")
                     .mapNotNull {
                         Regex("""/anime/page/(\d+)/""").find(it.attr("href"))
@@ -529,7 +684,7 @@ class DonghuaWorldProvider : MainAPI() {
                 for (attempt in 1..3) {
                     if (candidatePool.size >= 16) break
                     val p = 2 + rnd.nextInt(maxOf(1, top - 1))
-                    val pageDoc = app.get("$mainUrl/anime/page/$p/").document
+                    val pageDoc = dwwGet("$mainUrl/anime/page/$p/")
                     pageDoc.select("article").forEach { art ->
                         if (candidatePool.size >= 16) return@forEach
                         val parsed = parseArticleCard(art) ?: return@forEach
@@ -553,7 +708,7 @@ class DonghuaWorldProvider : MainAPI() {
      */
     private suspend fun resolveSeriesUrlFromEpisode(episodeUrl: String): String {
         return try {
-            val epDoc = app.get(episodeUrl).document
+            val epDoc = dwwGet(episodeUrl)
             // Buscar specifically /anime/<slug>/ (con path, no query string)
             epDoc.select("a[href*=/anime/]").firstOrNull { el ->
                 val href = el.attr("abs:href")
@@ -617,7 +772,7 @@ class DonghuaWorldProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val document = app.get(data).document
+        val document = dwwGet(data)
         // v8: dedupe DM por episodio (el set es de instancia).
         dwEmittedDmVids.clear()
 
@@ -675,7 +830,7 @@ class DonghuaWorldProvider : MainAPI() {
     ) {
         try {
             Log.d(TAG, "extractDarkServer: fetching $playerUrl")
-            val playerHtml = app.get(playerUrl, referer = "$mainUrl/").text
+            val playerHtml = dwwGetRaw(playerUrl, referer = "$mainUrl/")
             Log.d(TAG, "extractDarkServer: got ${playerHtml.length} chars")
 
             // === Extract Subtitle Tracks ===

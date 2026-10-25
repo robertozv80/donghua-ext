@@ -794,14 +794,18 @@ class AnimeCubeProvider : MainAPI() {
     // ==================== VIDEO EXTRACTION ====================
 
     override suspend fun loadLinks(
-        data: String, // episode id: <slug>-<seasonId>-ep-<N>
+        data: String, // <slug>-<seasonId>-ep-<N>; la API de CloudStream pasa el dato
+        // por fixUrl() al crear el Episode, asi que llega como URL absoluta del mainUrl.
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val m = Regex("""^(.+)-(tab-[\w-]+)-ep-(\d+(?:-\d+)?)$""").find(data) ?: return false
+        val m = Regex("""^(?:https?://[^/]+/)?(.+)-(tab-[\w-]+)-ep-(\d+(?:-\d+)?)$""").find(data) ?: return false
         val slug = m.groupValues[1]
         val seId = m.groupValues[2]
+        // Id desnudo para /sources: con el dato fixedUrl() la URL del endpoint
+        // saldria con "https://..." dentro del path y el sitio responde 404 HTML.
+        val epId = "${slug}-$seId-ep-${m.groupValues[3]}"
 
         // v8: el dedupe DM es POR EPISODIO. Al ser un campo de instancia, sin
         // limpiarlo el segundo loadLinks del mismo episodio devolvia true sin
@@ -821,7 +825,7 @@ class AnimeCubeProvider : MainAPI() {
         var sources = emptyList<AcSourceEntry>()
         var used: AcVersionEntry? = null
         for (entry in entries.take(3)) {
-            sources = fetchSources(slug, data, entry.primaryTabId, entry.seasonId, entry.version)
+            sources = fetchSources(slug, epId, entry.primaryTabId, entry.seasonId, entry.version)
             if (sources.isNotEmpty()) { used = entry; break }
         }
         if (sources.isEmpty()) {

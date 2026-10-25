@@ -289,17 +289,6 @@ class TioDonghuaProvider : MainAPI() {
         }
     }
 
-    /**
-     * Descarta los mp4 "basura": el JS anti-bot de varios players publica un
-     * clip de prueba (Big Buck Bunny en AV1) y el regex suelto tambien casa
-     * hosts tipo mp4upload.com/embed-x.html que no son un archivo de video.
-     */
-    private fun isJunkVideoUrl(u: String): Boolean =
-        u.contains("test-videos.co.uk", ignoreCase = true) ||
-            u.contains("av01", ignoreCase = true) ||
-            Regex("""/av1/""", RegexOption.IGNORE_CASE).containsMatchIn(u) ||
-            Regex("""\.mp4[A-Za-z0-9]""", RegexOption.IGNORE_CASE).containsMatchIn(u)
-
     /** Quita sufijo "Sub Español" y emojis iniciales de los títulos. */
     private fun tdCleanTitle(t: String): String = t
         .replace(Regex("\\s*Sub\\s*Espa[nñ]ol\\s*$", RegexOption.IGNORE_CASE), "")
@@ -809,7 +798,7 @@ class TioDonghuaProvider : MainAPI() {
             }
             if (!foundLinks) {
                 for (m in Regex("""(https?://[^"'\s<>]+\.mp4[^"'\s<>]*)""").findAll(html)) {
-                    if (isJunkVideoUrl(m.value)) continue
+                    if (CE.isJunkVideoUrl(m.value)) continue
                     callback(newExtractorLink(source = "Server", name = "Server", url = m.value) {
                         this.referer = data; this.quality = Qualities.Unknown.value
                     })
@@ -1102,7 +1091,7 @@ class TioDonghuaProvider : MainAPI() {
         }
         if (!found) {
             Regex("""["']?file["']?\s*:\s*["']([^"']+\.mp4[^"']*)["']""").findAll(unpacked).forEach { m ->
-                if (isJunkVideoUrl(m.groupValues[1])) return@forEach
+                if (CE.isJunkVideoUrl(m.groupValues[1])) return@forEach
                 callback(newExtractorLink(source = serverName, name = serverName, url = m.groupValues[1]) {
                     this.referer = referer; this.quality = Qualities.Unknown.value
                 })
@@ -1136,32 +1125,10 @@ class TioDonghuaProvider : MainAPI() {
                 subtitleCallback, callback
             )
         ) return true
-        try {
-            val json = app.get(
-                "https://www.dailymotion.com/player/metadata/video/$videoId",
-                referer = embedUrl,
-                headers = mapOf("User-Agent" to USER_AGENT, "Accept" to "application/json"),
-                timeout = 15L
-            ).text.replace("\\/", "/")
-            Regex("\"qualities\"\\s*:\\s*\\{\\s*\"auto\"\\s*:\\s*\\[\\s*\\{[^}]*?\"url\"\\s*:\\s*\"([^\"]+\\.m3u8[^\"]*)\"")
-                .find(json)?.let { m ->
-                    try { generateM3u8(serverName, m.groupValues[1], embedUrl).forEach(callback); return true } catch (_: Exception) {}
-                }
-            for (m in Regex("""(https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)""").findAll(json)) {
-                val u = m.value
-                if (u.contains("dmxleo.dailymotion.com")) continue
-                if (u.contains("[APIFRAMEWORKS]") || u.contains("[VASTVERSIONS]")) continue
-                try { generateM3u8(serverName, u, embedUrl).forEach(callback); return true } catch (_: Exception) {}
-            }
-            for (m in Regex("""(https?://[^"'\s<>]+\.mp4[^"'\s<>]*)""").findAll(json)) {
-                if (isJunkVideoUrl(m.value)) continue
-                callback(newExtractorLink(source = serverName, name = serverName, url = m.value) {
-                    this.referer = embedUrl; this.quality = Qualities.Unknown.value
-                })
-                return true
-            }
-        } catch (_: Exception) {}
-        return false
+        // v28: el unico respaldo que queda es el master HLS del metadata. Las
+        // ramas de generateM3u8 (partia el master y perdía el audio) y de mp4
+        // (solo casaban decoys) se eliminaron.
+        return CE.extractDailymotionMaster(videoId, embedUrl, serverName, TD_USER_AGENT, callback)
     }
 
     /**
@@ -1197,7 +1164,7 @@ class TioDonghuaProvider : MainAPI() {
             // 4) mp4
             if (!found) {
                 Regex("""["']?file["']?\s*:\s*["']([^"']+\.mp4[^"']*)["']""").findAll(unpacked).forEach { m ->
-                    if (isJunkVideoUrl(m.groupValues[1])) return@forEach
+                    if (CE.isJunkVideoUrl(m.groupValues[1])) return@forEach
                     callback(newExtractorLink(source = serverName, name = serverName, url = m.groupValues[1]) {
                         this.referer = referer; this.quality = Qualities.Unknown.value
                     })
@@ -1221,7 +1188,7 @@ class TioDonghuaProvider : MainAPI() {
                 try { generateM3u8(serverName, m.value, playerUrl).forEach(callback); return true } catch (_: Exception) {}
             }
             for (m in Regex("""(https?://[^"'\s<>]+\.mp4[^"'\s<>]*)""").findAll(text)) {
-                if (isJunkVideoUrl(m.value)) continue
+                if (CE.isJunkVideoUrl(m.value)) continue
                 callback(newExtractorLink(source = serverName, name = serverName, url = m.value) {
                     this.referer = playerUrl; this.quality = Qualities.Unknown.value
                 })
