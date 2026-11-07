@@ -457,6 +457,12 @@ class MundoDonghuaProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        // v24.16 (nota del Score del Home, issue #29): este sitio NO publica ninguna
+        // calificacion. Medido en vivo: ni home, lista-donghuas* ni las fichas
+        // /donghua/<slug> traen JSON-LD aggregateRating (ni un "ld+json" en el HTML),
+        // no hay elemento de valoracion en md-theme.css, y /usuarios/api_interactions.php
+        // solo devuelve likes_donghua_count/favoritos_count (no es una nota 0..10).
+        // Por eso aqui no se pide ninguna ficha: no habria Score que mostrar.
         val isHomePage = request.data == "$mainUrl/"
         val url = if (isHomePage) {
             request.data

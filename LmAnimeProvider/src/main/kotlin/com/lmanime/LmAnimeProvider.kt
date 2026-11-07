@@ -20,10 +20,10 @@ import org.jsoup.nodes.Element
  *   los cards apuntan a EPISODIOS (/<slug>-episode-N/) y load() resuelve la ficha
  *   por breadcrumb (misma mecanica de DonghuaWorldProvider).
  * - Fichas: /<slug>/ con episodios en .eplister (div.epl-num / div.epl-title).
- * - Completed Series: /anime/?status=completed&order=latest con paginado
- *   /anime/page/N/?status=completed&order=latest (20 fichas/pagina).
- * - Generos: /genres/action/, /genres/adventure/, /genres/martial-arts/ con
- *   paginado /genres/<g>/page/N/.
+ * - Completed: /anime/?status=completed&type=&order=rating; el paginado SOLO funciona
+ *   como query param (/anime/?...&page=N), la variante /anime/page/N/?... da 301.
+ * - Schedule: /schedule/ trae un bloque div.bixbox.schedulepage.sch_<dia> por cada
+ *   día de la semana; de ahí se arma una sección del Home por día (Lunes..Domingo).
  * - Episodios: select.mirror con UNA opcion por servidor/idioma, cada una carga
  *   la pagina /v/N/ cuyo #pembed trae UN iframe:
  *     * Dailymotion  -> HLS por API metadata + pistas de subtitulos del metadata
@@ -51,27 +51,49 @@ class LmAnimeProvider : MainAPI() {
 
         /** Cache slug -> rating (el listado no trae nota; hay que pedir la ficha). */
         private val ratingCache = java.util.concurrent.ConcurrentHashMap<String, Double>()
+
+        /** Días de /schedule/ en el orden en que se muestran (data = nombre en inglés del bloque). */
+        private val SCHEDULE_DAYS = listOf(
+            "Lunes" to "monday",
+            "Martes" to "tuesday",
+            "Miércoles" to "wednesday",
+            "Jueves" to "thursday",
+            "Viernes" to "friday",
+            "Sábado" to "saturday",
+            "Domingo" to "sunday"
+        )
+
+        /** La agenda semanal cambia una vez al día: no hace falta recargarla por sección. */
+        private const val SCHEDULE_TTL_MS = 6L * 60L * 60L * 1000L
     }
 
     // ==================== MAIN PAGE ====================
 
     override val mainPage = mainPageOf(
-        "$mainUrl/##latest" to "Latest Release",
-        "$mainUrl/anime/?status=completed&order=latest" to "Completed Series",
-        "$mainUrl/genres/action/" to "Action",
-        "$mainUrl/genres/adventure/" to "Adventure",
-        "$mainUrl/genres/martial-arts/" to "Martial Arts"
-    )
+        *(
+            listOf(
+                "$mainUrl/##latest" to "Latest Release",
+                "$mainUrl/anime/?status=completed&type=&order=rating" to "Completed"
+            ) + SCHEDULE_DAYS.map { (label, day) -> "$mainUrl/schedule/##$day" to label }
+            ).toTypedArray()
+        )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val sectionName = request.name
+        val data = request.data
+
+        // v9: secciones de /schedule/ (una por día) — el listado se cachea, la página
+        // del sitio no tiene paginado, así que siempre es hasNext=false.
+        if (data.startsWith("$mainUrl/schedule/##")) {
+            val items = scheduleDay(data.substringAfterLast("##"))
+            return newHomePageResponse(listOf(HomePageList(sectionName, items)), false)
+        }
+
         val url = when {
             sectionName == "Latest Release" ->
-                if (page == 1) request.data.substringBefore("##") else "$mainUrl/page/$page/"
-            sectionName == "Completed Series" ->
-                if (page == 1) request.data else "$mainUrl/anime/page/$page/?status=completed&order=latest"
-            else -> // generos: la URL ya termina en "/"
-                if (page == 1) request.data else "${request.data}page/$page/"
+                if (page == 1) data.substringBefore("##") else "$mainUrl/page/$page/"
+            else -> // Completed: el sitio solo acepta el paginado como query param (?page=N)
+                if (page == 1) data else "$data&page=$page"
         }
 
         val document = app.get(url, headers = mapOf("User-Agent" to UA)).document
@@ -84,34 +106,78 @@ class LmAnimeProvider : MainAPI() {
         // CALIFICACION sobre el poster en lugar de la etiqueta "Sub".
         val finalItems = if (isLatest) items else withRatings(items)
 
-        val hasNext = when {
-            isLatest -> items.isNotEmpty()
-            sectionName == "Completed Series" -> items.size >= 20
-            else -> items.size >= 10
-        }
+        val hasNext = isLatest || items.size >= 20
         return newHomePageResponse(listOf(HomePageList(sectionName, finalItems)), hasNext)
     }
 
-    /** Anade la nota (Score) a cada card consultando su ficha; cachea por slug. */
+    // ==================== SCHEDULE (una sección por día) ====================
+
+    private class ScheduleDays(val byDay: Map<String, List<SearchResponse>>, val fetchedAt: Long)
+
+    @Volatile
+    private var scheduleCache: ScheduleDays? = null
+
+    /**
+     * Agenda del día: /schedule/ trae un bloque `div.sch_<dia>` por cada día con
+     * `div.listupd > div.bs > a[href]` (ficha de la serie), título en `a[title]`/`.tt`
+     * y carátula en `img[data-src]`.
+     */
+    private suspend fun scheduleDay(dayKey: String): List<SearchResponse> {
+        // La agenda llega a 40 series por día; se recorta a un tamaño de fila normal
+        // para no disparar 40 peticiones extra por la nota.
+        val items = (days().byDay[dayKey] ?: return emptyList()).take(20)
+        return withRatings(items)
+    }
+
+    private suspend fun days(): ScheduleDays {
+        val now = System.currentTimeMillis()
+        scheduleCache?.takeIf { now - it.fetchedAt < SCHEDULE_TTL_MS }?.let { return it }
+
+        val doc = try {
+            app.get("$mainUrl/schedule/", headers = mapOf("User-Agent" to UA)).document
+        } catch (_: Exception) {
+            null
+        }
+        val byDay = HashMap<String, List<SearchResponse>>()
+        if (doc != null) {
+            for ((_, key) in SCHEDULE_DAYS) {
+                val cards = doc.select("div.sch_$key div.listupd div.bs")
+                    .mapNotNull { parseArticleCard(it, withDubStatus = false) }
+                    .distinctBy { it.url }
+                if (cards.isNotEmpty()) byDay[key] = cards
+            }
+        }
+        // Si el sitio respondió vacío no se cachea: la siguiente sección vuelve a intentar.
+        if (byDay.isNotEmpty()) scheduleCache = ScheduleDays(byDay, now)
+        return ScheduleDays(byDay, now)
+    }
+
+    /**
+     * Anade la nota (Score) a cada card consultando su ficha; cachea por slug.
+     * El 0 en la cache significa "la ficha respondió y no trae nota", para no
+     * repetir el request en cada visita al Home; un error de red sí se reintenta.
+     */
     private suspend fun withRatings(items: List<SearchResponse>): List<SearchResponse> = coroutineScope {
         items.map { sr ->
             async {
                 try {
                     val slug = sr.url.trimEnd('/').substringAfterLast('/')
-                    val rating = ratingCache[slug] ?: fetchRating(sr.url)?.also { ratingCache[slug] = it }
-                    if (rating != null) sr.score = Score.from10(rating)
+                    val rating = ratingCache[slug]
+                        ?: fetchRating(sr.url)?.also { ratingCache[slug] = it }
+                        ?: 0.0
+                    if (rating > 0.0) sr.score = Score.from10(rating)
                 } catch (_: Exception) {}
                 sr
             }
         }.awaitAll()
     }
 
-    /** Nota de la ficha: .numscore o meta[itemprop=ratingValue]. */
+    /** Nota de la ficha: .numscore o meta[itemprop=ratingValue]; 0 si no trae nota. */
     private suspend fun fetchRating(seriesUrl: String): Double? = try {
         val doc = app.get(seriesUrl, headers = mapOf("User-Agent" to UA), timeout = 15L).document
-        (doc.selectFirst(".numscore")?.text()?.trim()
+        ((doc.selectFirst(".numscore")?.text()?.trim()
             ?: doc.selectFirst("meta[itemprop=ratingValue]")?.attr("content")?.trim())
-            ?.toDoubleOrNull()?.takeIf { it > 0.0 }
+            ?.toDoubleOrNull()?.takeIf { it > 0.0 } ?: 0.0)
     } catch (_: Exception) {
         null
     }

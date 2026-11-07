@@ -65,6 +65,67 @@ class DonghuaWorldProvider : MainAPI() {
 
         /** Keywords that identify English subtitle tracks (case-insensitive matching) */
         private val ENGLISH_KEYWORDS = listOf("english", "eng", "en-us", "en-gb")
+
+        /**
+         * v11 (issue #29): sufijo de URL de episodio. Las cards del home apuntan
+         * a `/xxx-episode-678-4k-multi-subtitles/`, y para casar con el widget
+         * "Popular Series" (que lista fichas `/anime/<slug>/`) se recorta desde
+         * `-episode-<N>` al final del slug.
+         */
+        private val EPISODE_SLUG_SUFFIX =
+            Regex("""-episode-\d+(?:-\d+)?[^/]*$""", RegexOption.IGNORE_CASE)
+    }
+
+    // ==================== NOTAS DEL WIDGET "POPULAR SERIES" (v11) =================
+    //
+    // v11 (issue #29): el home y el listado /anime/?status=completed... traen el
+    // widget `#wpop-items .serieslist.pop li` con 27 pares `a.series[href]` +
+    // `div.numscore` (p.ej. https://donghuaworld.com/anime/renegade-immortal-xian-ni/
+    // -> 9.5), verificado en vivo con curl y UA de escritorio. El documento ya
+    // esta en memoria (dwwGet), asi que de ahi se saca la nota de las cards del
+    // home SIN una sola peticion extra: cualquier request adicional podria
+    // reabrir el reto de Cloudflare (WebView ~2 min) y reventar el home.
+
+    /** URL de pagina -> mapa slug-nota indexado de su widget; emptyMap() = centinela. */
+    private val dwwPopByPage = java.util.concurrent.ConcurrentHashMap<String, Map<String, Double>>()
+
+    /** Acumulado de notas vistas: el widget solo publica las populares. */
+    @Volatile
+    private var dwwPopRatings: Map<String, Double> = emptyMap()
+
+    /** Indexa UNA vez por documento el widget "Popular Series" y fusiona el mapa. */
+    private fun rememberPopRatings(url: String, document: Document) {
+        if (dwwPopByPage.containsKey(url)) return // ya parseado (centinela incluido)
+        val map = HashMap<String, Double>()
+        for (li in document.select("#wpop-items .serieslist.pop li, .serieslist.pop li")) {
+            val href = li.selectFirst("a.series[href]")?.absUrl("href") ?: continue
+            val score = li.selectFirst("div.numscore")?.text()?.trim()?.toDoubleOrNull()
+                ?.takeIf { it > 0.0 } ?: continue
+            val slug = dwwSeriesSlugOf(href)
+            if (slug.isNotEmpty()) map[slug] = score
+        }
+        if (dwwPopByPage.size > 60) dwwPopByPage.clear()
+        dwwPopByPage[url] = map
+        if (map.isNotEmpty()) {
+            dwwPopRatings = HashMap(dwwPopRatings).apply { putAll(map) }
+        }
+    }
+
+    /** Slug de serie de una URL de ficha o de episodio (`-episode-N...` fuera). */
+    private fun dwwSeriesSlugOf(url: String): String {
+        val last = url.substringBefore('?').trimEnd('/').substringAfterLast('/')
+        return EPISODE_SLUG_SUFFIX.replace(last, "")
+    }
+
+    /** Aplica la nota del widget a las cards; sin coincidencia quedan sin badge. */
+    private fun withWidgetScores(items: List<SearchResponse>): List<SearchResponse> {
+        val pop = dwwPopRatings
+        if (pop.isEmpty()) return items
+        for (sr in items) {
+            val score = pop[dwwSeriesSlugOf(sr.url)]
+            if (score != null) sr.score = Score.from10(score)
+        }
+        return items
     }
 
     // ==================== CLOUDFLARE (v23) + cache y puente de imagenes (v24) ====================
@@ -574,9 +635,11 @@ class DonghuaWorldProvider : MainAPI() {
             }
             // v24: collectImages puentea las imagenes de las cards por el WebView.
             val document = dwwGet(url, collectImages = true)
-            val items = document.select(".listupd article").mapNotNull { art ->
+            // v11: la nota sale del widget "Popular Series" del propio documento.
+            rememberPopRatings(url, document)
+            val items = withWidgetScores(document.select(".listupd article").mapNotNull { art ->
                 parseArticleCard(art)
-            }
+            })
             // Paginacion: si la pagina actual tiene 20 articulos, hay mas paginas
             val hasNext = items.size >= 20
             return newHomePageResponse(
@@ -590,21 +653,22 @@ class DonghuaWorldProvider : MainAPI() {
         // cargamos /page/N/ para la seccion Latest Release.
         // v24: ambas secciones piden la MISMA url -> el cache TTL de dwwFetch
         // resuelve el reto una sola vez. collectImages puentea los posters.
-        val document = if (page == 1) {
-            dwwGet(sectionUrl.substringBefore("##"), collectImages = true)
-        } else {
-            if (sectionUrl.contains("latest")) {
-                dwwGet("$mainUrl/page/$page/", collectImages = true)
-            } else {
-                return newHomePageResponse(emptyList(), hasNext = false)
-            }
+        val homeUrl = when {
+            page == 1 -> sectionUrl.substringBefore("##")
+            sectionUrl.contains("latest") -> "$mainUrl/page/$page/"
+            else -> return newHomePageResponse(emptyList(), hasNext = false)
         }
+        val document = dwwGet(homeUrl, collectImages = true)
+        // v11 (issue #29): widget "Popular Series" de este mismo documento -> nota
+        // gratis para Latest Release y Recommendation (sus cards son URLs de
+        // episodio; dwwSeriesSlugOf las normaliza a slug de serie).
+        rememberPopRatings(homeUrl, document)
 
-        val items = when {
+        val items = withWidgetScores(when {
             sectionName == "Latest Release" -> document.select(".listupd.normal article").mapNotNull { parseArticleCard(it) }
             sectionName == "Recommendation" -> document.select(".series-gen article").mapNotNull { parseArticleCard(it) }
             else -> emptyList()
-        }
+        })
 
         return newHomePageResponse(
             listOf(HomePageList(sectionName, items)),

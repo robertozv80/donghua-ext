@@ -50,7 +50,25 @@ class LuciferDonghuaProvider : MainAPI() {
 
         /** Cache slug -> rating (el listado no trae nota; hay que pedir la ficha). */
         private val ratingCache = java.util.concurrent.ConcurrentHashMap<String, Double>()
+
+        /** Centinela de "sin nota": se cachea el fallo para no re-pedir la ficha. */
+        private const val RATING_MISS = -1.0
+
+        /** Tope de fichas pedidas por seccion: el resto queda sin badge (home lento). */
+        private const val MAX_RATING_FETCHES = 20
+
+        /**
+         * luciferdonghua.org NO publica nota en ningun HTML medido en vivo
+         * (0 `numscore` y 0 `ratingValue` en home, /anime/?order=..., /schedule/
+         * y fichas /anime/<slug>/), asi que tras este numero de fallos seguidos
+         * se apaga el enriquecimiento: sin el, las 7 secciones de dia quemarian
+         * 20 peticiones por seccion y nunca saldria un badge.
+         */
+        private const val RATING_MISS_LIMIT = 5
     }
+
+    /** Fallos seguidos de fetchRating (se resetea con el primer impacto). */
+    private val ratingMisses = java.util.concurrent.atomic.AtomicInteger(0)
 
     // ==================== MAIN PAGE ====================
 
@@ -86,7 +104,11 @@ class LuciferDonghuaProvider : MainAPI() {
                     this.posterUrl = item.selectFirst("img")?.let { getImgSrc(it) }
                 }
             }
-            return newHomePageResponse(listOf(HomePageList(sectionName, items)), hasNext = false)
+            // FIX v27 (issue #29): las secciones por DIA tambien llevan la nota.
+            // /schedule/ no pinta .numscore en sus cards (0 ocurrencias en el HTML
+            // del dia), asi que se enriquecen con withRatings, igual que Completed.
+            val scored = withRatings(items)
+            return newHomePageResponse(listOf(HomePageList(sectionName, scored)), hasNext = false)
         }
 
         val url = when {
@@ -110,13 +132,30 @@ class LuciferDonghuaProvider : MainAPI() {
         return newHomePageResponse(listOf(HomePageList(sectionName, finalItems)), hasNext)
     }
 
-    /** Anade la nota (Score) a cada card consultando su ficha; cachea por slug. */
+    /**
+     * Anade la nota (Score) a cada card consultando su ficha; cachea por slug.
+     *
+     * v27 (issue #29): los fallos se guardan con centinela (RATING_MISS) para no
+     * re-pedir la misma ficha, y solo las primeras MAX_RATING_FETCHES cards sin
+     * cache disparan peticiones: los bloques de /schedule/ traen 30-40 series y
+     * 40 requests por dia inflarian el home.
+     */
     private suspend fun withRatings(items: List<SearchResponse>): List<SearchResponse> = coroutineScope {
+        val budget = java.util.concurrent.atomic.AtomicInteger(MAX_RATING_FETCHES)
         items.map { sr ->
             async {
                 try {
-                    val slug = sr.url.trimEnd('/').substringAfterLast('/')
-                    val rating = ratingCache[slug] ?: fetchRating(sr.url)?.also { ratingCache[slug] = it }
+                    val slug = sr.url.substringBefore('?').trimEnd('/').substringAfterLast('/')
+                    val cached = ratingCache[slug]
+                    val rating = when {
+                        cached != null -> if (cached > 0.0) cached else null
+                        budget.getAndDecrement() > 0 && ratingMisses.get() < RATING_MISS_LIMIT -> {
+                            val fetched = fetchRating(sr.url)
+                            if (fetched == null) ratingMisses.incrementAndGet() else ratingMisses.set(0)
+                            (fetched ?: RATING_MISS).also { ratingCache[slug] = it }.takeIf { it > 0.0 }
+                        }
+                        else -> null
+                    }
                     if (rating != null) sr.score = Score.from10(rating)
                 } catch (_: Exception) {}
                 sr
@@ -124,7 +163,14 @@ class LuciferDonghuaProvider : MainAPI() {
         }.awaitAll()
     }
 
-    /** Nota de la ficha: .numscore o meta[itemprop=ratingValue]. */
+    /**
+     * Nota de la ficha: .numscore o meta[itemprop=ratingValue].
+     * v27: medido en vivo (2026-11), luciferdonghua.org no pinta ninguno de los
+     * dos (home, /anime/?status=..., /schedule/ y fichas = 0 ocurrencias), asi
+     * que hoy devuelve null; se conserva porque es el unico canal valido si el
+     * tema llega a publicar la nota, y el tope RATING_MISS_LIMIT evita gastar
+     * peticiones mientras no la publique.
+     */
     private suspend fun fetchRating(seriesUrl: String): Double? = try {
         val doc = app.get(seriesUrl, headers = mapOf("User-Agent" to UA), timeout = 15L).document
         (doc.selectFirst(".numscore")?.text()?.trim()

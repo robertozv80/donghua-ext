@@ -237,14 +237,16 @@ class DonghuaLifeProvider : MainAPI() {
                         if (txt.matches(Regex("""\d+\.\d+"""))) score = txt
                     }
                     val votes = a.selectFirst("span.text-muted")?.text()?.trim()
+                    val siteScore = score?.toDoubleOrNull()
                     val displayTitle = when {
-                        score != null && votes != null -> "$title • ★$score ($votes)"
-                        score != null -> "$title • ★$score"
+                        siteScore != null && votes != null -> "$title ($votes)"
                         else -> title
                     }
                     home.add(
                         newAnimeSearchResponse(displayTitle, resolveUrl(href), TvType.Anime) {
                             this.posterUrl = poster
+                            // v19: la nota va en su propia etiqueta (score), no en el título
+                            if (siteScore != null) this.score = Score.from10(siteScore)
                             addDubStatus(DubStatus.Subbed)
                         }
                     )
@@ -1099,7 +1101,11 @@ class DonghuaLifeProvider : MainAPI() {
         if (activeEpId.isNotBlank()) {
             val epSources = extractSourcesNearEpisode(rscPayload, activeEpId)
             Log.i(TAG, "$logKey epSources with tokens: ${epSources.size} labels=[${epSources.joinToString(",") { it.label }}]")
-            for (src in epSources) {
+            // v19: el sitio lista R2 PRIMERO, pero su master es un CMAF 1080p
+            // avc1.640429 que en varios equipos no se ve (audio sí suena y la
+            // pantalla queda negra). Se emite al FINAL para que la fuente por
+            // defecto sea Rumble/Odysee; R2 sigue disponible para quien la elija.
+            for (src in epSources.sortedBy { if (it.label.equals("R2", ignoreCase = true)) 1 else 0 }) {
                 if (src.token.isBlank()) continue
                 val resolvedUrl = resolveTokenViaPlayerApi(src.token, url, logKey)
                 if (resolvedUrl.isBlank()) continue
@@ -1153,7 +1159,9 @@ class DonghuaLifeProvider : MainAPI() {
         if (!anyEmitted) {
             Log.i(TAG, "$logKey v17: trying real site API /api/player/source")
             val allSources = extractAllSourcesFromRsc(rscPayload)
-            for ((src, _) in allSources) {
+            for ((src, _) in allSources.sortedBy {
+                    if (it.first.label.equals("R2", ignoreCase = true)) 1 else 0
+                }) {
                 if (src.token.isBlank()) continue
                 val resolvedUrl = resolveTokenViaPlayerApi(src.token, url, logKey)
                 if (resolvedUrl.isNotBlank()) {
@@ -1226,7 +1234,10 @@ class DonghuaLifeProvider : MainAPI() {
         // v17: API REAL del sitio — POST /api/player/source {"token"} → {"url": ...}
         if (!anyEmitted) {
             Log.i(TAG, "$logKey v17: trying real site API /api/player/source (movie)")
-            for (source in sources) {
+            // v19: R2 al final (igual que en loadEpisodeLinks) para que no sea la fuente por defecto
+            for (source in sources.sortedBy {
+                    if (it.label.equals("R2", ignoreCase = true)) 1 else 0
+                }) {
                 if (source.token.isBlank()) continue
                 val resolvedUrl = resolveTokenViaPlayerApi(source.token, url, logKey)
                 if (resolvedUrl.isNotBlank()) {

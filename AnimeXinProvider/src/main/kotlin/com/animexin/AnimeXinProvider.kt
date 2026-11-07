@@ -18,6 +18,12 @@ import org.jsoup.nodes.Element
  *
  * - Home: cards `article` en .listupd.normal (Latest Release); las cards apuntan
  *   a EPISODIOS y load() resuelve la ficha por breadcrumb.
+ * - Nota (issue #29): el home (y tambien los episodios/generos) trae el widget
+ *   `#wpop-items .serieslist.pop li` con `a.series[href]` + `div.numscore`
+ *   (22 pares el dia de la prueba); de ahi se arma GRATIS el mapa slug->nota.
+ *   La nota PROPIA de una ficha solo vive en `meta[itemprop=ratingValue]` y
+ *   varias fichas no la tienen, por eso el .numscore del widget NUNCA se usa
+ *   como nota de la serie que se esta leyendo.
  * - Generos: /genres/action/, /genres/adventure/, /genres/martial-arts/ con
  *   paginado /genres/<g>/page/N/ (10 fichas/pagina).
  * - Fichas: /anime/<slug>/ o /<slug>/ con episodios en .eplister.
@@ -63,6 +69,24 @@ class AnimeXinProvider : MainAPI() {
 
         /** Cache slug -> rating; el listado no trae nota y hay que pedir la ficha. */
         private val ratingCache = java.util.concurrent.ConcurrentHashMap<String, Double>()
+
+        /** Centinela de "sin nota": se cachea el fallo para no re-pedir la ficha. */
+        private const val RATING_MISS = -1.0
+
+        /** Tope de fichas pedidas por seccion; el resto solo usa el widget (barato). */
+        private const val MAX_RATING_FETCHES = 20
+
+        /**
+         * Topes de fallos seguidos antes de apagar el enriquecimiento: muchas
+         * fichas de animexin.dev no publican nota (p.ej. /beyond-times-gaze/ y
+         * /a-good-day-to-ascend/ no traen ni ratingValue ni .numscore propio), y
+         * seguir pidiendo 20 fichas por seccion solo cuelga el home.
+         */
+        private const val RATING_MISS_LIMIT = 8
+
+        /** Sufijo de URL de episodio: recortado para casar con el slug de la ficha. */
+        private val EPISODE_SLUG_SUFFIX =
+            Regex("""-episode-\d+(?:-\d+)?[^/]*$""", RegexOption.IGNORE_CASE)
     }
 
     // ==================== MAIN PAGE ====================
@@ -83,28 +107,96 @@ class AnimeXinProvider : MainAPI() {
         }
 
         val document = app.get(url, headers = mapOf("User-Agent" to UA)).document
+        // v12 (issue #29): el propio documento trae el widget "Popular/Top" con la
+        // nota de varias fichas; se indexa UNA vez por documento (0 peticiones).
+        // El contador de fallos se reinicia por seccion para que un micro-corte del
+        // sitio no deje el enriquecimiento apagado durante todo el run.
+        ratingMisses.set(0)
+        rememberPopRatings(document)
+
         val selector = if (sectionName == "Latest Release") ".listupd.normal article" else "article"
         val isLatest = sectionName == "Latest Release"
         val items = document.select(selector).mapNotNull { parseArticleCard(it, withDubStatus = isLatest) }
             .distinctBy { it.url }
 
-        // v3: en las secciones que NO son "Latest Release" se muestra la
-        // CALIFICACION sobre el poster en lugar de la etiqueta "Sub". El
-        // listado no incluye nota, asi que se lee la ficha de cada serie
-        // (en paralelo y con cache en memoria).
-        val finalItems = if (isLatest) items else withRatings(items)
+        // v12: TODAS las secciones del home muestran CALIFICACION (antes "Latest
+        // Release" se saltaba el enriquecimiento). Primero se usa gratis el mapa
+        // del widget; solo si el slug no esta ahi se pide la ficha de la card,
+        // con cache + centinela y tope de MAX_RATING_FETCHES peticiones.
+        val finalItems = withRatings(items)
 
         val hasNext = if (isLatest) items.isNotEmpty() else items.size >= 10
         return newHomePageResponse(listOf(HomePageList(sectionName, finalItems)), hasNext)
     }
 
-    /** Anade la nota (Score) a cada card consultando su ficha; cachea por slug. */
+    /**
+     * v12: mapa slug -> nota tomado del widget "Popular/Top" (`#wpop-items
+     * .serieslist.pop li`, 22 pares `a.series` + `div.numscore` en el home).
+     * Se acumula entre documentos porque las cards de "Latest Release" apuntan a
+     * episodios y solo algunas coinciden con las series del widget.
+     */
+    @Volatile
+    private var popRatings: Map<String, Double> = emptyMap()
+
+    /** Fallos seguidos de fetchRating; al pasar RATING_MISS_LIMIT se deja de pedir. */
+    private val ratingMisses = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** Indexa el widget del documento UNA vez (sin peticiones) y fusiona la cache. */
+    private fun rememberPopRatings(document: org.jsoup.nodes.Document) {
+        val rows = document.select("#wpop-items .serieslist.pop li, .serieslist.pop li")
+        if (rows.isEmpty()) return
+        val map = HashMap(popRatings)
+        for (li in rows) {
+            val a = li.selectFirst("a.series[href]")
+            val score = li.selectFirst("div.numscore")?.text()?.trim()?.toDoubleOrNull()?.takeIf { it > 0.0 }
+            if (a == null || score == null) continue
+            val slug = seriesSlugOf(a.absUrl("href"))
+            if (slug.isNotEmpty()) map[slug] = score
+        }
+        popRatings = map
+    }
+
+    /** Slug de serie de una URL de ficha o de episodio (recorta "-episode-N..."). */
+    private fun seriesSlugOf(url: String): String {
+        val last = url.substringBefore('?').trimEnd('/').substringAfterLast('/')
+        return EPISODE_SLUG_SUFFIX.replace(last, "")
+    }
+
+    /**
+     * URL de ficha a partir de la URL de una card. Las cards de "Latest Release"
+     * apuntan a episodios (/x-episode-199-indonesia-english-sub/) y la ficha vive
+     * en la raiz (/x/); medido en vivo: las 5 URLs derivadas responden 200.
+     */
+    private fun seriesUrlOf(url: String): String {
+        val clean = url.substringBefore('?').trimEnd('/')
+        val last = clean.substringAfterLast('/')
+        val slug = EPISODE_SLUG_SUFFIX.replace(last, "")
+        if (slug == last) return url
+        return "${clean.removeSuffix(last).trimEnd('/')}/$slug/"
+    }
+
+    /**
+     * Anade la nota (Score) a cada card. Orden v12:
+     *  1) mapa del widget "Popular" del propio documento -> GRATIS;
+     *  2) cache por slug (con centinela RATING_MISS para no re-pedir fallos);
+     *  3) si nada anterior, 1 peticion a la ficha derivada (tope MAX_RATING_FETCHES
+     *     por seccion y se apaga tras RATING_MISS_LIMIT fallos seguidos).
+     */
     private suspend fun withRatings(items: List<SearchResponse>): List<SearchResponse> = coroutineScope {
+        val pop = popRatings
+        val budget = java.util.concurrent.atomic.AtomicInteger(MAX_RATING_FETCHES)
         items.map { sr ->
             async {
                 try {
-                    val slug = sr.url.trimEnd('/').substringAfterLast('/')
-                    val rating = ratingCache[slug] ?: fetchRating(sr.url)?.also { ratingCache[slug] = it }
+                    val slug = seriesSlugOf(sr.url)
+                    val cached = ratingCache[slug]
+                    val rating = when {
+                        pop.containsKey(slug) -> pop[slug]
+                        cached != null -> cached.takeIf { it > 0.0 }
+                        budget.getAndDecrement() > 0 && ratingMisses.get() < RATING_MISS_LIMIT ->
+                            fetchScore(slug, seriesUrlOf(sr.url))
+                        else -> null
+                    }
                     if (rating != null) sr.score = Score.from10(rating)
                 } catch (_: Exception) {}
                 sr
@@ -112,11 +204,24 @@ class AnimeXinProvider : MainAPI() {
         }.awaitAll()
     }
 
-    /** Nota de la ficha: .numscore o meta[itemprop=ratingValue]. */
+    /** Nota de la ficha, cacheada por slug con centinela en los fallos. */
+    private suspend fun fetchScore(slug: String, seriesUrl: String): Double? {
+        val rating = fetchRating(seriesUrl)
+        if (rating == null) ratingMisses.incrementAndGet() else ratingMisses.set(0)
+        ratingCache[slug] = rating ?: RATING_MISS
+        return rating
+    }
+
+    /**
+     * Nota propia de la ficha. v12: OJO con el orden, en animexin.dev el UNICO
+     * .numscore del HTML esta dentro del widget "Popular/Top" y es la nota de OTRA
+     * serie (todas las cards marcarian 8.5), asi que manda el dato schema.org de
+     * la ficha y un .numscore solo se acepta si esta fuera del widget.
+     */
     private suspend fun fetchRating(seriesUrl: String): Double? = try {
         val doc = app.get(seriesUrl, headers = mapOf("User-Agent" to UA), timeout = 15L).document
-        (doc.selectFirst(".numscore")?.text()?.trim()
-            ?: doc.selectFirst("meta[itemprop=ratingValue]")?.attr("content")?.trim())
+        (doc.selectFirst("meta[itemprop=ratingValue]")?.attr("content")?.trim()
+            ?: doc.select(".numscore").firstOrNull { it.closest("#wpop-items") == null }?.text()?.trim())
             ?.toDoubleOrNull()?.takeIf { it > 0.0 }
     } catch (_: Exception) {
         null

@@ -7,9 +7,6 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.getAndUnpack
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
-import kotlin.collections.ArrayList
 import com.donghuaext.common.CommonExtractors as CE
 
 /** UA de navegador (necesario para varios hosts). */
@@ -17,7 +14,105 @@ const val TD_USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 
 /**
- * v24: extractor de Ok.Ru (odnoklassniki). La página del embed trae el
+ * API del sitio nuevo. tiodonghua.lat abandonó WordPress/Dooplay y ahora es
+ * Next.js (App Router) sobre un backend Laravel expuesto en esta ruta. No pide
+ * auth y responde JSON envuelto en {"data": ...}.
+ */
+private const val TD_API = "https://tioplayer.cloudlatino.com/api/v1"
+
+/** Catalogo cacheado (titulo normalizado -> rating) para puntuar las cards de episodio. */
+private const val TD_RATINGS_TTL_MS = 60L * 60L * 1000L
+private var tdRatingsCache: Pair<Long, Map<String, Double>> = 0L to emptyMap()
+
+/**
+ * Lectores de JSON sin librería: el módulo solo depende de cloudstream3,
+ * NiceHttp y jsoup. `tdJsonVal` devuelve el valor crudo de la PRIMERA clave que
+ * coincide; en las respuestas del API los campos propios de un objeto siempre
+ * van antes de los objetos anidados, así que el primer match es el del nivel
+ * que se está leyendo.
+ */
+private fun tdJsonVal(json: String, key: String): String? {
+    val m = Regex("\"${Regex.escape(key)}\"\\s*:\\s*").find(json) ?: return null
+    var i = m.range.last + 1
+    while (i < json.length && json[i].isWhitespace()) i++
+    if (i >= json.length) return null
+    return when (val c = json[i]) {
+        '"', '{', '[' -> {
+            val close = if (c == '"') '"' else if (c == '{') '}' else ']'
+            var depth = 0
+            var j = i
+            var inStr = false
+            var esc = false
+            while (j < json.length) {
+                val ch = json[j]
+                if (inStr) {
+                    when {
+                        esc -> esc = false
+                        ch == '\\' -> esc = true
+                        ch == '"' -> inStr = false
+                    }
+                } else when (ch) {
+                    '"' -> inStr = true
+                    c -> depth++
+                    close -> {
+                        depth--
+                        if (depth == 0) return json.substring(i, j + 1)
+                    }
+                }
+                j++
+            }
+            null
+        }
+        else -> {
+            var j = i
+            while (j < json.length && json[j] != ',' && json[j] != '}' && json[j] != ']') j++
+            json.substring(i, j).trim()
+        }
+    }
+}
+
+/** Cadena JSON des-escapada (\\uXXXX, \\/, \\n) o null si la clave no existe. */
+private fun tdJsonStr(json: String, key: String): String? =
+    tdJsonVal(json, key)?.let { CE.unescJson(it.removePrefix("\"").removeSuffix("\"")).trim() }
+
+private fun tdJsonInt(json: String, key: String): Int? = tdJsonVal(json, key)?.toDoubleOrNull()?.toInt()
+
+private fun tdJsonDbl(json: String, key: String): Double? = tdJsonVal(json, key)?.toDoubleOrNull()
+
+/**
+ * Objetos JSON de un valor `"key":[{...},{...}]` (o de un solo objeto
+ * `"key":{...}`): se balancean llaves respetando las cadenas para no romperse
+ * con títulos que contengan llaves.
+ */
+private fun tdJsonObjs(json: String, key: String): List<String> {
+    val body = tdJsonVal(json, key) ?: return emptyList()
+    val out = ArrayList<String>()
+    var depth = 0
+    var start = -1
+    var inStr = false
+    var esc = false
+    for (i in body.indices) {
+        val ch = body[i]
+        if (inStr) {
+            when {
+                esc -> esc = false
+                ch == '\\' -> esc = true
+                ch == '"' -> inStr = false
+            }
+        } else when (ch) {
+            '"' -> inStr = true
+            '{' -> if (depth++ == 0) start = i
+            '}' -> if (--depth == 0 && start >= 0) { out.add(body.substring(start, i + 1)); start = -1 }
+        }
+    }
+    return out
+}
+
+private fun tdGenres(obj: String): List<String> =
+    tdJsonObjs(obj, "genres").mapNotNull { tdJsonStr(it, "name") }.filter { it.isNotBlank() }
+
+/**
+ * Extractor de Ok.Ru (odnoklassniki). La página del embed trae el
  * hlsManifestUrl y las urls progresivas en el atributo data-options.
  */
 private suspend fun extractTdOkRu(embedUrl: String, referer: String, name: String, callback: (ExtractorLink) -> Unit): Boolean {
@@ -44,14 +139,13 @@ private suspend fun extractTdOkRu(embedUrl: String, referer: String, name: Strin
             ?.let { it.replace("&quot;", "\"").replace("\\/", "/").let(decodeUnicode) }
             ?: return false
         var found = false
-        // hlsManifestUrl (mejor opción: adaptable). v24.2: el campo puede vivir
-        // en el JSON top-level O dentro de flashvars.metadata (embeds nuevos del
-        // agregador player.tiodonghua.com). VALIDAR el manifiesto antes de
-        // entregarlo: generateM3u8 no lanza excepción con contenido inválido y
-        // M3u8Helper filtra el link en reproducción => "Enlaces no encontrados".
-        // v24.2: la clave varia por version del player: "hlsManifestUrl" (clásico)
-        // u "ondemandHls" (embeds nuevos del agregador). El primer match que
-        // valide como #EXTM3U gana.
+        // hlsManifestUrl (mejor opción: adaptable). El campo puede vivir en el
+        // JSON top-level O dentro de flashvars.metadata (embeds nuevos del
+        // agregador). VALIDAR el manifiesto antes de entregarlo: generateM3u8 no
+        // lanza excepción con contenido inválido y M3u8Helper filtra el link en
+        // reproducción => "Enlaces no encontrados". La clave varía por versión
+        // del player: "hlsManifestUrl" (clásico) u "ondemandHls". El primer
+        // match que valide como #EXTM3U gana.
         val hlsUrl = Regex("\"(?:[a-zA-Z]*ManifestUrl|ondemandHls)\":\"([^\"]+)\"")
             .findAll(options).map { it.groupValues[1] }.firstOrNull { candidate ->
                 try {
@@ -92,79 +186,23 @@ private suspend fun extractTdOkRu(embedUrl: String, referer: String, name: Strin
     }
 }
 
-
 /**
- * v24: extractor de Rumble. La página del embed incluye el embed JS con
- * los mp4 directos por calidad (hugh.cdn.rumble.cloud).
- *
- * v24.12: el embed estándar (rumble.com/embed/VID) ya NO sirve el video en el
- * HTML: el player lo resuelve por API (verificado en vivo: embed de 165KB de JS
- * sin una sola url de video; los videos viejos sí traían el data JSON). La API
- * pública embedJS exige el parámetro embed= (o referrer=) o responde 403:
- *   https://rumble.com/embedJS/u3/?request=video&v=VID&embed=<embedUrl>
- * Devuelve "ua": {"240":[url,...],"360":[...],...,"1080":[...]} con MP4 directos
- * en hugh.cdn.rumble.cloud (validado en vivo: 206 video/mp4, Range OK, 301MB).
- * Estrategia: 1) API embedJS (embeds nuevos y viejos); 2) HTML del embed como
- * fallback para videos antiguos que aún traen hls-vod o mapa de calidades.
+ * v24: extractor de Rumble.
+ * v29: primero el extractor COMÚN (API embedJS + visita previa al embed para el
+ * reto de Cloudflare). Si no hay suerte se lee el HTML del embed: los videos
+ * antiguos aún traen el data JSON con "hls-vod" o el mapa de calidades mp4 en
+ * hugh.cdn.rumble.cloud (verificado en vivo: 206 video/mp4, Range OK).
  */
 private suspend fun extractTdRumble(embedUrl: String, referer: String, name: String, callback: (ExtractorLink) -> Unit): Boolean {
+    if (CE.extractRumble(embedUrl, referer, name, TD_USER_AGENT, callback)) return true
     return try {
-        // 1) API embedJS: vid = /embed/VID (o watch /VID). embed= es OBLIGATORIO
-        // (verificado: sin el parámetro la API responde 403 Forbidden).
-        val vid = Regex("rumble\\.com/(?:embed/)?(v[a-zA-Z0-9]+)").find(embedUrl)?.groupValues?.get(1)
-        if (vid != null) {
-            val api = "https://rumble.com/embedJS/u3/?request=video&v=$vid" +
-                "&embed=" + java.net.URLEncoder.encode(embedUrl, "UTF-8")
-            val uaMap = Regex("\"(\\d{3,4})\":\\[\"(https://[a-z0-9.-]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4)\"")
-            suspend fun emit(json: String): Int {
-                val fixed = json.replace("\\/", "/")
-                var n = 0
-                uaMap.findAll(fixed).forEach { m ->
-                    val h = m.groupValues[1].toIntOrNull()
-                    callback(newExtractorLink(source = name, name = name, url = m.groupValues[2]) {
-                        this.referer = "https://rumble.com/"
-                        this.quality = when {
-                            h == null -> Qualities.Unknown.value
-                            h >= 1080 -> Qualities.P1080.value
-                            h >= 720 -> Qualities.P720.value
-                            h >= 480 -> Qualities.P480.value
-                            else -> Qualities.P360.value
-                        }
-                    })
-                    n++
-                }
-                return n
-            }
-            var json = try {
-                app.get(api, referer = "https://rumble.com/",
-                    headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L).text
-            } catch (_: Exception) { "" }
-            var count = if (json.isNotBlank()) emit(json) else 0
-            if (count == 0) {
-                // WAF de Cloudflare: la API responde 403 sin cookie __cf_bm.
-                // Visitar el embed primero (la sesión conserva la cookie) y reintentar.
-                try {
-                    app.get(embedUrl, referer = referer,
-                        headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L)
-                } catch (_: Exception) {}
-                json = try {
-                    app.get(api, referer = embedUrl,
-                        headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L).text
-                } catch (_: Exception) { "" }
-                if (json.isNotBlank()) count = emit(json)
-            }
-            if (count > 0) return true
-        }
-        // 2) Fallback: HTML del embed (videos antiguos con el data JSON embebido)
         val html = app.get(embedUrl, referer = referer,
             headers = mapOf("User-Agent" to TD_USER_AGENT), timeout = 20L).text
         // Las URLs vienen con / escapado dentro del JSON del embed
         val fixed = html.replace("\\/", "/")
-        // v24.3: el embed nuevo (vip) trae el bloque m.f["VID"]={...}
-        // con rendiciones + "hls":{"url":"https://rumble.com/hls-vod/.../playlist.m3u8"}
-        // (el mapa "360":{"url":...} ya no aparece; el patron viejo solo matcheaba
-        // la "timeline" de 180p). El HLS es VOD valido: master con variantes
-        // 1080/720/480/360 y segmentos TS (verificado en vivo).
+        // El embed nuevo (vip) trae el bloque m.f["VID"]={...} con rendiciones +
+        // "hls":{"url":"https://rumble.com/hls-vod/.../playlist.m3u8"}. El HLS es
+        // VOD válido: master con variantes 1080/720/480/360 y segmentos TS.
         Regex("\"hls\":\\{\"url\":\"(https://rumble\\.com/hls-vod/[^\"]+)\"")
             .find(fixed)?.groupValues?.get(1)?.let { hlsUrl ->
                 try {
@@ -172,7 +210,7 @@ private suspend fun extractTdRumble(embedUrl: String, referer: String, name: Str
                     return true
                 } catch (_: Exception) {}
             }
-        // v24.2: el JSON del embed trae un mapa de calidades con dimensiones:
+        // El JSON del embed trae un mapa de calidades con dimensiones:
         // "360":{"url":"...mp4","meta":{...,"w":638,"h":360}}. Emitir cada una.
         val qualities = Regex("\"(\\d{3,4})\":\\{\"url\":\"(https://[a-z0-9.-]*rumble\\.cloud/video/[A-Za-z0-9/._-]+\\.mp4)\"")
             .findAll(fixed).toList()
@@ -204,6 +242,7 @@ private suspend fun extractTdRumble(embedUrl: String, referer: String, name: Str
         false
     }
 }
+
 /**
  * v24: extractor de StreamTape. El HTML del player trae el enlace directo
  * `//<host>.streamtape.<tld>/get_video?id=...&expires=...&ip=...&token=...`
@@ -227,25 +266,25 @@ private suspend fun extractTdStreamTape(embedUrl: String, referer: String, name:
 }
 
 /**
- * TioDonghua (https://tiodonghua.lat/) — WordPress con tema Dooplay.
+ * TioDonghua (https://tiodonghua.lat/) — v29: reescrito sobre el sitio nuevo.
  *
- * Estructura verificada en vivo (2026-09):
- * - Home: secciones "⚡TOP MAS VISTAS" (div#featured-titles),
- *   "🍿 ÚLTIMOS EPISODIOS" (article.item.episodes, span.serie),
- *   "DONGHUAS AGREGADOS" (div#dt-tvshows) y "🎬 PELICULAS RECIENTES".
- * - Catálogo: /donghua/ ("Recently added", 40 fichas/página, paginado /donghua/page/N/).
- * - Fichas: /donghua/slug/ y /peliculas/slug/ con episodios en ul.episodios
- *   (div.numerando = "temporada - episodio") y géneros en div.sgeneros.
- * - Episodios: /episodios/slug-episodio-N-sub-espanol/ con jugador Dooplay AJAX
- *   (li.dooplay_player_option data-type/data-post/data-nume ->
- *    POST /wp-admin/admin-ajax.php action=doo_player_ajax ->
- *    {"embed_url": "...", "type": "iframe"}).
- * v24.3: los episodios nuevos solo exponen servidores "is-vip-server" SIN
- *   data-attrs (el sitio los resuelve por JS). El mismo admin-ajax funciona
- *   usando el postid-N del body class + el N de cada player-option: nume 1..N
- *   devuelve el embed de cada servidor (Drive Vip = Google Drive MP4 directo,
- *   Rumble Vip = HLS 1080p, y en Inversion Marcial un agregador "XX+NN vip"
- *   con mas servidores). Todos los servidores se procesan ahora.
+ * El sitio dejó WordPress/Dooplay: ahora es Next.js App Router con Tailwind y
+ * un backend Laravel en [TD_API]. Los selectores viejos (article.item,
+ * ul.episodios, admin-ajax doo_player_ajax) ya no matcheaban NADA, por eso la
+ * provider quedaba vacía en la app.
+ *
+ * Rutas verificadas en vivo (2026-11):
+ * - /donghua/{slug}  ficha        -> TD_API/donghuas/{slug}
+ * - /ver/{episodeId} reproductor  -> TD_API/episodes/{episodeId}
+ * - /explorar?status=&sort=&q=    -> TD_API/donghuas?status=&sort=&q=
+ * El API de catálogo NO expone los últimos episodios, así que esa sección se
+ * sigue leyendo del HTML del home (renderizado en servidor).
+ *
+ * LIMITACIÓN del sitio (no del plugin): la ficha solo publica los episodios más
+ * recientes de cada temporada (p. ej. Swallowed Star entrega 241-248). Se
+ * probaron per_page/limit/page/all=1 y las rutas alternativas
+ * /donghuas/{slug}/episodes y /episodes?serie_slug=; el tope está del lado del
+ * servidor y el HTML de la ficha expone exactamente los mismos episodios.
  */
 class TioDonghuaProvider : MainAPI() {
 
@@ -261,19 +300,13 @@ class TioDonghuaProvider : MainAPI() {
         TvType.AnimeMovie,
     )
 
-    override val    mainPage = mainPageOf(
-        "$mainUrl/" to "Últimos Episodios",
-        "$mainUrl/##top" to "Top Más Vistas",
-        "$mainUrl/donghua/" to "Últimos Agregados",
-        "$mainUrl/##peliculas" to "Películas Recientes",
-        // v23.1: no hay páginas /generos/ ni /animes/ (404 verificado), pero las
-        // páginas de género de Dooplay sí existen: /genero/accion/ etc.
-        // (30 fichas por página, paginadas /genero/X/page/N/).
-        "$mainUrl/genero/accion/" to "Género: Acción",
-        "$mainUrl/genero/artes-marciales/" to "Género: Artes Marciales",
-        "$mainUrl/genero/aventura/" to "Género: Aventura",
-        // v24.1: "Género: Fantasía" eliminada por pedido del usuario (liberar
-        // espacio en el home).
+    // Secciones pedidas (2026-11). Las tres últimas usan los mismos filtros que
+    // /explorar en el navegador, resueltos directo contra el API.
+    override val mainPage = mainPageOf(
+        "$mainUrl/##episodios" to "Últimos Episodios",
+        "$TD_API/donghuas?sort=popular" to "Top Más Vistos",
+        "$TD_API/donghuas?status=ongoing&sort=rating" to "En Emisión",
+        "$TD_API/donghuas?sort=rating" to "Catálogo de Donghuas",
     )
 
     private val pageHeaders = mapOf(
@@ -300,422 +333,189 @@ class TioDonghuaProvider : MainAPI() {
         .replace(Regex("\\p{Mn}+"), "")
         .replace(Regex("[^a-z0-9]+"), " ").trim()
 
+    private suspend fun apiGet(url: String): String? = try {
+        app.get(url, headers = pageHeaders, timeout = 30L).text
+    } catch (_: Exception) {
+        null
+    }
+
+    /** Objetos del array `"data":[...]` de una respuesta del API. */
+    private fun apiItems(json: String): List<String> = tdJsonObjs(json, "data")
+
+    /**
+     * Ficha del API -> SearchResponse. El campo `rating` (escala 10) se traduce
+     * a `score` para que la card del home muestre la etiqueta de puntuación.
+     */
+    private fun apiCard(item: String): SearchResponse? {
+        val slug = tdJsonStr(item, "slug") ?: return null
+        val rawTitle = tdJsonStr(item, "title") ?: return null
+        val title = tdCleanTitle(rawTitle)
+        if (title.isBlank()) return null
+        return newAnimeSearchResponse(title, "$mainUrl/donghua/$slug") {
+            this.posterUrl = tdJsonStr(item, "poster_url") ?: ""
+            tdJsonInt(item, "release_year")?.let { this.year = it }
+            val r = tdJsonDbl(item, "rating")
+            if (r != null && r > 0.0) {
+                try { Score.from10(r.toString())?.let { this.score = it } } catch (_: Exception) {}
+            }
+        }
+    }
+
     // ========== getMainPage ==========
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val isHome = request.data == "$mainUrl/"
-        val isTop = request.data == "$mainUrl/##top"
-        val isCatalog = request.data == "$mainUrl/donghua/"
-        // v24: /peliculas/ es un archivo propio (sin header "PELICULAS"), así que
-        // se pide directo en vez de la sección del home (que carga por AJAX).
-        val isMovies = request.data == "$mainUrl/##peliculas"
-        val isGenre = request.data.contains("$mainUrl/genero/")
-
-        // "Top Más Vistas" no tiene paginación real
-        if (isTop && page > 1) {
-            return newHomePageResponse(list = HomePageList(request.name, emptyList()), hasNext = false)
+        // "Últimos Episodios" sale del HTML del home (el API no expone la lista).
+        if (request.data.endsWith("##episodios")) {
+            val items = if (page > 1) emptyList() else lastEpisodesFromHome()
+            return newHomePageResponse(HomePageList(request.name, items), hasNext = false)
         }
-
-        val url = when {
-            isHome && page > 1 -> "$mainUrl/episodios/page/$page/" // archivo /episodios/ (30/pág, mismo markup)
-            // v24.1 FIX: el Top vive en el HOME (div#featured-titles); la URL
-            // derivada "$mainUrl/top" da 404 (la rama isTop se perdió en la
-            // refactor v24.0) => la sección salía VACÍA.
-            isTop -> "$mainUrl/"
-            isCatalog && page > 1 -> "$mainUrl/donghua/page/$page/"
-            isMovies && page > 1 -> "$mainUrl/peliculas/page/$page/" // 404 si no existe: hasNext=false
-            isGenre && page > 1 -> "${request.data.trimEnd('/')}/page/$page/"
-            else -> request.data.removePrefix("$mainUrl/##").let { if (it == request.data) request.data else "$mainUrl/${it.removePrefix("$mainUrl/")}" }
+        if (page > 1) {
+            // El catálogo completo cabe en una página: last_page=1 verificado en
+            // vivo para sort=rating|popular y el filtro status=ongoing.
+            return newHomePageResponse(HomePageList(request.name, emptyList()), hasNext = false)
         }
-        val doc = app.get(
-            if (isMovies) "$mainUrl/peliculas/" else url,
-            headers = pageHeaders, timeout = 30L
-        ).document
+        val items = apiItems(apiGet(request.data) ?: "").mapNotNull { apiCard(it) }
+        return newHomePageResponse(HomePageList(request.name, items.distinctBy { it.url }), hasNext = false)
+    }
 
-        val items: List<SearchResponse> = when {
-            // Últimos Episodios: cards article.item.episodes con span.serie
-            isHome -> {
-                val articles = if (page == 1) {
-                    sectionArticles(doc, "EPISODIOS")
-                } else {
-                    doc.select("article.item.episodes")
+    /**
+     * Cards de "⚡ÚLTIMOS EPISODIOS" del home nuevo:
+     * `<a href="/ver/{id}">` con `<img>`, el badge "Capítulo N" y un `<h4>` con
+     * el nombre de la serie (el span de al lado trae el título largo con sufijos
+     * tipo "X 10 Episodio 45 Sub Español", por eso se prefiere el h4).
+     */
+    private suspend fun lastEpisodesFromHome(): List<SearchResponse> {
+        return try {
+            val ratings = apiRatingsByTitle()
+            val doc = app.get("$mainUrl/", headers = pageHeaders, timeout = 30L).document
+            doc.select("a[href^=/ver/]").mapNotNull { a ->
+                val epId = Regex("/ver/(\\d+)").find(a.attr("href"))?.groupValues?.get(1) ?: return@mapNotNull null
+                val img = a.selectFirst("img")
+                val alt = img?.attr("alt")?.trim() ?: ""
+                val serie = a.selectFirst("h4")?.text()?.trim().orEmpty()
+                val title = tdCleanTitle(serie.ifBlank { alt.substringBeforeLast(" - Ep") })
+                if (title.isBlank()) return@mapNotNull null
+                val badge = a.selectFirst("div.absolute")?.text().orEmpty()
+                val epNum = Regex("(?i)Cap[íi]tulo\\s*(\\d+)").find(badge)?.groupValues?.get(1)?.toIntOrNull()
+                    ?: Regex("(?i)[- ]Ep(?:isodio)?\\s*(\\d+)").find(alt)?.groupValues?.get(1)?.toIntOrNull()
+                newAnimeSearchResponse(title, "$mainUrl/ver/$epId") {
+                    this.posterUrl = img?.attr("src") ?: ""
+                    // La card del home es un EPISODIO y su HTML no trae nota; se toma
+                    // del catálogo del API, que llega completo en una sola petición.
+                    val r = ratings[tdNormalize(title)]
+                    if (r != null) {
+                        try { Score.from10(r.toString())?.let { this.score = it } } catch (_: Exception) {}
+                    }
+                    addDubStatus(DubStatus.Subbed, epNum)
                 }
-                articles.mapNotNull { parseTdEpisodeCard(it) }
-            }
-            // Top Más Vistas: div#featured-titles article.item (fichas)
-            isTop -> doc.select("div#featured-titles article.item").mapNotNull { parseTdCard(it) }
-            // Últimos Agregados: catálogo /donghua/ ("Recently added")
-            isCatalog -> doc.select("div#archive-content article.item").mapNotNull { parseTdCard(it) }
-            // Géneros: /genero/X/ usa div.items.full con los mismos cards
-            isGenre -> doc.select("div.items article.item").mapNotNull { parseTdCard(it) }
-            // Películas: catálogo /peliculas/ con div#archive-content
-            isMovies -> doc.select("div#archive-content article.item").mapNotNull { parseTdCard(it) }
-            // Resto: sección del home por h2
-            else -> sectionArticles(doc, "PELICULAS").mapNotNull { parseTdCard(it) }
-        }
-
-        // El home y /episodios/ tienen miles de páginas (16,594 episodios):
-        // permitir paginación infinita; Top no tiene paginación real.
-        val hasNext = when {
-            isHome -> true
-            isTop -> false
-            isMovies -> page == 1 && doc.select("div#archive-content article.item").isNotEmpty() &&
-                doc.html().contains("peliculas/page/2/")
-            else -> doc.select("a[href*=\"page/${page + 1}/\"]").isNotEmpty()
-        }
-        // v24: "Últimos Episodios" como fila de imágenes horizontales (las cards
-        // ya son panorámicas 300x170: carrusel visual tipo "Captura home
-        // donghualife.png"; CloudStream no expone hero/spotlight a los plugins,
-        // esta es la fila más grande que permite la API).
-        return newHomePageResponse(
-            // v25 (usuario): cards de "Últimos Episodios" al mismo tamaño que
-            // el resto de secciones (la fila horizontal las achicaba).
-            list = HomePageList(request.name, items.distinctBy { it.url }, isHorizontalImages = false),
-            hasNext = hasNext
-        )
-    }
-
-    /** Articles de una sección del home identificada por el texto del h2 del header. */
-    private fun sectionArticles(doc: org.jsoup.nodes.Document, titleContains: String): List<org.jsoup.nodes.Element> {
-        val headerEl = doc.select("header h2").firstOrNull {
-            it.text().uppercase().contains(titleContains)
-        } ?: return emptyList()
-        var node: org.jsoup.nodes.Element? = headerEl.parent()?.nextElementSibling()
-        while (node != null) {
-            val articles = node.select("article")
-            if (articles.isNotEmpty()) return articles
-            node = node.nextElementSibling()
-        }
-        return emptyList()
-    }
-
-    /**
-     * Card de ficha (donghua/película) del home o catálogo.
-     * v24: soporta cards de /peliculas/ (div.image con h3 sin <a>) y muestra
-     * el PUNTAJE (div.rating, ej. "9.8") en la etiqueta de la card en vez de
-     * "Subtitulado": se setea score y no se marca dubStatus.
-     */
-    private fun parseTdCard(article: org.jsoup.nodes.Element): SearchResponse? {
-        val href = article.selectFirst("div.poster a[href], div.image a[href], a[href]")?.attr("href") ?: return null
-        if (!href.contains("/donghua/") && !href.contains("/peliculas/")) return null
-        val title = article.select("h3 a").firstOrNull { it.text().isNotBlank() }?.text()?.trim()
-            ?: article.selectFirst("h3.title")?.text()?.trim()
-            ?: article.selectFirst("h3")?.text()?.trim()
-            ?: article.selectFirst("img")?.attr("alt")?.trim()
-            ?: return null
-        val poster = article.selectFirst("img")?.attr("src") ?: ""
-        val rating = article.selectFirst("div.rating")?.text()?.trim()
-        return newAnimeSearchResponse(tdCleanTitle(title), href) {
-            this.posterUrl = poster
-            if (!rating.isNullOrBlank()) {
-                try { Score.from10(rating)?.let { this.score = it } } catch (_: Exception) {}
-            }
+            }.distinctBy { it.url }
+        } catch (_: Exception) {
+            emptyList()
         }
     }
 
-    /**
-     * Card de episodio ("Últimos Episodios"): el nombre de la serie está en
-     * span.serie; el h3 trae "Episodio N" y el span "S1 EN / fecha".
-     * v24: mostrar el número de episodio en la etiqueta de la card
-     * ("Subtitulado • N") y el score de la serie si viene en el RSC.
-     */
-    private fun parseTdEpisodeCard(article: org.jsoup.nodes.Element): SearchResponse? {
-        val href = article.selectFirst("a[href*=\"/episodios/\"]")?.attr("href") ?: return null
-        val serieName = article.selectFirst("span.serie")?.text()?.trim()
-        val title = if (!serieName.isNullOrBlank()) serieName
-        else tdCleanTitle(article.selectFirst("img")?.attr("alt") ?: "")
-        if (title.isBlank()) return null
-        val poster = article.selectFirst("img")?.attr("src") ?: ""
-        val epText = article.selectFirst("h3")?.text()?.trim() ?: ""
-        val spanText = article.select("div.data span").firstOrNull()?.text()?.trim() ?: ""
-        val epNum = Regex("(?:Episodio|Capítulo)\\s*(\\d+)", RegexOption.IGNORE_CASE).find(epText)
-            ?.groupValues?.get(1)?.toIntOrNull()
-            ?: Regex("S\\d+\\s*E\\s*(\\d+)", RegexOption.IGNORE_CASE).find(spanText)
-                ?.groupValues?.get(1)?.toIntOrNull()
-            ?: Regex("-episodio-(\\d+)").find(href)?.groupValues?.get(1)?.toIntOrNull()
-        return newAnimeSearchResponse(title, href) {
-            this.posterUrl = poster
-            addDubStatus(DubStatus.Subbed, epNum)
-        }
+    /** título normalizado -> rating, según el catálogo del API (cacheado 1 h). */
+    private suspend fun apiRatingsByTitle(): Map<String, Double> {
+        val now = System.currentTimeMillis()
+        tdRatingsCache.second.takeIf { now - tdRatingsCache.first < TD_RATINGS_TTL_MS }?.let { return it }
+        val json = apiGet("$TD_API/donghuas?sort=rating") ?: return emptyMap()
+        val map = apiItems(json).mapNotNull { item ->
+            val t = tdJsonStr(item, "title") ?: return@mapNotNull null
+            val r = tdJsonDbl(item, "rating") ?: return@mapNotNull null
+            tdNormalize(tdCleanTitle(t)) to r
+        }.toMap()
+        if (map.isNotEmpty()) tdRatingsCache = now to map
+        return map
     }
 
     // ========== search ==========
     override suspend fun search(query: String): List<SearchResponse> {
-        return try {
-            val doc = app.get(
-                "$mainUrl/?s=${java.net.URLEncoder.encode(query, "UTF-8")}",
-                headers = pageHeaders, timeout = 30L
-            ).document
-            doc.select("div.result-item").mapNotNull { item ->
-                val a = item.selectFirst("div.title a") ?: item.selectFirst("div.image a[href]") ?: return@mapNotNull null
-                val href = a.attr("href")
-                if (href.isBlank()) return@mapNotNull null
-                val title = a.text().trim().ifBlank { item.selectFirst("img")?.attr("alt") ?: return@mapNotNull null }
-                val poster = item.selectFirst("img")?.attr("src") ?: ""
-                newAnimeSearchResponse(tdCleanTitle(title), href) {
-                    this.posterUrl = poster
-                    addDubStatus(DubStatus.Subbed)
-                }
-            }.distinctBy { it.url }.take(30)
-        } catch (_: Exception) {
-            emptyList()
-        }
+        val q = java.net.URLEncoder.encode(query.trim(), "UTF-8")
+        return apiItems(apiGet("$TD_API/donghuas?q=$q&sort=rating") ?: "")
+            .mapNotNull { apiCard(it) }.distinctBy { it.url }.take(30)
     }
 
     // ========== load ==========
     override suspend fun load(url: String): LoadResponse {
-        // Episodio suelto -> convertir a ficha de serie
-        if (url.contains("/episodios/")) {
-            return loadFromEpisodeUrl(url)
+        val epId = Regex("/ver/(\\d+)").find(url)?.groupValues?.get(1)
+        if (epId != null) {
+            val json = apiGet("$TD_API/episodes/$epId") ?: ""
+            // "slug" aparece primero dentro de serie{} (el episodio no tiene
+            // slug propio; embed_slug usa otra clave).
+            val serieSlug = tdJsonStr(json, "slug")
+            if (!serieSlug.isNullOrBlank()) return loadSerie(serieSlug)
+            // Sin ficha localizable: serie sintetizada de un episodio para que
+            // el usuario pueda reproducir el enlace que abrió.
+            return singleEpisodeResponse(url, epId, json)
         }
+        val slug = url.trimEnd('/').substringAfter("/donghua/").substringBefore('/').trim()
+        return loadSerie(slug.ifBlank { url.trimEnd('/').substringAfterLast('/') })
+    }
 
-        val isMovie = url.contains("/peliculas/")
-        val doc = app.get(url, headers = pageHeaders, timeout = 30L).document
-
-        val title = tdCleanTitle(doc.selectFirst("h1")?.text() ?: "")
-            .ifBlank {
-                tdCleanTitle(
-                    doc.selectFirst("meta[property=\"og:title\"]")?.attr("content") ?: ""
-                )
-            }
-        val poster = doc.selectFirst("meta[property=\"og:image\"]")?.attr("content") ?: ""
-
-        // v24: pestaña "info" de Dooplay (div#info) — sinopsis completa +
-        // custom_fields (Original title, TMDb Rating, First air date, ...)
-        val infoDiv = doc.selectFirst("div#info")
-        val description = infoDiv?.selectFirst("div.wp-content")?.text()?.trim()
-            ?.takeIf { it.isNotBlank() }
-            ?: doc.selectFirst("meta[property=\"og:description\"]")?.attr("content") ?: ""
-
-        // custom_fields: pares <b class="variante">clave</b><span class="valor">valor</span>
-        val infoFields = HashMap<String, String>()
-        infoDiv?.select("div.custom_fields")?.forEach { cf ->
-            val k = cf.selectFirst("b.variante")?.text()?.trim() ?: return@forEach
-            val v = cf.selectFirst("span.valor")?.text()?.trim() ?: return@forEach
-            if (k.isNotBlank() && v.isNotBlank()) infoFields[k] = v
+    private suspend fun singleEpisodeResponse(url: String, epId: String, json: String): LoadResponse {
+        val serieTitle = tdCleanTitle(tdJsonStr(json, "title") ?: "Episodio $epId")
+        val poster = tdJsonStr(json, "thumbnail_url") ?: ""
+        return newAnimeLoadResponse(serieTitle, url, TvType.Anime) {
+            posterUrl = poster
+            addEpisodes(DubStatus.Subbed, listOf(newEpisode(url) {
+                this.episode = tdJsonInt(json, "episode_number")
+            }))
         }
-        val originalTitle = infoFields["Original title"]?.trim()
+    }
 
-        // Año desde "First air date" ("Jan. 01, 2024")
-        val year = Regex("(19|20)\\d{2}").find(
-            infoFields["First air date"] ?: ""
-        )?.value?.toIntOrNull()
-
-        // Rating del sitio (span.dt_rating_vgs, escala 10)
-        val ratingText = doc.selectFirst("span.dt_rating_vgs[itemprop=ratingValue]")?.text()?.trim()
-        val rating = if (!ratingText.isNullOrBlank()) {
-            try { Score.from10(ratingText) } catch (_: Exception) { null }
-        } else null
-
-        val genres = doc.select("div.sgeneros a").map { it.text().trim() }.filter { it.isNotBlank() }
-        // Estado de emisión según géneros del sitio (Completado / En emisión)
-        val showStatus = when {
-            genres.any { it.equals("Completado", ignoreCase = true) } -> ShowStatus.Completed
-            genres.any {
-                it.contains("emision", ignoreCase = true) ||
-                    it.contains("emisión", ignoreCase = true) ||
-                    it.contains("curso", ignoreCase = true)
-            } -> ShowStatus.Ongoing
+    /** Ficha completa desde el API: episodios por temporada, rating, géneros. */
+    private suspend fun loadSerie(slug: String): LoadResponse {
+        val json = apiGet("$TD_API/donghuas/$slug") ?: ""
+        val data = tdJsonVal(json, "data") ?: json
+        val title = tdCleanTitle(tdJsonStr(data, "title") ?: slug.replace("-", " ").trim())
+        val seriesUrl = "$mainUrl/donghua/$slug"
+        val poster = tdJsonStr(data, "poster_url") ?: ""
+        val synopsis = tdJsonStr(data, "synopsis") ?: ""
+        val releaseYear = tdJsonInt(data, "release_year")
+        val genres = tdGenres(data)
+        val originalTitle = tdJsonStr(data, "original_title")?.takeIf { it.isNotBlank() }
+        val showStatus = when (tdJsonStr(data, "broadcast_status")?.lowercase()) {
+            "completed" -> ShowStatus.Completed
+            "ongoing" -> ShowStatus.Ongoing
             else -> null
         }
+        val score = tdJsonDbl(data, "rating")?.takeIf { it > 0.0 }?.let {
+            try { Score.from10(it.toString()) } catch (_: Exception) { null }
+        }
 
-        // Recomendaciones: primero otras temporadas, luego similares aleatorios (tope 16)
-        val recommendations = fetchTdRecommendations(url, title)
-
-        // Episodios: ul.episodios con div.numerando "temporada - episodio"
-        // v24: el numerando es la fuente de verdad (algunos slugs traen sufijos
-        // raros tipo "-episodio-10-1sub-" o URLs de la temporada anterior).
         val episodes = ArrayList<Episode>()
-        doc.select("ul.episodios li").forEach { li ->
-            val a = li.selectFirst("div.episodiotitle a[href]") ?: return@forEach
-            val href = a.attr("href")
-            if (href.isBlank()) return@forEach
-            val num = li.selectFirst("div.numerando")?.text()?.trim() ?: ""
-            val parts = num.split("-")
-            val season = parts.getOrNull(0)?.trim()?.toIntOrNull()
-            val epNum = parts.getOrNull(1)?.trim()?.toIntOrNull()
-                ?: Regex("-episodio-(\\d+)").find(href)?.groupValues?.get(1)?.toIntOrNull()
-            episodes.add(newEpisode(resolveUrl(href)) {
-                this.name = a.text().trim().ifBlank { null }
-                this.episode = epNum
-                season?.let { this.season = it }
-            })
+        val seen = HashSet<String>()
+        for (season in tdJsonObjs(data, "seasons")) {
+            val seasonNum = tdJsonInt(season, "season_number")
+            for (ep in tdJsonObjs(season, "episodes")) {
+                val epId = tdJsonStr(ep, "id") ?: continue
+                if (!seen.add(epId)) continue
+                // name se deja null: el título del API ("X 10 Episodio 45 Sub
+                // Español") repite la serie y el sufijo; con season+episode
+                // CloudStream renderiza "Episodio N" y agrupa por temporada.
+                episodes.add(newEpisode("$mainUrl/ver/$epId") {
+                    this.episode = tdJsonInt(ep, "episode_number")
+                    this.season = seasonNum
+                })
+            }
         }
+        episodes.sortWith(compareBy({ it.season ?: 1 }, { it.episode ?: 0 }))
 
-        // Película con lista de episodios (película por episodio) -> serie
-        if (episodes.isEmpty()) {
-            if (isMovie) {
-                // MovieLoadResponse no tiene synonyms/showStatus: se añaden al plot
-                val extraInfo = buildString {
-                    append(description)
-                    originalTitle?.let { append("\n\nTítulo original: ").append(it) }
-                    if (showStatus == ShowStatus.Completed) append("\n\nEstado: Completado")
-                    if (showStatus == ShowStatus.Ongoing) append("\n\nEstado: En emisión")
-                }.trim()
-                return newMovieLoadResponse(title, url, TvType.AnimeMovie, url) {
-                    posterUrl = poster; this.plot = extraInfo; this.tags = genres
-                    this.year = year; this.score = rating
-                    if (recommendations.isNotEmpty()) this.recommendations = recommendations
-                }
-            }
-            // Ficha de serie sin ul.episodios: sintetizar con links a /episodios/
-            doc.select("a[href*=\"/episodios/\"]").forEach { a ->
-                val href = a.attr("href")
-                val epNum = Regex("-episodio-(\\d+)").find(href)?.groupValues?.get(1)?.toIntOrNull()
-                if (href.isNotBlank() && episodes.none { it.data == href }) {
-                    episodes.add(newEpisode(resolveUrl(href)) { this.episode = epNum })
-                }
-            }
-            if (episodes.isEmpty()) {
-                // Último recurso: la ficha misma tiene jugador (especiales)
-                return newMovieLoadResponse(title, url, TvType.AnimeMovie, url) {
-                    posterUrl = poster; this.plot = description; this.tags = genres
-                    this.year = year; this.score = rating
-                    if (recommendations.isNotEmpty()) this.recommendations = recommendations
-                }
-            }
-            episodes.sortBy { it.episode }
-        } else {
-            episodes.sortBy { (it.season ?: 1) * 100000 + (it.episode ?: 0) }
-        }
+        val recs = apiItems(apiGet("$TD_API/donghuas?sort=popular") ?: "")
+            .filter { tdJsonStr(it, "slug") != slug }
+            .mapNotNull { apiCard(it) }
+            .take(12)
 
-        return newAnimeLoadResponse(title, url, TvType.Anime) {
+        return newAnimeLoadResponse(title, seriesUrl, TvType.Anime) {
             posterUrl = poster
-            addEpisodes(DubStatus.Subbed, episodes)
-            this.plot = description; this.tags = genres
-            this.year = year; this.score = rating
+            if (synopsis.isNotBlank()) plot = synopsis
+            if (genres.isNotEmpty()) tags = genres
+            releaseYear?.let { this.year = it }
+            score?.let { this.score = it }
             showStatus?.let { this.showStatus = it }
             originalTitle?.let { this.synonyms = listOf(it) }
-            if (recommendations.isNotEmpty()) this.recommendations = recommendations
-        }
-    }
-
-    /**
-     * Carga desde una URL de episodio: usa el enlace "ALL" del paginador
-     * (div.pag_episodes) que apunta a la ficha con el título limpio.
-     */
-    private suspend fun loadFromEpisodeUrl(epUrl: String): LoadResponse {
-        val doc = try {
-            app.get(epUrl, headers = pageHeaders, timeout = 30L).document
-        } catch (_: Exception) {
-            return synthesizedEpisodeResponse(epUrl)
-        }
-        val seriesHref = doc.select("div.pag_episodes a[href]").firstOrNull {
-            val h = it.attr("href")
-            (h.contains("/donghua/") || h.contains("/peliculas/")) && !h.contains("/donghua/page/")
-        }?.attr("href")
-        if (!seriesHref.isNullOrBlank()) {
-            return load(seriesHref)
-        }
-        return synthesizedEpisodeResponse(epUrl)
-    }
-
-    /** Fallback: episodio sin ficha localizable -> serie sintetizada de un episodio. */
-    private suspend fun synthesizedEpisodeResponse(epUrl: String): LoadResponse {
-        val epNum = Regex("-episodio-(\\d+)").find(epUrl)?.groupValues?.get(1)?.toIntOrNull() ?: 1
-        val slugBase = epUrl.substringAfter("/episodios/").trimEnd('/').substringBefore("-episodio-")
-        val guessTitle = slugBase.replace("-", " ").trim().replaceFirstChar { it.uppercase() }
-        var poster = ""
-        var plot = ""
-        try {
-            val doc = app.get(epUrl, headers = pageHeaders, timeout = 30L).document
-            poster = doc.selectFirst("meta[property=\"og:image\"]")?.attr("content") ?: ""
-            plot = doc.selectFirst("meta[property=\"og:description\"]")?.attr("content") ?: ""
-        } catch (_: Exception) {}
-        return newAnimeLoadResponse(guessTitle, epUrl, TvType.Anime) {
-            posterUrl = poster; plot = plot
-            addEpisodes(DubStatus.Subbed, listOf(newEpisode(epUrl) { this.episode = epNum }))
-        }
-    }
-
-    /**
-     * v23.0 recomendaciones (NOTA del usuario):
-     * 1) Otras temporadas del mismo nombre (misma base de slug/título) vía el
-     *    buscador del sitio;
-     * 2) Similares aleatorios desde una página al azar de /donghua/ (catálogo,
-     *    40 fichas por página). Tope 16.
-     */
-    private suspend fun fetchTdRecommendations(
-        seriesUrl: String,
-        seriesTitle: String
-    ): List<SearchResponse> {
-        return try {
-            val all = ArrayList<SearchResponse>()
-            val seen = mutableSetOf(seriesUrl)
-
-            val selfSlug = seriesUrl.trimEnd('/').substringAfterLast('/')
-            val baseSlug = Regex("-\\d+$").replace(selfSlug, "")
-            val norm = tdNormalize(seriesTitle)
-            val baseNorm = Regex("\\s+\\d+$").replace(norm, "").trim()
-
-            // El título puede traer sufijo de temporada ("... Temporada 3")
-            val titleNoSeason = Regex("\\s*(temporada|season)\\s*\\d+$", RegexOption.IGNORE_CASE)
-                .replace(seriesTitle, "").trim()
-                .ifBlank { Regex("\\s+\\d+$").replace(seriesTitle, "").trim() }
-            val normNoSeason = if (titleNoSeason != seriesTitle) tdNormalize(titleNoSeason) else ""
-
-            // ===== 1) Otras temporadas vía buscador =====
-            val q = normNoSeason.ifBlank { baseNorm.ifBlank { baseSlug.replace("-", " ") } }
-            if (q.isNotBlank()) {
-                try {
-                    val doc = app.get(
-                        "$mainUrl/?s=${java.net.URLEncoder.encode(q, "UTF-8")}",
-                        headers = pageHeaders, timeout = 30L
-                    ).document
-                    val seasons = ArrayList<Triple<String, String, String>>() // url, title, poster
-                    doc.select("div.result-item").forEach { item ->
-                        val a = item.selectFirst("div.title a") ?: item.selectFirst("a[href]") ?: return@forEach
-                        val href = a.attr("href")
-                        if (href.isBlank() || href in seen) return@forEach
-                        if (!href.contains("/donghua/") && !href.contains("/peliculas/")) return@forEach
-                        val slug = href.trimEnd('/').substringAfterLast('/')
-                        val t = tdCleanTitle(a.text().trim().ifBlank { item.selectFirst("img")?.attr("alt") ?: "" })
-                        val tNorm = tdNormalize(t)
-                        val tBase = Regex("\\s+\\d+$").replace(tNorm, "").trim()
-                        val slugBase = Regex("-\\d+$").replace(slug, "")
-                        val sameBase = (baseSlug.isNotBlank() && slugBase.startsWith(baseSlug)) ||
-                            (baseNorm.isNotBlank() && tNorm.startsWith(baseNorm)) ||
-                            (normNoSeason.isNotBlank() && tNorm.startsWith(normNoSeason)) ||
-                            (baseNorm.isNotBlank() && baseNorm.startsWith(tBase) && tBase.isNotBlank())
-                        if (!sameBase) return@forEach
-                        seen.add(href)
-                        seasons.add(Triple(href, t, item.selectFirst("img")?.attr("src") ?: ""))
-                    }
-                    seasons.sortBy {
-                        Regex("(\\d+)$").find(it.first.trimEnd('/').substringAfterLast('/'))
-                            ?.groupValues?.get(1)?.toIntOrNull() ?: 0
-                    }
-                    seasons.forEach { (u, t, p) ->
-                        all.add(newAnimeSearchResponse(t, u) { this.posterUrl = p })
-                    }
-                } catch (_: Exception) {}
-            }
-
-            // ===== 2) Similares aleatorios del catálogo =====
-            if (all.size < 16) try {
-                val firstDoc = app.get("$mainUrl/donghua/", headers = pageHeaders, timeout = 30L).document
-                val lastPage = Regex("/donghua/page/(\\d+)/").findAll(firstDoc.html())
-                    .mapNotNull { it.groupValues[1].toIntOrNull() }.maxOrNull() ?: 1
-                val page = if (lastPage > 1) (1..lastPage).random() else 1
-                val poolDoc = if (page == 1) firstDoc else
-                    app.get("$mainUrl/donghua/page/$page/", headers = pageHeaders, timeout = 30L).document
-                val pool = ArrayList<SearchResponse>()
-                poolDoc.select("div#archive-content article.item").forEach { article ->
-                    if (pool.size >= 40) return@forEach
-                    val href = article.selectFirst("a[href]")?.attr("href") ?: return@forEach
-                    if (href in seen || !href.contains("/donghua/") && !href.contains("/peliculas/")) return@forEach
-                    val t = article.select("h3 a").firstOrNull { it.text().isNotBlank() }?.text()?.trim()
-                        ?: article.selectFirst("img")?.attr("alt") ?: return@forEach
-                    seen.add(href)
-                    pool.add(newAnimeSearchResponse(tdCleanTitle(t), href) {
-                        this.posterUrl = article.selectFirst("img")?.attr("src") ?: ""
-                    })
-                }
-                pool.shuffle()
-                all.addAll(pool)
-            } catch (_: Exception) {}
-            all.take(16)
-        } catch (_: Exception) {
-            emptyList()
+            if (episodes.isEmpty()) addEpisodes(DubStatus.Subbed, listOf(newEpisode(seriesUrl)))
+            else addEpisodes(DubStatus.Subbed, episodes)
+            if (recs.isNotEmpty()) this.recommendations = recs
         }
     }
 
@@ -724,131 +524,74 @@ class TioDonghuaProvider : MainAPI() {
         data: String, isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val doc = app.get(data, headers = pageHeaders, timeout = 30L).document
-        var foundLinks = false
         var links = 0
         val cb: (ExtractorLink) -> Unit = { links++; callback(it) }
         // v8: dedupe DM por episodio (los sets son de instancia).
         tdEmittedDmVids.clear()
         tdEmittedDmSubs.clear()
 
-        // Opciones de servidor Dooplay (AJAX).
-        // v24.3: los episodios nuevos solo exponen <li class="... is-vip-server">
-        // SIN data-attrs (el sitio los resuelve por JS). Verificado en vivo que el
-        // MISMO admin-ajax funciona usando el postid-N del body class de la pagina
-        // + el numero de opcion (player-option-N): nume 1..N devuelve el embed de
-        // cada servidor, VIP incluidos (Drive Vip, Rumble Vip, y en Inversion
-        // Marcial un agregador "XX+NN vip" con 7 servidores mas).
-        val liOptions = doc.select("li.dooplay_player_option")
-        val bodyPostId = Regex("postid-(\\d+)")
-            .find(doc.body()?.className() ?: "")?.groupValues?.get(1)
-        val requests = LinkedHashMap<String, Array<String>>() // key -> [post, nume, type, label]
-        liOptions.forEachIndexed { idx, li ->
-            val isVip = li.hasClass("is-vip-server")
-            val nume = li.attr("id").removePrefix("player-option-")
-                .takeIf { it.isNotBlank() && it.toIntOrNull() != null } ?: (idx + 1).toString()
-            val post = if (!isVip && li.attr("data-post").isNotBlank()) li.attr("data-post")
-                else bodyPostId ?: return@forEachIndexed
-            val type = if (!isVip) li.attr("data-type").ifBlank { "tv" } else "tv"
-            val label = li.selectFirst("span.title")?.text()?.trim()?.ifBlank { null }
-                ?: "Server $nume"
-            requests["${post}_${nume}_$type"] = arrayOf(post, nume, type, label)
+        val epId = Regex("/ver/(\\d+)").find(data)?.groupValues?.get(1)
+        val json = if (epId != null) apiGet("$TD_API/episodes/$epId") ?: "" else ""
+
+        val servers = ArrayList<Pair<String, String>>()
+        for (src in tdJsonObjs(json, "sources")) {
+            val embed = tdNormalizeEmbed(tdJsonStr(src, "embed_url") ?: "") ?: continue
+            val label = tdJsonStr(tdJsonVal(src, "server") ?: "", "name")?.takeIf { it.isNotBlank() }
+                ?: serverLabelFromUrl(embed)
+            servers.add(embed to label)
         }
-        if (requests.isNotEmpty()) {
-            val results = coroutineScope {
-                requests.values.map { r ->
-                    async {
-                        try { fetchTdPlayerEmbed(r[0], r[1], r[2]) to r[3] } catch (_: Exception) { "" to r[3] }
-                    }
-                }.map { it.await() }
-            }
-            // v24.13: auditoria de servidores (12 episodios x 8 opciones AJAX):
-            // vivos Dailymotion 7/7 y Rumble 5/6 (calidades directas), Drive 3/3
-            // y OK 2/4; muertos de forma estable VOE/Filemon/StreamTape/Terabox/
-            // SW/DS (0 de N). Emitir los vivos primero (sortedByDescending es
-            // estable: dentro de cada grupo se conserva el orden del sitio) para
-            // que la reproduccion por defecto caiga en un servidor que responde.
-            val ordered = results.sortedByDescending { (raw, _) ->
-                tdServerPriority(tdNormalizeEmbed(raw) ?: "")
-            }
-            ordered.forEach { (rawEmbed, label) ->
-                val embedUrl = tdNormalizeEmbed(rawEmbed)
-                if (embedUrl != null) {
-                    processTdEmbed(embedUrl, data, label, subtitleCallback, cb)
-                }
-            }
+        // v24.13: los servidores vivos primero para que la reproducción por
+        // defecto caiga en uno que responde (auditoría en tdServerPriority).
+        for ((embed, label) in servers.sortedByDescending { tdServerPriority(it.first) }.distinctBy { it.first }) {
+            processTdEmbed(embed, data, label, subtitleCallback, cb)
         }
 
-        // Fallback 1: iframes directos
+        // Fallback 1: la lista "downloads" del mismo episodio (urls cortas).
         if (links == 0) {
-            doc.select("iframe").forEach { iframe ->
-                val src = listOf("src", "data-src").map { iframe.attr(it).trim() }
-                    .firstOrNull { it.isNotBlank() }?.let { resolveUrl(it) } ?: return@forEach
-                if (src.startsWith("http")) {
-                    processTdEmbed(src, data, serverLabelFromUrl(src), subtitleCallback, cb)
-                }
+            for (dl in tdJsonObjs(json, "downloads")) {
+                val url = tdNormalizeEmbed(tdJsonStr(dl, "url") ?: "") ?: continue
+                if (url.contains("/drive/folders/") || url.contains("playerp2p")) continue
+                val label = tdJsonStr(dl, "name")?.takeIf { it.isNotBlank() } ?: serverLabelFromUrl(url)
+                processTdEmbed(url, data, label, subtitleCallback, cb)
             }
         }
 
-        // Fallback 2: m3u8/mp4 en el HTML
+        // Fallback 2: iframes / m3u8 servidos en la propia página del episodio.
         if (links == 0) {
-            val html = doc.html()
-            for (m in Regex("""(https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)""").findAll(html)) {
-                try { generateM3u8("Server", m.value, data).forEach(cb); foundLinks = true } catch (_: Exception) {}
+            val doc = try { app.get(data, headers = pageHeaders, timeout = 30L).document } catch (_: Exception) { null }
+            doc?.select("iframe")?.forEach { iframe ->
+                val raw = listOf("src", "data-src").map { iframe.attr(it).trim() }.firstOrNull { it.isNotBlank() }
+                    ?: return@forEach
+                val src = resolveUrl(tdNormalizeEmbed(raw) ?: raw)
+                if (src.startsWith("http")) processTdEmbed(src, data, serverLabelFromUrl(src), subtitleCallback, cb)
             }
-            if (!foundLinks) {
-                for (m in Regex("""(https?://[^"'\s<>]+\.mp4[^"'\s<>]*)""").findAll(html)) {
-                    if (CE.isJunkVideoUrl(m.value)) continue
-                    callback(newExtractorLink(source = "Server", name = "Server", url = m.value) {
-                        this.referer = data; this.quality = Qualities.Unknown.value
-                    })
-                    foundLinks = true
+            if (links == 0) {
+                for (m in Regex("""(https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)""").findAll(doc?.html() ?: "")) {
+                    try { generateM3u8("Server", m.value, data).forEach(cb) } catch (_: Exception) {}
+                    if (links > 0) break
                 }
             }
         }
-
-        return links > 0 || foundLinks
+        return links > 0
     }
 
     /**
-     * v24: normaliza el embed_url del AJAX. El tipo "dtshcode" devuelve HTML
-     * (un <iframe ...> o <div><iframe ...></div>); extraer el src. Si es una
-     * URL directa ("iframe") se devuelve tal cual. Devuelve null si no hay URL.
+     * v29: normaliza las URLs de servidor. El API mezcla dos formatos por host:
+     * el canónico del player (`dailymotion.com/embed/video/ID`,
+     * `rumble.com/embed/vID/?pub=...`) y el corto de las descargas
+     * (`dailymotion.com/d/video/ID`, `rumble.com/d/vID`). Los extractores solo
+     * entienden el canónico, así que se reescribe aquí.
      */
     private fun tdNormalizeEmbed(raw: String): String? {
-        // des-escapar JSON (\" -> " y \/ -> /) antes de analizar
         val t = raw.replace("\\\"", "\"").replace("\\/", "/").trim()
-        if (t.startsWith("http")) {
-            val end = t.indexOfFirst { it == '"' || it == '\\' }
-            return (if (end == -1) t else t.substring(0, end)).trim().ifBlank { null }
-        }
-        if (t.contains("<iframe", ignoreCase = true) || t.contains("<div", ignoreCase = true)) {
-            val src = Regex("""src\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE).find(t)
-                ?.groupValues?.get(1)
-            if (src != null) return src.trim()
-        }
-        return null
-    }
-
-    /** Llama al endpoint AJAX de Dooplay y devuelve el embed_url de la opción. */
-    private suspend fun fetchTdPlayerEmbed(post: String, nume: String, type: String): String {
-        return try {
-            val resp = app.post(
-                "$mainUrl/wp-admin/admin-ajax.php",
-                data = mapOf(
-                    "action" to "doo_player_ajax",
-                    "post" to post,
-                    "nume" to nume,
-                    "type" to type,
-                ),
-                headers = pageHeaders,
-                timeout = 20L
-            ).text
-            // {"embed_url":"https:\/\/...","type":"iframe"}
-            Regex("\"embed_url\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").find(resp)
-                ?.groupValues?.get(1) ?: ""
-        } catch (_: Exception) {
-            ""
+        if (!t.startsWith("http")) return null
+        val end = t.indexOfFirst { it == '"' || it == ' ' }
+        val url = (if (end == -1) t else t.substring(0, end)).trim()
+        if (url.isBlank()) return null
+        return when {
+            url.contains("dailymotion.com/d/video/") -> url.replace("/d/video/", "/embed/video/")
+            Regex("rumble\\.com/d/v[a-zA-Z0-9]+").containsMatchIn(url) -> url.replaceFirst("/d/", "/embed/")
+            else -> url
         }
     }
 
@@ -863,26 +606,33 @@ class TioDonghuaProvider : MainAPI() {
     }
 
     /**
-     * v24.13: prioridad del servidor por host para ordenar la emision de
-     * enlaces (ver auditoria en loadLinks). Mas alto = emite antes.
+     * Prioridad del servidor por host para ordenar la emisión de enlaces.
+     * v29 auditoría (18 episodios del API nuevo): Byse 15/18, VidHide 15,
+     * Streamp2p 14, Rumble 13, Dailymotion 13, OkRu 10, VIDARA 5, VOE 5.
+     * Byse (byselapuix.com) es una SPA Vite de 1.6 KB sin fuente estática y sin
+     * API pública; Streamp2p es WebRTC con tokens (ExoPlayer no lo reproduce);
+     * VOE redirige a un host aleatorio y sirve las fuentes en un blob cifrado
+     * por su bundle JS. Esos tres se saltan sin gastar peticiones.
      */
     private fun tdServerPriority(embedUrl: String): Int {
         val u = embedUrl.lowercase()
         return when {
-            u.contains("rumble.com") -> 3
-            u.contains("dailymotion.com") || u.contains("dai.ly") -> 3
-            u.contains("drive.google.com") -> 2
-            u.contains("ok.ru") || u.contains("odnoklassniki") -> 1
+            u.contains("rumble.com") -> 9
+            u.contains("dailymotion.com") || u.contains("dai.ly") -> 8
+            u.contains("ok.ru") || u.contains("odnoklassniki") -> 7
+            u.contains("morencius") || u.contains("vidhide") -> 6
+            u.contains("vidara") -> 5
+            u.contains("streamtape") || u.contains("strcloud") -> 4
+            u.contains("drive.google.com") -> 3
             else -> 0
         }
     }
 
     /**
-     * v24.3: Google Drive (servidor "Drive Vip" del AJAX de tiodonghua).
-     * drive.google.com/file/d/ID/preview -> drive.usercontent.google.com/download
-     * ?id=ID&export=download&confirm=t: sirve el MP4 DIRECTO (verificado en vivo
-     * con 3 archivos: 200 video/mp4, 325-586 MB, sin cookies ni JS). Es una
-     * transform pura de URL: sin peticiones de red en el extractor.
+     * v24.3: Google Drive (servidor "Drive Vip"): drive.google.com/file/d/ID/
+     * preview -> drive.usercontent.google.com/download?id=ID&export=download
+     * &confirm=t, que sirve el MP4 DIRECTO (verificado en vivo con 3 archivos:
+     * 200 video/mp4, 325-586 MB, sin cookies ni JS). Transformación pura de URL.
      */
     private suspend fun extractTdGoogleDrive(
         embedUrl: String, serverName: String, callback: (ExtractorLink) -> Unit
@@ -900,11 +650,60 @@ class TioDonghuaProvider : MainAPI() {
     }
 
     /**
-     * v24.3: la página "MultiPlayer" (player.tiodonghua.com/embed/XX+NN) es un
-     * agregador: lista <li onclick="go_to_player('URL')"> con 7 servidores
-     * (StreamWish, VidGuard, FileMon, Dailymotion, OKRu, VidHide, Rumble) y la
-     * etiqueta visible junto a cada botón. Extraer cada embed y procesarlo con su
-     * nombre real de servidor.
+     * v29: Vidara (servidor "VIDARA"). El embed es un reproductor JWPlayer cuya
+     * fuente resuelve una API POST sin auth en el MISMO host del embed:
+     *   POST <host>/api/stream {"filecode":"<id de /e/ID>","device":"web"}
+     *   -> {"streaming_url":"https://.../master.m3u8?token=...","subtitles":...}
+     * Validado en vivo: master #EXTM3U con variante
+     * CODECS="avc1.640028,mp4a.40.2" (h264 con audio muxed, sin VMAP). El host
+     * real puede ser vidara.to o un espejo (as9u7bgh9.com), así que se usa el
+     * host de la propia URL del embed.
+     */
+    private suspend fun extractTdVidara(
+        embedUrl: String, serverName: String,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        return try {
+            val code = embedUrl.trimEnd('/').substringAfterLast('/')
+            if (code.isBlank() || code.contains('.')) return false
+            val host = Regex("(https?://[^/]+)").find(embedUrl)?.groupValues?.get(1) ?: return false
+            val resp = app.post(
+                "$host/api/stream",
+                referer = embedUrl,
+                headers = mapOf("User-Agent" to TD_USER_AGENT),
+                json = mapOf("filecode" to code, "device" to "web"),
+                timeout = 20L
+            ).text
+            val stream = tdJsonStr(resp, "streaming_url") ?: return false
+            if (!stream.startsWith("http")) return false
+            var found = false
+            if (stream.contains(".m3u8")) {
+                try { generateM3u8(serverName, stream, embedUrl).forEach(callback); found = true } catch (_: Exception) {}
+            }
+            if (!found) {
+                callback(newExtractorLink(source = serverName, name = serverName, url = stream) {
+                    this.referer = embedUrl
+                    this.quality = Qualities.Unknown.value
+                })
+                found = true
+            }
+            for (sub in tdJsonObjs(resp, "subtitles")) {
+                val file = tdJsonStr(sub, "file") ?: continue
+                if (!file.startsWith("http")) continue
+                val label = tdJsonStr(sub, "label")?.takeIf { it.isNotBlank() } ?: "Subtítulos"
+                try { subtitleCallback(SubtitleFile(label, file)) } catch (_: Exception) {}
+            }
+            found
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * v24.3: la página "MultiPlayer" (player.tiodonghua.com/embed/XX+NN) era un
+     * agregador: lista <li onclick="go_to_player('URL')"> con varios servidores y
+     * la etiqueta visible junto a cada botón. Extraer cada embed y procesarlo con
+     * su nombre real de servidor.
      */
     private suspend fun extractTdMultiPlayer(
         embedUrl: String, referer: String, name: String,
@@ -931,9 +730,8 @@ class TioDonghuaProvider : MainAPI() {
                 } catch (_: Exception) { false }
                 if (processed) any = true
             }
-            // v24.3: el agregador VIP (embed "XX+NN vip" del AJAX, ej. "MI+001 vip")
-            // usa botones is-vip-server SIN go_to_player: hosts absolutos en atributos
-            // data-* (verificado en vivo). Extraerlos también.
+            // v24.3: el agregador VIP usa botones is-vip-server SIN
+            // go_to_player: hosts absolutos en atributos data-*.
             if (!any) {
                 for (m in Regex("""(https?://[a-zA-Z0-9.-]+/[a-zA-Z0-9/._+?=&-]+)""").findAll(html)) {
                     val cand = m.groupValues[1]
@@ -967,17 +765,18 @@ class TioDonghuaProvider : MainAPI() {
         when {
             // v24.3: streaming P2P/WebRTC (API JSON con token, peers y MSE);
             // ExoPlayer no puede reproducirlo: no gastar peticiones.
-            u.contains("playerp2p.online") -> {}
-            // v24.13: Terabox (servidor "TB"): reproductor propio sin fuente
-            // estatica en el HTML (476KB de SPA) y SIN API publica anonima:
-            // share/list devuelve los metadatos (errno 0) pero sin dlink,
-            // shorturlinfo responde errno 0 con shareid/uk/sign pero dlink
-            // VACIO, /share/download esta envuelto en check-login en el JS del
-            // propio sitio (errno 2 anonimo) y /share/streaming responde errno
-            // 130 (y aunque funcionara, el player anonimo recibe chunks
-            // aleatorios de ~4 min por request, inservible en ExoPlayer).
-            // No extraible: saltar (ahorra 2 requests muertas por episodio).
+            u.contains("playerp2p") -> {}
+            // v29: Byse (byselapuix.com): SPA Vite sin fuente estática ni API
+            // pública anónima (verificado en vivo: 1.6 KB de HTML y el bundle no
+            // expone ruta de sources). Saltar ahorra 1 request muerta.
+            u.contains("byse") -> {}
+            // v24.13: Terabox (servidor "TB"): SPA sin dlink anónimo. No
+            // extraible: saltar (ahorra 2 requests muertas por episodio).
             u.contains("terabox") -> {}
+            // v29: VOE sirve las fuentes en un blob cifrado por su bundle JS y
+            // el host real cambia en cada visita (window.location.href hacia un
+            // dominio aleatorio). No extraible sin ejecutar JS: saltar.
+            u.contains("voe.sx") || u.contains("voe.sh") -> {}
             u.contains("dailymotion.com") ->
                 extractTdDailymotion(u, referer, serverName, subtitleCallback, cb)
             // v24: Ok.Ru (servidor "OK" muy común en tiodonghua)
@@ -986,34 +785,36 @@ class TioDonghuaProvider : MainAPI() {
             // v24: Rumble (servidor "DM" en fichas nuevas)
             u.contains("rumble.com") ->
                 extractTdRumble(u, referer, serverName, cb)
-            // v24.2: agregador "MultiPlayer" (player.tiodonghua.com/embed/XX+NN):
-            // pagina propia con 7 servidores via go_to_player('URL'). Extraerlos
-            // y procesar CADA embed con su servidor real.
+            // v29: Vidara y sus espejos: API POST /api/stream.
+            u.contains("vidara") -> extractTdVidara(u, serverName, subtitleCallback, cb)
+            // v24.2: agregador "MultiPlayer" (player.tiodonghua.com/embed/XX+NN).
             u.contains("player.tiodonghua.com") ->
                 extractTdMultiPlayer(u, referer, serverName, subtitleCallback, cb)
             // v24: StreamTape (servidor "ST")
             u.contains("streamtape") || u.contains("strcloud") ->
                 extractTdStreamTape(u, referer, serverName, cb)
-            // modagamers: 302 a publicidad que planta cookie sid, luego challenge con
-            // JS redirect (verificado en vivo); seguir la cadena con reintentos.
+            // modagamers: 302 a publicidad que planta cookie sid, luego challenge
+            // con JS redirect; seguir la cadena con reintentos.
             u.contains("modagamers") ->
                 extractTdPackedFromChallenge(u, referer, serverName, cb)
-            // Familia streamwish/filelions/vidguard: players con JS empaquetado
+            // Familia streamwish/filelions/vidguard + VidHide (morencius.com):
+            // players con JS empaquetado Dean-Edwards cuya fuente m3u8 aparece al
+            // des-empaquetar. Validado en vivo con morencius: el unpack revela
+            // links={"hls2":"https://...acek-cdn.com/hls2/.../master.m3u8?..."}.
             u.contains("wish") || u.contains("sblona") || u.contains("ahvsh") ||
                 u.contains("filelions") || u.contains("luluvdo") ||
                 u.contains("vgembed") || u.contains("vgfplay") || u.contains("vidguard") ||
-                u.contains("byse") || u.contains("asnwish") ->
+                u.contains("asnwish") || u.contains("morencius") || u.contains("vidhide") ||
+                u.contains("pixibay") || u.contains("earnvids") ->
                 extractTdPacked(u, referer, serverName, cb)
-            // v24.3: Google Drive (servidor "Drive Vip" del AJAX):
-            // transform pura de URL a la descarga directa (MP4 sin cookies).
+            // v24.3: Google Drive (servidor "Drive Vip"): transform pura de URL.
             u.contains("drive.google.com") ->
                 extractTdGoogleDrive(u, serverName, cb)
             else -> {
                 try { loadExtractor(u, referer, subtitleCallback, cb) } catch (_: Exception) {}
-                // v24.2: hosts del agregador MultiPlayer que no tienen rama propia
-                // (iplayerhls.com, tioplayer.com, filemoon.sx, dhtpre.com) son
-                // players con JS empaquetado tipo packer: mismo tratamiento que
-                // la familia streamwish (unpack + buscar hls/file/m3u8/mp4).
+                // v24.2: hosts del agregador sin rama propia (iplayerhls.com,
+                // tioplayer.com, filemoon.sx, dhtpre.com) son players con JS
+                // empaquetado: mismo tratamiento que la familia streamwish.
                 if (links == 0) extractTdPacked(u, referer, serverName, cb)
                 if (links == 0) extractTdFromPage(u, referer, serverName, cb)
             }
@@ -1066,14 +867,20 @@ class TioDonghuaProvider : MainAPI() {
         embedUrl: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
         val html = tdGetWithChallenge(embedUrl, referer) ?: return false
-        return extractTdPackedFromHtml(html, referer, serverName, callback)
+        return tdEmitFromPlayerScript(
+            try { getAndUnpack(html) } catch (_: Exception) { html }, referer, serverName, callback
+        )
     }
 
-    /** Búsqueda de fuentes de video sobre un HTML de player ya resuelto. */
-    private suspend fun extractTdPackedFromHtml(
-        html: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
+    /**
+     * Fuentes de un script de player ya des-empaquetado. En VidHide el orden es
+     * `links={"hls2":"https://.../master.m3u8"}` seguido de
+     * `sources:[{file:links.hls2}]`: el `file:` NO es una cadena, así que la
+     * fuente se toma del m3u8 directo.
+     */
+    private suspend fun tdEmitFromPlayerScript(
+        unpacked: String, referer: String, serverName: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val unpacked = try { getAndUnpack(html) } catch (_: Exception) { html }
         var found = false
         Regex("""["']?hls["']?\s*:\s*\{[^}]*?["']?(?:url|file)["']?\s*:\s*["']([^"']+)["']""")
             .find(unpacked)?.let { m ->
@@ -1085,8 +892,8 @@ class TioDonghuaProvider : MainAPI() {
             }
         }
         if (!found) {
-            Regex("""(https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)""").findAll(unpacked).forEach { m ->
-                try { generateM3u8(serverName, m.value, referer).forEach(callback); found = true } catch (_: Exception) {}
+            Regex("""(https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)""").findAll(unpacked).map { it.value }.distinct().forEach { cand ->
+                try { generateM3u8(serverName, cand, referer).forEach(callback); found = true } catch (_: Exception) {}
             }
         }
         if (!found) {
@@ -1101,10 +908,6 @@ class TioDonghuaProvider : MainAPI() {
         return found
     }
 
-    /**
-     * Dailymotion: pre-warm de cookies + API de metadata
-     * (mismo approach probado en SeriesDonghuaProvider).
-     */
     /** Dedupe de subs/videos de DM entre servers del episodio. */
     private val tdEmittedDmSubs = mutableSetOf<String>()
     private val tdEmittedDmVids = mutableSetOf<String>()
@@ -1133,7 +936,7 @@ class TioDonghuaProvider : MainAPI() {
 
     /**
      * Extractor para players con JS ofuscado tipo packer
-     * (streamwish/sblona/ahvsh/filelions/vgembed): getAndUnpack y buscar
+     * (streamwish/sblona/ahvsh/filelions/vgembed/vidhide): getAndUnpack y buscar
      * hls/file/m3u8/mp4.
      */
     private suspend fun extractTdPacked(
@@ -1143,35 +946,7 @@ class TioDonghuaProvider : MainAPI() {
             val html = app.get(embedUrl, referer = referer,
                 headers = mapOf("User-Agent" to USER_AGENT), timeout = 20L).text
             val unpacked = try { getAndUnpack(html) } catch (_: Exception) { html }
-            var found = false
-            // 1) "hls": {"url": "...m3u8..."}
-            Regex("""["']?hls["']?\s*:\s*\{[^}]*?["']?(?:url|file)["']?\s*:\s*["']([^"']+)["']""")
-                .find(unpacked)?.let { m ->
-                    try { generateM3u8(serverName, m.groupValues[1], referer).forEach(callback); found = true } catch (_: Exception) {}
-                }
-            // 2) "file": "...m3u8..."
-            if (!found) {
-                Regex("""["']file["']\s*:\s*["']([^"']+\.m3u8[^"']*)["']""").findAll(unpacked).forEach { m ->
-                    try { generateM3u8(serverName, m.groupValues[1], referer).forEach(callback); found = true } catch (_: Exception) {}
-                }
-            }
-            // 3) m3u8 directos
-            if (!found) {
-                Regex("""(https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)""").findAll(unpacked).forEach { m ->
-                    try { generateM3u8(serverName, m.value, referer).forEach(callback); found = true } catch (_: Exception) {}
-                }
-            }
-            // 4) mp4
-            if (!found) {
-                Regex("""["']?file["']?\s*:\s*["']([^"']+\.mp4[^"']*)["']""").findAll(unpacked).forEach { m ->
-                    if (CE.isJunkVideoUrl(m.groupValues[1])) return@forEach
-                    callback(newExtractorLink(source = serverName, name = serverName, url = m.groupValues[1]) {
-                        this.referer = referer; this.quality = Qualities.Unknown.value
-                    })
-                    found = true
-                }
-            }
-            found
+            tdEmitFromPlayerScript(unpacked, referer, serverName, callback)
         } catch (_: Exception) {
             false
         }

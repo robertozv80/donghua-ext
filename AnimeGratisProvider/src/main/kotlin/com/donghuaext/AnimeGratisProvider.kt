@@ -11,6 +11,7 @@ import com.donghuaext.common.CommonExtractors as CE
 import com.lagradost.cloudstream3.utils.getAndUnpack
 import java.util.*
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlin.collections.ArrayList
 
@@ -27,6 +28,11 @@ class AnimeGratisProvider : MainAPI() {
         TvType.OVA,
         TvType.AnimeMovie,
     )
+
+    companion object {
+        /** slug -> nota; 0 = "la ficha respondio y no trae nota" (no se repite el request). */
+        private val ratingCache = java.util.concurrent.ConcurrentHashMap<String, Double>()
+    }
 
     override val mainPage = mainPageOf(
         "$mainUrl/" to "Nuevos Episodios",
@@ -175,15 +181,14 @@ class AnimeGratisProvider : MainAPI() {
         val doc = app.get(url, headers = headers, timeout = 30L).document
 
         val home = when {
-            isHomePage -> {
-                parseHomePageCards(doc)
-            }
-            isDonghuaSection -> {
-                parseDonghuaCards(doc)
-            }
-            else -> {
-                parseDirectorioCards(doc)
-            }
+            // v24.16: la nota del Home no sale en su HTML (las cards apuntan al
+            // episodio, que tampoco la trae), pero aqui ya estan convertidas a
+            // ficha de serie: 1 request por card, topado a 20 y cacheado por slug.
+            // Las secciones /donghua* estan retiradas en el sitio (HTTP 410) y
+            // /directorio ya trae la nota inline en #ssr-init, asi que no piden nada.
+            isHomePage -> withRatings(parseHomePageCards(doc))
+            isDonghuaSection -> parseDonghuaCards(doc)
+            else -> parseDirectorioCards(doc)
         }
 
         val hasNext = doc.select("link[rel=\"next\"]").isNotEmpty() || doc.select("a[href*=\"page=${page + 1}\"]").isNotEmpty()
@@ -191,6 +196,37 @@ class AnimeGratisProvider : MainAPI() {
             list = HomePageList(request.name, home, isHorizontalImages = false),
             hasNext = hasNext
         )
+    }
+
+    /** Anade la nota (Score) a las cards consultando su ficha; cachea por slug. */
+    private suspend fun withRatings(items: List<SearchResponse>): List<SearchResponse> = coroutineScope {
+        val capped = items.take(20)
+        val rated = capped.map { sr ->
+            async {
+                try {
+                    val slug = sr.url.trimEnd('/').substringAfterLast('/')
+                    val rating = ratingCache[slug]
+                        ?: fetchRating(sr.url)?.also { ratingCache[slug] = it }
+                        ?: 0.0
+                    if (rating > 0.0) sr.score = Score.from10(rating)
+                } catch (_: Exception) {}
+                sr
+            }
+        }.awaitAll()
+        rated + items.drop(capped.size)
+    }
+
+    /**
+     * Nota de la ficha: el bloque "Puntuacion AnimeGratis" trae
+     * `[data-ag-rating-value]` con el numero sobre 10 ("9.0") o "—" cuando nadie
+     * ha puntuado; 0 = sin nota, null = fallo de red (eso si se reintenta).
+     */
+    private suspend fun fetchRating(seriesUrl: String): Double? = try {
+        val doc = app.get(seriesUrl, headers = headers, timeout = 15L).document
+        doc.selectFirst("[data-ag-rating-value]")?.text()?.trim()?.toDoubleOrNull()
+            ?.takeIf { it > 0.0 } ?: 0.0
+    } catch (_: Exception) {
+        null
     }
 
     private fun parseHomePageCards(doc: org.jsoup.nodes.Document): List<SearchResponse> {
@@ -278,6 +314,9 @@ class AnimeGratisProvider : MainAPI() {
                     newAnimeSearchResponse(title, href) {
                         this.posterUrl = poster
                         addDubStatus(dubstat)
+                        // v24.16: `sc` es la nota que la card muestra con su ⭐ (gratis,
+                        // viene en el JSON del listado; null en los "Proximamente").
+                        anime.sc?.takeIf { it > 0.0 }?.let { this.score = Score.from10(it) }
                     }
                 } ?: emptyList()
                 if (results.isNotEmpty()) return results
@@ -303,6 +342,15 @@ class AnimeGratisProvider : MainAPI() {
         return ""
     }
 
+    /**
+     * Nota pintada en una card del catálogo HTML: el span pegado al "⭐"
+     * (`⭐ 7.9 (217,547)`). Se usa solo en el fallback sin #ssr-init.
+     */
+    private fun org.jsoup.nodes.Element.inlineCardRating(): Double? {
+        val star = select("span").firstOrNull { it.text().trim() == "⭐" } ?: return null
+        return star.nextElementSibling()?.text()?.trim()?.toDoubleOrNull()?.takeIf { it > 0.0 }
+    }
+
     private fun parseDirectorioHtml(doc: org.jsoup.nodes.Document): List<SearchResponse> {
         val results = ArrayList<SearchResponse>()
 
@@ -324,9 +372,11 @@ class AnimeGratisProvider : MainAPI() {
                     val href = titleEl.attr("href").takeIf { it.isNotBlank() } ?: continue
                     val poster = card.selectFirst("img").bestImageUrl()
                     val dubstat = if (title.contains("Latino") || title.contains("Castellano")) DubStatus.Dubbed else DubStatus.Subbed
+                    val rating = card.inlineCardRating()
                     results.add(newAnimeSearchResponse(title, resolveUrl(href)) {
                         this.posterUrl = resolveUrl(poster)
                         addDubStatus(dubstat)
+                        if (rating != null) this.score = Score.from10(rating)
                     })
                 }
                 if (results.isNotEmpty()) return results
