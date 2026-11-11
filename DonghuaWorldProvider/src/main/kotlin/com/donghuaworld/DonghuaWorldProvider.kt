@@ -45,6 +45,10 @@ class DonghuaWorldProvider : MainAPI() {
         private const val DWW_IMAGE_TTL_MS = 10 * 60_000L
         private const val DWW_IMAGE_CACHE_MAX = 600
 
+        /** Por debajo de esto el HTML es una pagina de error del WebView
+         *  (net::ERR_NAME_NOT_RESOLVED devuelve ~50 chars), no contenido real. */
+        private const val DWW_MIN_HTML = 200
+
         // v25: CS3 corta getMainPage a los 120s y el reto de Cloudflare tarda
         // ~2min en el WebView del emulador. Cache de paginas en disco (4h) para
         // que el home abra al instante en sesiones posteriores mientras un
@@ -229,7 +233,11 @@ class DonghuaWorldProvider : MainAPI() {
         val raw = f.readText()
         val nl = raw.indexOf('\n')
         val ts = if (nl > 0) raw.substring(0, nl).toLongOrNull() ?: 0L else 0L
-        if (System.currentTimeMillis() - ts < DWW_DISK_TTL_MS) raw.substring(nl + 1) else null
+        if (System.currentTimeMillis() - ts >= DWW_DISK_TTL_MS) return null
+        // v32: un HTML vacio/de error guardado por un fallo anterior no es cache
+        // valida; si se sirve, el episodio queda sin enlaces hasta que expire.
+        val html = raw.substring(nl + 1)
+        if (html.length <= DWW_MIN_HTML || isDwwChallenge(html)) null else html
     } catch (_: Throwable) {
         null
     }
@@ -485,7 +493,7 @@ class DonghuaWorldProvider : MainAPI() {
                     fun checkPage(view: WebView) {
                         view.evaluateJavascript("document.documentElement.outerHTML") { htmlJson ->
                             val h = unjson(htmlJson)
-                            if (!h.isNullOrBlank() && !isDwwChallenge(h)) {
+                            if (!h.isNullOrBlank() && h.length > DWW_MIN_HTML && !isDwwChallenge(h)) {
                                 val ck = CookieManager.getInstance().getCookie(mainUrl) ?: ""
                                 if (ck.isNotBlank()) dwwCookies = ck
                                 html = h
@@ -566,17 +574,30 @@ class DonghuaWorldProvider : MainAPI() {
                 return h
             }
             var page: DwwPage? = null
+            var webViewWorthIt = true
             try {
                 val resp = app.get(url, headers = headers(), referer = referer, timeout = 25L)
                 if (resp.code != 403 && !isDwwChallenge(resp.text)) {
                     page = DwwPage(resp.text)
                 }
-            } catch (_: Throwable) {}
-            if (page == null) {
+            } catch (t: Throwable) {
+                // Un host que no resuelve (Dark Server caido) nunca lo arregla el
+                // WebView: sin este corte se quemaban ~2min por enlace pedido.
+                val dns = t is java.net.UnknownHostException ||
+                    (t.message ?: "").contains("Unable to resolve host", ignoreCase = true)
+                if (dns) {
+                    webViewWorthIt = false
+                    Log.w(TAG, "dwwFetch: host sin resolver para $url (${t.message})")
+                }
+            }
+            if (page == null && webViewWorthIt) {
                 Log.i(TAG, "dwwFetch: challenge Cloudflare en $url -> WebView")
                 page = dwwWebViewPage(url, collectImages)
             }
-            page?.let {
+            // Nunca se cachea una pagina vacia: un fallo del WebView quedaba en
+            // disco y durante todo el TTL el episodio volvia "enlaces no
+            // encontrados" sin reintentar la red.
+            page?.takeIf { it.html.length > DWW_MIN_HTML }?.let {
                 dwwPageCache[url] = System.currentTimeMillis() to it
                 dwwDiskSavePage(url, it.html)
             }
@@ -1184,12 +1205,14 @@ class DonghuaWorldProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val document = dwwGet(data)
+        var links = 0
+        val cb: (ExtractorLink) -> Unit = { links++; callback(it) }
         // v8: dedupe DM por episodio (el set es de instancia).
         dwEmittedDmVids.clear()
 
+        val document = dwwGet(data)
+        Log.i(TAG, "loadLinks $data html=${document.html().length}")
         val serverButtons = document.select("a[data-hash], .btn[data-hash], .server-item[data-hash]")
-        if (serverButtons.isEmpty()) return false
 
         var darkServerUrl: String? = null
         var engSubUrl: String? = null
@@ -1219,17 +1242,36 @@ class DonghuaWorldProvider : MainAPI() {
             }
         }
 
+        // v32: sin botones (documento a medias, reto de Cloudflare sin resolver o
+        // markup nuevo) el reproductor renderizado en #pembed sigue teniendo el
+        // iframe real; antes se devolvia false y la app decia "enlaces no
+        // encontrados" aunque el episodio tuviera Dailymotion.
+        if (darkServerUrl == null && engSubUrl == null) {
+            val pembed = document.select("#pembed iframe, .player-embed iframe, div.video-content iframe")
+                .map { listOf("src", "data-src").mapNotNull { a -> it.attr(a).trim().ifBlank { null } }.firstOrNull() }
+                .filterNotNull()
+            Log.w(TAG, "loadLinks: ${serverButtons.size} botones data-hash, respaldo #pembed=${pembed.size}")
+            pembed.forEach { src ->
+                if (src.contains("dailymotion", ignoreCase = true) && engSubUrl == null) engSubUrl = src
+                else if (darkServerUrl == null) darkServerUrl = src
+            }
+        }
+        Log.i(TAG, "loadLinks: dark=$darkServerUrl dm=$engSubUrl")
+
         // Priority 1: Dark Server (Rumble CDN with multi-language subtitles including Spanish)
         if (darkServerUrl != null) {
-            extractDarkServer(darkServerUrl, subtitleCallback, callback)
+            extractDarkServer(darkServerUrl, subtitleCallback, cb)
         }
 
         // Priority 2: Eng-Sub Player (Dailymotion fallback)
         if (engSubUrl != null) {
-            extractDailymotion(engSubUrl, callback)
+            extractDailymotion(engSubUrl, cb)
         }
 
-        return darkServerUrl != null || engSubUrl != null
+        // v32: el estado real son los enlaces emitidos. Devolver "encontre una
+        // URL" marcaba el episodio como resuelto sin ningun link reproducible.
+        Log.i(TAG, "loadLinks $data -> $links enlaces emitidos")
+        return links > 0
     }
 
     /**

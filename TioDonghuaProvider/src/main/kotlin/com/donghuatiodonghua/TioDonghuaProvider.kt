@@ -1,5 +1,6 @@
 package com.donghuatiodonghua
 
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
@@ -7,16 +8,20 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.getAndUnpack
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 import com.donghuaext.common.CommonExtractors as CE
+
+private const val TAG = "TioDonghua"
 
 /** UA de navegador (necesario para varios hosts). */
 const val TD_USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 
 /**
- * API del sitio nuevo. tiodonghua.lat abandonó WordPress/Dooplay y ahora es
- * Next.js (App Router) sobre un backend Laravel expuesto en esta ruta. No pide
- * auth y responde JSON envuelto en {"data": ...}.
+ * API del sitio nuevo (backend Laravel del player). Quedó como RESPALDO: desde
+ * la app el reto de Cloudflare la bloquea y por eso las secciones que la usaban
+ * salían vacías. Todo lo principal se lee del HTML SSR de tiodonghua.lat.
  */
 private const val TD_API = "https://tioplayer.cloudlatino.com/api/v1"
 
@@ -37,8 +42,26 @@ private fun tdJsonVal(json: String, key: String): String? {
     while (i < json.length && json[i].isWhitespace()) i++
     if (i >= json.length) return null
     return when (val c = json[i]) {
-        '"', '{', '[' -> {
-            val close = if (c == '"') '"' else if (c == '{') '}' else ']'
+        // Cadena: se barre hasta la comilla de cierre sin escapar. No se puede
+        // reutilizar el balanceo de llaves de abajo porque allí la rama '"'
+        // (entrar en cadena) sombrearía el cierre cuando c=='"', y depth nunca
+        // avanzaría -> devolvería null para TODO valor de texto (p.ej. embed_url).
+        '"' -> {
+            var j = i + 1
+            var esc = false
+            while (j < json.length) {
+                val ch = json[j]
+                when {
+                    esc -> esc = false
+                    ch == '\\' -> esc = true
+                    ch == '"' -> return json.substring(i, j + 1)
+                }
+                j++
+            }
+            null
+        }
+        '{', '[' -> {
+            val close = if (c == '{') '}' else ']'
             var depth = 0
             var j = i
             var inStr = false
@@ -110,6 +133,49 @@ private fun tdJsonObjs(json: String, key: String): List<String> {
 
 private fun tdGenres(obj: String): List<String> =
     tdJsonObjs(obj, "genres").mapNotNull { tdJsonStr(it, "name") }.filter { it.isNotBlank() }
+
+/**
+ * Vuelo de Next.js: concatena los `self.__next_f.push([1,"…"])` y des-escapa las
+ * comillas para poder aplicar los lectores de JSON de arriba. La página del
+ * reproductor trae ahí el episodio completo (serie, temporada, sources,
+ * downloads) que el SSR no pinta en el DOM.
+ */
+private fun tdFlight(html: String): String {
+    if (!html.contains("__next_f")) return ""
+    // Escáner manual en vez de `Regex("(?:[^\"\\\\]|\\\\.)*")`: esa alternancia
+    // repetida recursiona por cada carácter y revienta la pila de la JVM
+    // (StackOverflowError) con vuelos largos, dejando el episodio sin sources.
+    val open = "self.__next_f.push([1,\""
+    val close = "\"])"
+    val sb = StringBuilder()
+    var idx = 0
+    while (true) {
+        val s = html.indexOf(open, idx)
+        if (s < 0) break
+        val start = s + open.length
+        var j = start
+        var esc = false
+        while (j < html.length) {
+            val ch = html[j]
+            if (esc) esc = false
+            else if (ch == '\\') esc = true
+            else if (ch == '"' && html.startsWith(close, j)) break
+            j++
+        }
+        sb.append(html, start, minOf(j, html.length)).append('\n')
+        idx = j + close.length
+    }
+    return sb.toString()
+        .replace("\\\"", "\"")
+        .replace("\\/", "/")
+        .replace("\\n", "\n")
+        .replace("\\u0026", "&")
+}
+
+/** Objeto JSON-LD `TVSeries` de la ficha (name, description, image, genre, aggregateRating). */
+private fun tdLdJson(doc: Document): String =
+    doc.select("script[type=application/ld+json]").mapNotNull { it.data().trim().ifBlank { null } }
+        .firstOrNull { it.contains("TVSeries") || it.contains("aggregateRating") } ?: ""
 
 /**
  * Extractor de Ok.Ru (odnoklassniki). La página del embed trae el
@@ -266,25 +332,33 @@ private suspend fun extractTdStreamTape(embedUrl: String, referer: String, name:
 }
 
 /**
- * TioDonghua (https://tiodonghua.lat/) — v29: reescrito sobre el sitio nuevo.
+ * TioDonghua (https://tiodonghua.lat/) — v30: HTML-first.
  *
- * El sitio dejó WordPress/Dooplay: ahora es Next.js App Router con Tailwind y
- * un backend Laravel en [TD_API]. Los selectores viejos (article.item,
- * ul.episodios, admin-ajax doo_player_ajax) ya no matcheaban NADA, por eso la
- * provider quedaba vacía en la app.
+ * El sitio dejó WordPress/Dooplay: ahora es Next.js App Router con Tailwind y un
+ * backend Laravel en [TD_API]. En la app el host del API
+ * (tioplayer.cloudlatino.com) rechaza OkHttp por el reto de Cloudflare, así que
+ * TODO se lee del HTML que el propio sitio renderiza en servidor; el API queda
+ * solo como respaldo. Síntomas que corregía esto: tres de las cuatro secciones
+ * del home vacías, búsqueda sin resultados y cada episodio abriendo una "serie"
+ * sintetizada de un capítulo en vez de su ficha real.
  *
- * Rutas verificadas en vivo (2026-11):
- * - /donghua/{slug}  ficha        -> TD_API/donghuas/{slug}
- * - /ver/{episodeId} reproductor  -> TD_API/episodes/{episodeId}
- * - /explorar?status=&sort=&q=    -> TD_API/donghuas?status=&sort=&q=
- * El API de catálogo NO expone los últimos episodios, así que esa sección se
- * sigue leyendo del HTML del home (renderizado en servidor).
+ * Fuentes verificadas en vivo (2026-11):
+ * - /                    home: cards `a[href^=/ver/]` de últimos episodios.
+ * - /explorar?sort=&status=&q=  cards `a[href^=/donghua/]` con nota, estado,
+ *   año, póster y género. El catálogo completo (23 títulos) entra en una sola
+ *   página: el SSR no genera paginación.
+ * - /donghua/{slug}      ficha: JSON-LD TVSeries (name, description, image,
+ *   genre[], aggregateRating.ratingValue) + temporadas/episodios como
+ *   `a[href^=/ver/]` agrupados bajo un span "Temporada N".
+ * - /ver/{episodeId}     reproductor: el vuelo de Next (`self.__next_f.push`)
+ *   trae `"episode":{... "serie":{"slug":...}, "sources":[{"server":{"name":...},
+ *   "embed_url":...}], "downloads":[...]}`.
  *
- * LIMITACIÓN del sitio (no del plugin): la ficha solo publica los episodios más
- * recientes de cada temporada (p. ej. Swallowed Star entrega 241-248). Se
- * probaron per_page/limit/page/all=1 y las rutas alternativas
- * /donghuas/{slug}/episodes y /episodes?serie_slug=; el tope está del lado del
- * servidor y el HTML de la ficha expone exactamente los mismos episodios.
+ * LIMITACIÓN del sitio (no del plugin): cada ficha solo publica los episodios
+ * que el backend tiene cargados (Swallowed Star entrega 241-248 de 248;
+ * `numberOfEpisodes` del JSON-LD coincide con los que se listan). Se probaron
+ * per_page/limit/page/all=1 y las rutas /donghuas/{slug}/episodes y
+ * /episodes?serie_slug=; el tope está del lado del servidor.
  */
 class TioDonghuaProvider : MainAPI() {
 
@@ -300,13 +374,13 @@ class TioDonghuaProvider : MainAPI() {
         TvType.AnimeMovie,
     )
 
-    // Secciones pedidas (2026-11). Las tres últimas usan los mismos filtros que
-    // /explorar en el navegador, resueltos directo contra el API.
+    // Secciones pedidas (2026-11). Apuntan a las MISMAS rutas que usa el sitio en
+    // el navegador y se leen del HTML SSR (el API lo bloquea Cloudflare en la app).
     override val mainPage = mainPageOf(
         "$mainUrl/##episodios" to "Últimos Episodios",
-        "$TD_API/donghuas?sort=popular" to "Top Más Vistos",
-        "$TD_API/donghuas?status=ongoing&sort=rating" to "En Emisión",
-        "$TD_API/donghuas?sort=rating" to "Catálogo de Donghuas",
+        "$mainUrl/explorar?sort=popular" to "Top Más Vistos",
+        "$mainUrl/explorar?status=ongoing&sort=rating" to "En Emisión",
+        "$mainUrl/explorar?sort=rating" to "Catálogo de Donghuas",
     )
 
     private val pageHeaders = mapOf(
@@ -333,9 +407,22 @@ class TioDonghuaProvider : MainAPI() {
         .replace(Regex("\\p{Mn}+"), "")
         .replace(Regex("[^a-z0-9]+"), " ").trim()
 
+    /** HTML SSR de una página del sitio. Nunca lanza: devuelve null y lo registra. */
+    private suspend fun tdHtml(url: String): Document? = try {
+        val res = app.get(url, headers = pageHeaders, timeout = 30L)
+        val doc = res.document
+        Log.i(TAG, "tdHtml ${res.code} $url len=${doc.html().length}")
+        doc
+    } catch (e: Exception) {
+        Log.w(TAG, "tdHtml FALLO $url: ${e.message}")
+        null
+    }
+
     private suspend fun apiGet(url: String): String? = try {
-        app.get(url, headers = pageHeaders, timeout = 30L).text
-    } catch (_: Exception) {
+        app.get(url, headers = pageHeaders, timeout = 20L).text
+    } catch (e: Exception) {
+        // Esperado en la app: Cloudflare rechaza OkHttp en el host del API.
+        Log.w(TAG, "apiGet FALLO $url: ${e.message}")
         null
     }
 
@@ -363,18 +450,63 @@ class TioDonghuaProvider : MainAPI() {
 
     // ========== getMainPage ==========
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // "Últimos Episodios" sale del HTML del home (el API no expone la lista).
-        if (request.data.endsWith("##episodios")) {
-            val items = if (page > 1) emptyList() else lastEpisodesFromHome()
-            return newHomePageResponse(HomePageList(request.name, items), hasNext = false)
-        }
+        // El SSR de /explorar ya entrega el catálogo completo (23 títulos) y no
+        // genera paginación, así que page > 1 siempre vuelve vacío.
         if (page > 1) {
-            // El catálogo completo cabe en una página: last_page=1 verificado en
-            // vivo para sort=rating|popular y el filtro status=ongoing.
             return newHomePageResponse(HomePageList(request.name, emptyList()), hasNext = false)
         }
-        val items = apiItems(apiGet(request.data) ?: "").mapNotNull { apiCard(it) }
+        val items = if (request.data.endsWith("##episodios")) lastEpisodesFromHome()
+        else exploreCards(request.data)
+        Log.i(TAG, "getMainPage '${request.name}' (${request.data}) -> ${items.size} items")
         return newHomePageResponse(HomePageList(request.name, items.distinctBy { it.url }), hasNext = false)
+    }
+
+    /**
+     * Cards de /explorar (y de la búsqueda): `a[href^=/donghua/]` con `<h3>`
+     * título, `<img>` póster, un `<span>` con la nota y otro con el año.
+     */
+    private suspend fun exploreCards(url: String): List<SearchResponse> {
+        val cards = (tdHtml(url)?.select("a[href^=/donghua/]") ?: emptyList()).mapNotNull { tdCard(it) }
+        if (cards.isEmpty()) {
+            Log.w(TAG, "exploreCards: 0 cards en $url -> respaldo con el API")
+            return apiFallbackCards(url)
+        }
+        return cards
+    }
+
+    /**
+     * Respaldo del explorador: los parámetros de /explorar (sort, status, q) son
+     * los mismos que acepta el API, así que se reutiliza la query tal cual.
+     */
+    private suspend fun apiFallbackCards(siteUrl: String): List<SearchResponse> {
+        val query = siteUrl.substringAfter('?', "").substringBefore("##")
+        val json = apiGet("$TD_API/donghuas${if (query.isBlank()) "" else "?$query"}") ?: return emptyList()
+        return apiItems(json).mapNotNull { apiCard(it) }
+    }
+
+    /** Nota (escala 10) de una card: primer span con forma "8.5" / "8,5". */
+    private fun tdCardRating(a: Element): Double? =
+        a.select("span").mapNotNull { s ->
+            Regex("""^\d{1,2}[.,]\d$""").find(s.text().trim())?.value?.replace(',', '.')?.toDoubleOrNull()
+        }.firstOrNull()
+
+    private fun tdCard(a: Element): SearchResponse? {
+        val slug = a.attr("href").substringAfter("/donghua/").substringBefore('?').trim('/')
+        if (slug.isBlank()) return null
+        val title = tdCleanTitle(
+            a.selectFirst("h3")?.text()?.trim()?.ifBlank { null }
+                ?: a.selectFirst("img")?.attr("alt")?.trim().orEmpty()
+        )
+        if (title.isBlank()) return null
+        val rating = tdCardRating(a)
+        val year = Regex("""\b(?:19|20)\d\d\b""").find(a.text())?.value?.toIntOrNull()
+        return newAnimeSearchResponse(title, "$mainUrl/donghua/$slug") {
+            this.posterUrl = a.selectFirst("img")?.attr("src") ?: ""
+            year?.let { this.year = it }
+            if (rating != null && rating > 0.0) {
+                try { Score.from10(rating.toString())?.let { this.score = it } } catch (_: Exception) {}
+            }
+        }
     }
 
     /**
@@ -384,44 +516,40 @@ class TioDonghuaProvider : MainAPI() {
      * tipo "X 10 Episodio 45 Sub Español", por eso se prefiere el h4).
      */
     private suspend fun lastEpisodesFromHome(): List<SearchResponse> {
-        return try {
-            val ratings = apiRatingsByTitle()
-            val doc = app.get("$mainUrl/", headers = pageHeaders, timeout = 30L).document
-            doc.select("a[href^=/ver/]").mapNotNull { a ->
-                val epId = Regex("/ver/(\\d+)").find(a.attr("href"))?.groupValues?.get(1) ?: return@mapNotNull null
-                val img = a.selectFirst("img")
-                val alt = img?.attr("alt")?.trim() ?: ""
-                val serie = a.selectFirst("h4")?.text()?.trim().orEmpty()
-                val title = tdCleanTitle(serie.ifBlank { alt.substringBeforeLast(" - Ep") })
-                if (title.isBlank()) return@mapNotNull null
-                val badge = a.selectFirst("div.absolute")?.text().orEmpty()
-                val epNum = Regex("(?i)Cap[íi]tulo\\s*(\\d+)").find(badge)?.groupValues?.get(1)?.toIntOrNull()
-                    ?: Regex("(?i)[- ]Ep(?:isodio)?\\s*(\\d+)").find(alt)?.groupValues?.get(1)?.toIntOrNull()
-                newAnimeSearchResponse(title, "$mainUrl/ver/$epId") {
-                    this.posterUrl = img?.attr("src") ?: ""
-                    // La card del home es un EPISODIO y su HTML no trae nota; se toma
-                    // del catálogo del API, que llega completo en una sola petición.
-                    val r = ratings[tdNormalize(title)]
-                    if (r != null) {
-                        try { Score.from10(r.toString())?.let { this.score = it } } catch (_: Exception) {}
-                    }
-                    addDubStatus(DubStatus.Subbed, epNum)
+        val doc = tdHtml("$mainUrl/") ?: return emptyList()
+        val ratings = tdRatingsByTitle()
+        return doc.select("a[href^=/ver/]").mapNotNull { a ->
+            val epId = Regex("/ver/(\\d+)").find(a.attr("href"))?.groupValues?.get(1) ?: return@mapNotNull null
+            val img = a.selectFirst("img")
+            val alt = img?.attr("alt")?.trim() ?: ""
+            val serie = a.selectFirst("h4")?.text()?.trim().orEmpty()
+            val title = tdCleanTitle(serie.ifBlank { alt.substringBeforeLast(" - Ep") })
+            if (title.isBlank()) return@mapNotNull null
+            val badge = a.selectFirst("div.absolute")?.text().orEmpty()
+            val epNum = Regex("(?i)Cap[íi]tulo\\s*(\\d+)").find(badge)?.groupValues?.get(1)?.toIntOrNull()
+                ?: Regex("(?i)[- ]Ep(?:isodio)?\\s*(\\d+)").find(alt)?.groupValues?.get(1)?.toIntOrNull()
+            newAnimeSearchResponse(title, "$mainUrl/ver/$epId") {
+                this.posterUrl = img?.attr("src") ?: ""
+                // La card del home es un EPISODIO y su HTML no trae nota; se toma
+                // del catálogo SSR, que llega completo en una sola petición.
+                val r = ratings[tdNormalize(title)]
+                if (r != null) {
+                    try { Score.from10(r.toString())?.let { this.score = it } } catch (_: Exception) {}
                 }
-            }.distinctBy { it.url }
-        } catch (_: Exception) {
-            emptyList()
-        }
+                addDubStatus(DubStatus.Subbed, epNum)
+            }
+        }.distinctBy { it.url }
     }
 
-    /** título normalizado -> rating, según el catálogo del API (cacheado 1 h). */
-    private suspend fun apiRatingsByTitle(): Map<String, Double> {
+    /** título normalizado -> nota, leído del catálogo SSR (cacheado 1 h). */
+    private suspend fun tdRatingsByTitle(): Map<String, Double> {
         val now = System.currentTimeMillis()
         tdRatingsCache.second.takeIf { now - tdRatingsCache.first < TD_RATINGS_TTL_MS }?.let { return it }
-        val json = apiGet("$TD_API/donghuas?sort=rating") ?: return emptyMap()
-        val map = apiItems(json).mapNotNull { item ->
-            val t = tdJsonStr(item, "title") ?: return@mapNotNull null
-            val r = tdJsonDbl(item, "rating") ?: return@mapNotNull null
-            tdNormalize(tdCleanTitle(t)) to r
+        val anchors = tdHtml("$mainUrl/explorar?sort=rating")?.select("a[href^=/donghua/]") ?: emptyList()
+        val map = anchors.mapNotNull { a ->
+            val t = tdCleanTitle(a.selectFirst("h3")?.text()?.trim().orEmpty())
+            val r = tdCardRating(a)
+            if (t.isBlank() || r == null) null else tdNormalize(t) to r
         }.toMap()
         if (map.isNotEmpty()) tdRatingsCache = now to map
         return map
@@ -430,80 +558,132 @@ class TioDonghuaProvider : MainAPI() {
     // ========== search ==========
     override suspend fun search(query: String): List<SearchResponse> {
         val q = java.net.URLEncoder.encode(query.trim(), "UTF-8")
-        return apiItems(apiGet("$TD_API/donghuas?q=$q&sort=rating") ?: "")
-            .mapNotNull { apiCard(it) }.distinctBy { it.url }.take(30)
+        val results = exploreCards("$mainUrl/explorar?q=$q").distinctBy { it.url }.take(30)
+        Log.i(TAG, "search '$query' -> ${results.size} resultados")
+        return results
     }
 
     // ========== load ==========
     override suspend fun load(url: String): LoadResponse {
         val epId = Regex("/ver/(\\d+)").find(url)?.groupValues?.get(1)
-        if (epId != null) {
-            val json = apiGet("$TD_API/episodes/$epId") ?: ""
-            // "slug" aparece primero dentro de serie{} (el episodio no tiene
-            // slug propio; embed_slug usa otra clave).
-            val serieSlug = tdJsonStr(json, "slug")
-            if (!serieSlug.isNullOrBlank()) return loadSerie(serieSlug)
-            // Sin ficha localizable: serie sintetizada de un episodio para que
-            // el usuario pueda reproducir el enlace que abrió.
-            return singleEpisodeResponse(url, epId, json)
+        if (epId == null) {
+            val slug = url.trimEnd('/').substringAfter("/donghua/").substringBefore('/').trim()
+            return loadSerie(slug.ifBlank { url.trimEnd('/').substringAfterLast('/') })
         }
-        val slug = url.trimEnd('/').substringAfter("/donghua/").substringBefore('/').trim()
-        return loadSerie(slug.ifBlank { url.trimEnd('/').substringAfterLast('/') })
+        // Las cards del home apuntan al reproductor (/ver/{id}), no a la ficha: hay
+        // que resolver a qué serie pertenece el episodio y abrir SU ficha. Antes se
+        // sintetizaba una serie de un solo capítulo y por eso entrar a cualquier
+        // episodio "no llevaba a la serie correspondiente".
+        val epUrl = "$mainUrl/ver/$epId"
+        val doc = tdHtml(epUrl)
+        val ep = tdJsonVal(tdFlight(doc?.html().orEmpty()), "episode").orEmpty()
+        val serieSlug = tdJsonStr(tdJsonVal(ep, "serie").orEmpty(), "slug")?.takeIf { it.isNotBlank() }
+            ?: doc?.select("a[href^=/donghua/]")?.mapNotNull {
+                it.attr("href").substringAfter("/donghua/").substringBefore('?').trim('/').ifBlank { null }
+            }?.firstOrNull()
+        Log.i(TAG, "load $epUrl -> serie='$serieSlug'")
+        if (!serieSlug.isNullOrBlank()) return loadSerie(serieSlug)
+        return singleEpisodeResponse(epUrl, epId, ep)
     }
 
-    private suspend fun singleEpisodeResponse(url: String, epId: String, json: String): LoadResponse {
-        val serieTitle = tdCleanTitle(tdJsonStr(json, "title") ?: "Episodio $epId")
-        val poster = tdJsonStr(json, "thumbnail_url") ?: ""
-        return newAnimeLoadResponse(serieTitle, url, TvType.Anime) {
+    /** Último recurso: el episodio suelto cuando no se pudo resolver su serie. */
+    private suspend fun singleEpisodeResponse(url: String, epId: String, ep: String): LoadResponse {
+        val serie = tdJsonVal(ep, "serie").orEmpty()
+        val serieTitle = tdCleanTitle(tdJsonStr(serie, "title") ?: tdJsonStr(ep, "title") ?: "Episodio $epId")
+        val poster = tdJsonStr(serie, "poster_url") ?: tdJsonStr(ep, "thumbnail_url") ?: ""
+        val seasonNum = tdJsonInt(tdJsonVal(ep, "season").orEmpty(), "season_number")
+        return newAnimeLoadResponse(serieTitle.ifBlank { "Episodio $epId" }, url, TvType.Anime) {
             posterUrl = poster
             addEpisodes(DubStatus.Subbed, listOf(newEpisode(url) {
-                this.episode = tdJsonInt(json, "episode_number")
+                this.episode = tdJsonInt(ep, "episode_number")
+                this.season = seasonNum
             }))
         }
     }
 
-    /** Ficha completa desde el API: episodios por temporada, rating, géneros. */
-    private suspend fun loadSerie(slug: String): LoadResponse {
-        val json = apiGet("$TD_API/donghuas/$slug") ?: ""
-        val data = tdJsonVal(json, "data") ?: json
-        val title = tdCleanTitle(tdJsonStr(data, "title") ?: slug.replace("-", " ").trim())
-        val seriesUrl = "$mainUrl/donghua/$slug"
-        val poster = tdJsonStr(data, "poster_url") ?: ""
-        val synopsis = tdJsonStr(data, "synopsis") ?: ""
-        val releaseYear = tdJsonInt(data, "release_year")
-        val genres = tdGenres(data)
-        val originalTitle = tdJsonStr(data, "original_title")?.takeIf { it.isNotBlank() }
-        val showStatus = when (tdJsonStr(data, "broadcast_status")?.lowercase()) {
-            "completed" -> ShowStatus.Completed
-            "ongoing" -> ShowStatus.Ongoing
-            else -> null
+    /**
+     * Temporada de una card de episodio: los capítulos viven en un grid hermano
+     * del encabezado `<span>Temporada N</span>`, así que se sube hasta el
+     * contenedor que tiene exactamente un encabezado de temporada.
+     */
+    private fun tdSeasonOf(a: Element): Int? {
+        var p: Element? = a.parent()
+        var hops = 0
+        while (p != null && hops++ < 5) {
+            val headers = p.select("span, div, h3, h4").mapNotNull { el ->
+                Regex("""(?i)^Temporada\s*(\d+)$""").find(el.ownText().trim())?.groupValues?.get(1)?.toIntOrNull()
+            }.distinct()
+            if (headers.size == 1) return headers[0]
+            if (headers.size > 1) return null   // subimos de más: varias temporadas
+            p = p.parent()
         }
-        val score = tdJsonDbl(data, "rating")?.takeIf { it > 0.0 }?.let {
+        return null
+    }
+
+    /** Ficha completa desde el HTML SSR: JSON-LD TVSeries + episodios del DOM. */
+    private suspend fun loadSerie(slug: String): LoadResponse {
+        val seriesUrl = "$mainUrl/donghua/$slug"
+        val doc = tdHtml(seriesUrl) ?: return loadSerieFromApi(slug)
+        val ld = tdLdJson(doc)
+
+        val title = tdCleanTitle(
+            tdJsonStr(ld, "name") ?: doc.selectFirst("h1")?.text()?.trim().orEmpty()
+        ).ifBlank { slug.replace("-", " ").trim() }
+        val poster = tdJsonStr(ld, "image")
+            ?: doc.select("meta[property=og:image]").map { it.attr("content") }
+                .lastOrNull { it.isNotBlank() }.orEmpty()
+        val synopsis = (tdJsonStr(ld, "description") ?: "").replace("\r\n", "\n").trim()
+        val genres = doc.select("a[href^=/explorar?genre=]").map { it.text().trim() }
+            .filter { it.isNotBlank() }.distinct()
+        val rating = tdJsonStr(ld, "ratingValue")?.toDoubleOrNull() ?: tdJsonDbl(ld, "ratingValue")
+        val score = rating?.takeIf { it > 0.0 }?.let {
             try { Score.from10(it.toString()) } catch (_: Exception) { null }
         }
 
+        // El año va en un <span> junto al icono de calendario del hero; el del
+        // pie (© 2026) queda fuera del tramo h1.."Sinopsis" que se usa de respaldo.
+        val h1 = doc.selectFirst("h1")
+        val releaseYear = doc.select("svg.lucide-calendar").mapNotNull { svg ->
+            Regex("""\b(?:19|20)\d\d\b""").find(svg.parent()?.text().orEmpty())?.value?.toIntOrNull()
+        }.firstOrNull() ?: run {
+            val html = doc.html()
+            val from = html.indexOf("<h1")
+            val to = html.indexOf("Sinopsis", if (from >= 0) from else 0)
+            val segment = if (from >= 0 && to > from) html.substring(from, to) else ""
+            Regex("""\b(?:19|20)\d\d\b""").find(segment)?.value?.toIntOrNull()
+        }
+        // Badges del hero (hermano anterior del h1): "★ TOP 3", "En Emisión", "donghua".
+        val badges = h1?.previousElementSibling()?.text().orEmpty()
+        val showStatus = when {
+            badges.contains("emisi", true) -> ShowStatus.Ongoing
+            badges.contains("finaliz", true) || badges.contains("complet", true) -> ShowStatus.Completed
+            else -> null
+        }
+        val originalTitle = Regex("""[\u4E00-\u9FFF]{2,}""").find(h1?.parent()?.text().orEmpty())?.value
+
         val episodes = ArrayList<Episode>()
         val seen = HashSet<String>()
-        for (season in tdJsonObjs(data, "seasons")) {
-            val seasonNum = tdJsonInt(season, "season_number")
-            for (ep in tdJsonObjs(season, "episodes")) {
-                val epId = tdJsonStr(ep, "id") ?: continue
-                if (!seen.add(epId)) continue
-                // name se deja null: el título del API ("X 10 Episodio 45 Sub
-                // Español") repite la serie y el sufijo; con season+episode
-                // CloudStream renderiza "Episodio N" y agrupa por temporada.
-                episodes.add(newEpisode("$mainUrl/ver/$epId") {
-                    this.episode = tdJsonInt(ep, "episode_number")
-                    this.season = seasonNum
-                })
-            }
+        for (a in doc.select("a[href^=/ver/]")) {
+            val epId = Regex("/ver/(\\d+)").find(a.attr("href"))?.groupValues?.get(1) ?: continue
+            // Sin "Capítulo N" es el botón "Empezar a Ver (Ep 1)" del hero, que
+            // duplica la URL del primer capítulo disponible.
+            val epNum = Regex("""(?i)Cap[íi]tulo\s*(\d+)""").find(a.text())?.groupValues?.get(1)?.toIntOrNull()
+                ?: continue
+            if (!seen.add(epId)) continue
+            // name se deja null: la etiqueta del sitio ("Renegade Immortal
+            // Episodio 166 Sub Español") repite la serie y el sufijo; con
+            // season+episode CloudStream renderiza "Episodio N" y agrupa.
+            val seasonNum = tdSeasonOf(a)
+            episodes.add(newEpisode("$mainUrl/ver/$epId") {
+                this.episode = epNum
+                this.season = seasonNum
+            })
         }
         episodes.sortWith(compareBy({ it.season ?: 1 }, { it.episode ?: 0 }))
+        Log.i(TAG, "loadSerie $slug: ${episodes.size} episodios, rating=$rating, generos=${genres.size}")
 
-        val recs = apiItems(apiGet("$TD_API/donghuas?sort=popular") ?: "")
-            .filter { tdJsonStr(it, "slug") != slug }
-            .mapNotNull { apiCard(it) }
-            .take(12)
+        val recs = exploreCards("$mainUrl/explorar?sort=popular")
+            .filter { it.url != seriesUrl }.take(12)
 
         return newAnimeLoadResponse(title, seriesUrl, TvType.Anime) {
             posterUrl = poster
@@ -519,6 +699,53 @@ class TioDonghuaProvider : MainAPI() {
         }
     }
 
+    /** Respaldo de la ficha si el HTML del sitio no responde (host distinto al API). */
+    private suspend fun loadSerieFromApi(slug: String): LoadResponse {
+        val json = apiGet("$TD_API/donghuas/$slug") ?: ""
+        val data = tdJsonVal(json, "data") ?: json
+        val title = tdCleanTitle(tdJsonStr(data, "title") ?: slug.replace("-", " ").trim())
+        val seriesUrl = "$mainUrl/donghua/$slug"
+        val episodes = ArrayList<Episode>()
+        val seen = HashSet<String>()
+        for (season in tdJsonObjs(data, "seasons")) {
+            val seasonNum = tdJsonInt(season, "season_number")
+            for (ep in tdJsonObjs(season, "episodes")) {
+                val epId = tdJsonStr(ep, "id") ?: continue
+                if (!seen.add(epId)) continue
+                episodes.add(newEpisode("$mainUrl/ver/$epId") {
+                    this.episode = tdJsonInt(ep, "episode_number")
+                    this.season = seasonNum
+                })
+            }
+        }
+        episodes.sortWith(compareBy({ it.season ?: 1 }, { it.episode ?: 0 }))
+        val synopsis = tdJsonStr(data, "synopsis") ?: ""
+        val genres = tdGenres(data)
+        val releaseYear = tdJsonInt(data, "release_year")
+        val score = tdJsonDbl(data, "rating")?.takeIf { it > 0.0 }?.let {
+            try { Score.from10(it.toString()) } catch (_: Exception) { null }
+        }
+        val showStatus = when (tdJsonStr(data, "broadcast_status")?.lowercase()) {
+            "completed" -> ShowStatus.Completed
+            "ongoing" -> ShowStatus.Ongoing
+            else -> null
+        }
+        val originalTitle = tdJsonStr(data, "original_title")?.takeIf { it.isNotBlank() }
+        Log.i(TAG, "loadSerieFromApi $slug: ${episodes.size} episodios")
+
+        return newAnimeLoadResponse(title, seriesUrl, TvType.Anime) {
+            posterUrl = tdJsonStr(data, "poster_url") ?: ""
+            if (synopsis.isNotBlank()) plot = synopsis
+            if (genres.isNotEmpty()) tags = genres
+            releaseYear?.let { this.year = it }
+            score?.let { this.score = it }
+            showStatus?.let { this.showStatus = it }
+            originalTitle?.let { this.synonyms = listOf(it) }
+            if (episodes.isEmpty()) addEpisodes(DubStatus.Subbed, listOf(newEpisode(seriesUrl)))
+            else addEpisodes(DubStatus.Subbed, episodes)
+        }
+    }
+
     // ========== loadLinks ==========
     override suspend fun loadLinks(
         data: String, isCasting: Boolean,
@@ -531,7 +758,12 @@ class TioDonghuaProvider : MainAPI() {
         tdEmittedDmSubs.clear()
 
         val epId = Regex("/ver/(\\d+)").find(data)?.groupValues?.get(1)
-        val json = if (epId != null) apiGet("$TD_API/episodes/$epId") ?: "" else ""
+        val epUrl = if (epId != null) "$mainUrl/ver/$epId" else data
+        // Los servidores NO están en el DOM: viajan en el vuelo de Next de la
+        // página del reproductor. El API queda solo de respaldo.
+        val doc = tdHtml(epUrl)
+        val ep = tdJsonVal(tdFlight(doc?.html().orEmpty()), "episode").orEmpty()
+        val json = ep.ifBlank { if (epId != null) apiGet("$TD_API/episodes/$epId").orEmpty() else "" }
 
         val servers = ArrayList<Pair<String, String>>()
         for (src in tdJsonObjs(json, "sources")) {
@@ -540,6 +772,8 @@ class TioDonghuaProvider : MainAPI() {
                 ?: serverLabelFromUrl(embed)
             servers.add(embed to label)
         }
+        Log.i(TAG, "loadLinks $epUrl: vuelo=${ep.length} sources=${servers.size} " +
+            "[${servers.joinToString(",") { it.second }}]")
         // v24.13: los servidores vivos primero para que la reproducción por
         // defecto caiga en uno que responde (auditoría en tdServerPriority).
         for ((embed, label) in servers.sortedByDescending { tdServerPriority(it.first) }.distinctBy { it.first }) {
@@ -558,7 +792,6 @@ class TioDonghuaProvider : MainAPI() {
 
         // Fallback 2: iframes / m3u8 servidos en la propia página del episodio.
         if (links == 0) {
-            val doc = try { app.get(data, headers = pageHeaders, timeout = 30L).document } catch (_: Exception) { null }
             doc?.select("iframe")?.forEach { iframe ->
                 val raw = listOf("src", "data-src").map { iframe.attr(it).trim() }.firstOrNull { it.isNotBlank() }
                     ?: return@forEach
@@ -566,12 +799,13 @@ class TioDonghuaProvider : MainAPI() {
                 if (src.startsWith("http")) processTdEmbed(src, data, serverLabelFromUrl(src), subtitleCallback, cb)
             }
             if (links == 0) {
-                for (m in Regex("""(https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)""").findAll(doc?.html() ?: "")) {
+                for (m in Regex("""(https?://[^"'\s<>]+\.m3u8[^"'\s<>]*)""").findAll(doc?.html().orEmpty())) {
                     try { generateM3u8("Server", m.value, data).forEach(cb) } catch (_: Exception) {}
                     if (links > 0) break
                 }
             }
         }
+        Log.i(TAG, "loadLinks $epUrl -> $links enlaces emitidos")
         return links > 0
     }
 

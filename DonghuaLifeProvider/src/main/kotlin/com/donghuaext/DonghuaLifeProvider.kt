@@ -2290,7 +2290,10 @@ class DonghuaLifeProvider : MainAPI() {
         serverName: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val marker = """m.f["$vkey"]="""
+        // v20: el nombre de la variable del bloque cambia entre builds del player
+        // de Rumble (m.f[...] un dia, p.f[...] al siguiente), asi que el marcador
+        // omite la variable y solo ancla en `.f["<vkey>"]=`.
+        val marker = """.f["$vkey"]="""
         // 1) okhttp (via rapida; funciona desde IP no bloqueada)
         try {
             val resp = app.get(embedUrl, headers = mapOf("User-Agent" to browserUA), timeout = 20L)
@@ -2298,9 +2301,11 @@ class DonghuaLifeProvider : MainAPI() {
             Log.i(TAG, "extractRumble v20: embedPage(okhttp) vkey=$vkey httpCode=${resp.code} len=${html.length}")
             if (resp.code == 200 && html.contains(marker)) {
                 if (extractRumbleDataBlock(html, vkey, serverName, callback)) {
-                    Log.i(TAG, "extractRumble v20: SUCCESS via okhttp embed-page m.f[] for $vkey")
+                    Log.i(TAG, "extractRumble v20: SUCCESS via okhttp embed-page .f[] for $vkey")
                     return true
                 }
+            } else {
+                Log.i(TAG, "extractRumble v20: okhttp embedPage sin marcador .f[$vkey] (code=${resp.code})")
             }
         } catch (e: Exception) {
             Log.w(TAG, "extractRumble v20: okhttp embedPage failed: ${e.message}")
@@ -2313,10 +2318,10 @@ class DonghuaLifeProvider : MainAPI() {
             if (webHtml != null) {
                 Log.i(TAG, "extractRumble v20: WebView HTML len=${webHtml.length} markerFound=${webHtml.contains(marker)}")
                 if (extractRumbleDataBlock(webHtml, vkey, serverName, callback)) {
-                    Log.i(TAG, "extractRumble v20: SUCCESS via WebView embed-page m.f[] for $vkey")
+                    Log.i(TAG, "extractRumble v20: SUCCESS via WebView embed-page .f[] for $vkey")
                     return true
                 }
-                Log.w(TAG, "extractRumble v20: WebView HTML present but m.f[] data did not parse (vkey=$vkey)")
+                Log.w(TAG, "extractRumble v20: WebView HTML present but .f[] data did not parse (vkey=$vkey)")
             } else {
                 Log.w(TAG, "extractRumble v20: WebView fallback returned no HTML")
             }
@@ -3099,14 +3104,16 @@ class DonghuaLifeProvider : MainAPI() {
         }
         val qCh = 34.toChar()   // doble comilla
         val bsCh = 92.toChar() // barra invertida
-        val block = Regex("m" + bsCh + ".f" + bsCh + "[" + bsCh + qCh + Regex.escape(vkey) + qCh + bsCh + "]=").find(html)
+        // v20: la variable del bloque no es estable (m.f[...] / p.f[...]); se captura
+        // cualquier identificador JS delante de `.f["<vkey>"]=`.
+        val block = Regex("([A-Za-z_$][\\w$]*)" + bsCh + ".f" + bsCh + "[" + bsCh + qCh + Regex.escape(vkey) + qCh + bsCh + "]=").find(html)
         if (block == null) {
-            Log.w(TAG, "extractRumble v21: m.f[] block regex no matchio para $vkey (marker presente?)")
+            Log.w(TAG, "extractRumble v21: .f[] block regex no matchio para $vkey (marker presente?)")
             return false
         }
 
         val start = block.range.first
-        val nextMf = html.indexOf("m.f[\"", start + 10)
+        val nextMf = html.indexOf(".f[" + qCh, block.range.last)
         // v20: </script> NO es un borde seguro (configs de ads lo contienen dentro de
         // strings y truncaban el bloque antes de las URLs); cap de 300 KB por seguridad
         val end = listOf(nextMf, start + 300000).filter { it > start }.minOrNull() ?: html.length
@@ -3114,7 +3121,7 @@ class DonghuaLifeProvider : MainAPI() {
             .replace(Regex("\\\\+/"), "/")
             .replace(Regex("\\\\+u0026"), "&")
 
-        Log.i(TAG, "extractRumble v20: block len=" + data.length + " head=" + data.take(140))
+        Log.i(TAG, "extractRumble v20: block var=${block.groupValues[1]} len=" + data.length + " head=" + data.take(140))
 
         var emitted = false
 
