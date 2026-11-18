@@ -543,9 +543,6 @@ class TioDonghuaProvider : MainAPI() {
             val serie = a.selectFirst("h4")?.text()?.trim().orEmpty()
             val title = tdCleanTitle(serie.ifBlank { alt.substringBeforeLast(" - Ep") })
             if (title.isBlank()) return@mapNotNull null
-            val badge = a.selectFirst("div.absolute")?.text().orEmpty()
-            val epNum = Regex("(?i)Cap[íi]tulo\\s*(\\d+)").find(badge)?.groupValues?.get(1)?.toIntOrNull()
-                ?: Regex("(?i)[- ]Ep(?:isodio)?\\s*(\\d+)").find(alt)?.groupValues?.get(1)?.toIntOrNull()
             newAnimeSearchResponse(title, "$mainUrl/ver/$epId") {
                 this.posterUrl = img?.attr("src") ?: ""
                 // La card del home es un EPISODIO y su HTML no trae nota; se toma
@@ -554,7 +551,12 @@ class TioDonghuaProvider : MainAPI() {
                 if (r != null) {
                     try { Score.from10(r.toString())?.let { this.score = it } } catch (_: Exception) {}
                 }
-                addDubStatus(DubStatus.Subbed, epNum)
+                // FIX badge (2026-11): NO marcar la card como episodio
+                // (addDubStatus). Con dubStatus, CS3 usa el layout de episodio y
+                // la etiqueta de rating se estira a una barra de ancho completo
+                // (y encima la barra "Subtitulado Ep. N"); en el resto de
+                // secciones (sin dubStatus) el rating es una pastilla compacta
+                // que se ajusta al texto. Sin dubStatus queda igual que ellas.
             }
         }.distinctBy { it.url }
     }

@@ -75,6 +75,13 @@ object CommonExtractors {
             newExtractorLink(source = linkName, name = linkName, url = master, type = ExtractorLinkType.M3U8) {
                 this.referer = DM_REFERER
                 this.quality = Qualities.Unknown.value
+                // FIX TV (2026-11): el CDN de DM responde 403 (ExoPlayer
+                // ERROR_CODE_IO_BAD_HTTP_STATUS 2004) si la peticion de media
+                // va sin User-Agent o con uno "raro" (curl/vacio). En el
+                // emulador el player manda un UA aceptable, en algunos TV no.
+                // Forzamos un UA de navegador en el enlace para que TODOS los
+                // dispositivos envien el mismo UA aceptado por el CDN.
+                this.headers = headersWithUA(customUA)
             }
         )
         return true
@@ -247,6 +254,11 @@ object CommonExtractors {
                     ) {
                         this.referer = DM_REFERER
                         this.quality = q ?: Qualities.Unknown.value
+                        // FIX TV (2026-11): UA de navegador explicito en el
+                        // enlace. El CDN de DM da 403 (2004) sin UA o con UA
+                        // curl/vacio; algunos TV mandan un UA bloqueado mientras
+                        // el emulador no. Mismo UA aceptado en todos lados.
+                        this.headers = headersWithUA(customUA)
                     }
                 )
                 found = true
