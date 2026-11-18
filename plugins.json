@@ -82,14 +82,14 @@
   {
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/DonghuaWorldProvider.cs3",
     "status": 1,
-    "version": 12,
+    "version": 14,
     "name": "DonghuaWorldProvider",
     "internalName": "DonghuaWorldProvider",
     "authors": [
       "robertozv80"
     ],
     "description": "DonghuaWorld - Donghuas y anime chino en espa\u00f1ol",
-    "fileSize": 97852,
+    "fileSize": 105229,
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
     "language": "es",
     "tvTypes": [
@@ -97,7 +97,7 @@
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=donghuaworld.com&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-eeb60c008f2943aa3662c83067484ad3f691e6703babc69c6f416ed4c3af0b44"
+    "fileHash": "sha256-cf2cf345934f89eb1c2ecfb0fd16d06a2946cde6f4a16e2a817bf59d9a54b5bf"
   },
   {
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/DonghuaZoneProvider.cs3",
@@ -202,14 +202,14 @@
   {
     "url": "https://raw.githubusercontent.com/robertozv80/donghua-ext/builds/TioDonghuaProvider.cs3",
     "status": 1,
-    "version": 16,
+    "version": 17,
     "name": "TioDonghuaProvider",
     "internalName": "TioDonghuaProvider",
     "authors": [
       "robertozv80"
     ],
     "description": "TioDonghua - Donghuas, pel\u00edculas y episodios sub espa\u00f1ol (tiodonghua.lat)",
-    "fileSize": 101409,
+    "fileSize": 103049,
     "repositoryUrl": "https://github.com/robertozv80/donghua-ext",
     "language": "es",
     "tvTypes": [
@@ -219,6 +219,6 @@
     ],
     "iconUrl": "https://www.google.com/s2/favicons?domain=tiodonghua.lat&sz=%size%",
     "apiVersion": 1,
-    "fileHash": "sha256-6f74152bfc544b6d158d8aaca661fbb15e120607f053969326c5528846c8103c"
+    "fileHash": "sha256-47f394eb045ec56a5516d2828198fd2735bc3777101ef7494db80c3b3f4fc987"
   }
 ]
