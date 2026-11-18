@@ -21,6 +21,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import org.json.JSONObject
 
 class DonghuaWorldProvider : MainAPI() {
     override var mainUrl = "https://donghuaworld.com"
@@ -189,6 +190,9 @@ class DonghuaWorldProvider : MainAPI() {
     // segunda seccion reutilice el fetch de la primera.
     private val dwwPageCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, DwwPage>>()
     private val dwwPageMutex = kotlinx.coroutines.sync.Mutex()
+    // v14: urls con un refresh en segundo plano en curso (stale-while-revalidate
+    // del home). Evita lanzar un WebView por cada seccion que pide la misma url.
+    private val dwwRefreshing = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
 
     // FIX v24 (posters grises): Cloudflare tambien rechaza las peticiones de
     // imagen de la app (Coil/OkHttp, mismo fingerprint TLS que el resto). La
@@ -227,13 +231,13 @@ class DonghuaWorldProvider : MainAPI() {
     private fun dwwPageFile(url: String): java.io.File? =
         dwwDiskDir()?.let { java.io.File(it, "p" + Integer.toHexString(url.hashCode()) + ".html") }
 
-    private fun dwwDiskLoadPage(url: String): String? = try {
+    private fun dwwDiskLoadPage(url: String, ttlMs: Long = DWW_DISK_TTL_MS): String? = try {
         val f = dwwPageFile(url) ?: return null
         if (!f.isFile) return null
         val raw = f.readText()
         val nl = raw.indexOf('\n')
         val ts = if (nl > 0) raw.substring(0, nl).toLongOrNull() ?: 0L else 0L
-        if (System.currentTimeMillis() - ts >= DWW_DISK_TTL_MS) return null
+        if (System.currentTimeMillis() - ts >= ttlMs) return null
         // v32: un HTML vacio/de error guardado por un fallo anterior no es cache
         // valida; si se sirve, el episodio queda sin enlaces hasta que expire.
         val html = raw.substring(nl + 1)
@@ -543,7 +547,8 @@ class DonghuaWorldProvider : MainAPI() {
         url: String,
         referer: String? = null,
         collectImages: Boolean = false,
-        bypassCache: Boolean = false
+        bypassCache: Boolean = false,
+        allowStale: Boolean = false
     ): DwwPage {
         val now = System.currentTimeMillis()
         if (!bypassCache) {
@@ -556,6 +561,28 @@ class DonghuaWorldProvider : MainAPI() {
                 val p = DwwPage(html)
                 dwwPageCache[url] = System.currentTimeMillis() to p
                 return p
+            }
+            // v14 (home lento): stale-while-revalidate. Si la cache de disco ya
+            // expiro pero existe, el home la sirve AL INSTANTE y refresca en
+            // segundo plano; nunca espera el reto de Cloudflare (~1-2min). Solo
+            // se usa para el catalogo/home, no para load/loadLinks de episodios.
+            if (allowStale) {
+                dwwDiskLoadPage(url, ttlMs = Long.MAX_VALUE)?.let { html ->
+                    Log.i(TAG, "dwwFetch: cache disco EXPIRADA servida al instante para $url (refresh en 2o plano)")
+                    val p = DwwPage(html)
+                    dwwPageCache[url] = System.currentTimeMillis() to p
+                    if (dwwRefreshing.putIfAbsent(url, true) == null) {
+                        dwwScope.launch {
+                            try {
+                                dwwFetch(url, referer, collectImages, bypassCache = true)
+                            } catch (_: Throwable) {
+                            } finally {
+                                dwwRefreshing.remove(url)
+                            }
+                        }
+                    }
+                    return p
+                }
             }
         }
         return dwwPageMutex.withLock {
@@ -609,8 +636,9 @@ class DonghuaWorldProvider : MainAPI() {
     private suspend fun dwwGet(
         url: String,
         referer: String? = null,
-        collectImages: Boolean = false
-    ): Document = Jsoup.parse(dwwFetch(url, referer, collectImages).html, url)
+        collectImages: Boolean = false,
+        allowStale: Boolean = false
+    ): Document = Jsoup.parse(dwwFetch(url, referer, collectImages, allowStale = allowStale).html, url)
 
     // ==================== MAIN PAGE ====================
     // FIX 2026-08-11: Refactorizado para usar selectores CSS basados en clases en lugar
@@ -655,7 +683,7 @@ class DonghuaWorldProvider : MainAPI() {
                 sectionUrl
             }
             // v24: collectImages puentea las imagenes de las cards por el WebView.
-            val document = dwwGet(url, collectImages = true)
+            val document = dwwGet(url, collectImages = true, allowStale = true)
             // v11: la nota sale del widget "Popular Series" del propio documento.
             rememberPopRatings(url, document)
             val items = withWidgetScores(document.select(".listupd article").mapNotNull { art ->
@@ -679,7 +707,7 @@ class DonghuaWorldProvider : MainAPI() {
             sectionUrl.contains("latest") -> "$mainUrl/page/$page/"
             else -> return newHomePageResponse(emptyList(), hasNext = false)
         }
-        val document = dwwGet(homeUrl, collectImages = true)
+        val document = dwwGet(homeUrl, collectImages = true, allowStale = true)
         // v11 (issue #29): widget "Popular Series" de este mismo documento -> nota
         // gratis para Latest Release y Recommendation (sus cards son URLs de
         // episodio; dwwSeriesSlugOf las normaliza a slug de serie).
@@ -1275,7 +1303,13 @@ class DonghuaWorldProvider : MainAPI() {
     }
 
     /**
-     * Extract video and subtitles from the Dark Server (player.donghuaplanet.com).
+     * Extract video and subtitles from the Dark Server.
+     *
+     * v13: el Dark Server actual es `playi.donghuaworld.com/<id>` y su HTML es un
+     * shell de JW Player SIN `sources`/`tracks` inline: los pide en runtime a un
+     * relay JSON. Antes solo se parseaba el formato viejo (player.donghuaplanet.com),
+     * asi que el episodio emitia 0 enlaces de Dark Server y en la app unicamente
+     * aparecia "Eng-Sub Player" (DM) con 480p/288p aunque la web tuviera 1080p.
      */
     private suspend fun extractDarkServer(
         playerUrl: String,
@@ -1284,21 +1318,170 @@ class DonghuaWorldProvider : MainAPI() {
     ) {
         try {
             Log.d(TAG, "extractDarkServer: fetching $playerUrl")
-            val playerHtml = dwwFetch(playerUrl, referer = "$mainUrl/").html
+            // v13: el shell del player es pequeno y barato; NUNCA se sirve desde
+            // la cache de disco. Una entrada vieja (shell anterior al relay, o
+            // pagina a medias) no trae RELAY/ID ni sources y dejaba el episodio
+            // solo con DM Player durante todo el TTL de 4h.
+            val playerHtml = dwwFetch(playerUrl, referer = "$mainUrl/", bypassCache = true).html
             Log.d(TAG, "extractDarkServer: got ${playerHtml.length} chars")
 
-            // === Extract Subtitle Tracks ===
+            // El referer de las fuentes debe ser el origin REAL del player: el
+            // PLAYER_BASE historico (donghuaplanet) ya no sirve el contenido.
+            val referer = (Regex("""^https?://[^/]+""").find(playerUrl)?.value ?: PLAYER_BASE) + "/"
+
+            // === Ruta nueva: relay JSON (Auto + 360/480/720/1080 + subs) ===
+            val relayLinks = extractRelaySources(playerUrl, playerHtml, referer, subtitleCallback, callback)
+            if (relayLinks > 0) {
+                Log.i(TAG, "extractDarkServer: relay JSON -> $relayLinks enlaces")
+                return
+            }
+
+            // === Ruta legacy: sources/tracks inline en el HTML del player ===
             extractAndParseTracks(playerHtml, subtitleCallback)
-
-            // Log if no subtitles were found for debugging
-            // (subtitleCallback invocations are counted inside extractAndParseTracks)
-
-            // === Extract Video Sources ===
-            extractAndParseSources(playerHtml, callback)
+            extractAndParseSources(playerHtml, referer, callback)
 
         } catch (e: Exception) {
             Log.w(TAG, "extractDarkServer failed for $playerUrl: ${e.message}")
         }
+    }
+
+    /**
+     * v13: fuentes del Dark Server nuevo via relay JSON.
+     *
+     * El shell del player declara en su propio HTML:
+     *   var RELAY = "https:\/\/playing.donghuaworld.com\/";
+     *   var ID = "v7gag2e";
+     * y hace `fetch(RELAY + "?json=1&id=" + ID)`. La respuesta trae:
+     *   data.ua.hls.auto  -> master HLS (Auto)
+     *   data.ua.tar.<h>   -> HLS por calidad (.tar?r_file=chunklist.m3u8)
+     *   data.ua.mp4.<h>   -> mp4 progresivos (si el video los tiene)
+     *   data.cc.<lang>    -> VTT de subtitulos (incluye es/en)
+     * `data.u` es el respaldo con una sola fuente por grupo.
+     *
+     * IMPORTANTE: el relay responde 403 "forbidden" sin el header `Origin` del
+     * player (verificado con curl: con Origin 200, sin el 403; el Referer solo
+     * NO basta). `timeline` (tira de preview 180p) y `audio` (AAC) se ignoran:
+     * no son video reproducible.
+     *
+     * Devuelve el numero de enlaces emitidos (0 = usar la ruta legacy).
+     */
+    private suspend fun extractRelaySources(
+        playerUrl: String,
+        html: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Int {
+        val relay = Regex("""RELAY\s*=\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
+            ?.replace("\\/", "/")?.trim().orEmpty()
+        val id = Regex("""\bID\s*=\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
+            ?.replace("\\/", "/")?.trim().orEmpty()
+        if (relay.isEmpty() || id.isEmpty()) {
+            Log.w(TAG, "extractRelaySources: sin RELAY/ID en el shell (relay='${relay.take(40)}' id='$id')")
+            return 0
+        }
+        val origin = Regex("""^https?://[^/]+""").find(playerUrl)?.value ?: return 0
+        val api = relay + (if (relay.contains('?')) "&" else "?") +
+            "json=1&id=" + java.net.URLEncoder.encode(id, "UTF-8")
+
+        val text = try {
+            app.get(
+                api,
+                referer = playerUrl,
+                headers = mapOf(
+                    "User-Agent" to dwwUserAgent(),
+                    "Origin" to origin,
+                    "Accept" to "*/*"
+                ),
+                timeout = 20L
+            ).text
+        } catch (t: Throwable) {
+            Log.w(TAG, "extractRelaySources: fallo $api (${t.message})")
+            return 0
+        }
+        val root = try {
+            JSONObject(text)
+        } catch (_: Exception) {
+            Log.w(TAG, "extractRelaySources: respuesta no JSON (${text.take(80)})")
+            return 0
+        }
+        if (!root.optBoolean("ok", false)) {
+            Log.w(TAG, "extractRelaySources: ok=false para $id")
+            return 0
+        }
+        val data = root.optJSONObject("data") ?: return 0
+        val ua = data.optJSONObject("ua") ?: data.optJSONObject("u")
+        if (ua == null) {
+            Log.w(TAG, "extractRelaySources: data sin ua/u (keys=${data.keys().asSequence().toList()})")
+            return 0
+        }
+
+        var emitted = 0
+        val seenUrls = HashSet<String>()
+        // Mismo orden que el player de la web: hls (Auto), mp4, tar.
+        for (group in listOf("hls", "mp4", "tar")) {
+            val node = ua.opt(group) ?: continue
+            if (node !is JSONObject) continue
+            // {url:...} (forma `u`) o {"auto":{...}} / {"360":{...},...} (forma `ua`)
+            val entries: List<Pair<String, JSONObject>> =
+                if (node.has("url")) listOf("" to node)
+                else node.keys().asSequence().mapNotNull { k ->
+                    (node.opt(k) as? JSONObject)?.let { k to it }
+                }.toList()
+
+            for ((key, obj) in entries) {
+                val url = obj.optString("url").replace("\\/", "/").trim()
+                if (url.isEmpty() || !seenUrls.add(url)) continue
+                val h = obj.optJSONObject("meta")?.optInt("h", 0) ?: 0
+                val isAuto = h <= 0 && (key.equals("auto", ignoreCase = true) || group == "hls")
+                val label = when {
+                    h > 0 -> "${h}p"
+                    isAuto -> "Auto"
+                    key.isNotBlank() -> key
+                    else -> "MP4"
+                }
+                // Los .tar?r_file=chunklist.m3u8 NO son mp4: son HLS. Marcarlos
+                // VIDEO daba "parsing_container_unsupported(3003)".
+                val isHls = group == "hls" || group == "tar" ||
+                    url.contains("r_file=") || url.contains("chunklist.m3u8") ||
+                    url.substringBefore('?').endsWith(".m3u8", ignoreCase = true)
+                val quality = when {
+                    h > 0 -> parseQualityFromLabel("${h}p")
+                    isAuto -> Qualities.Unknown.value
+                    else -> parseQualityFromLabel(label)
+                }
+                Log.d(TAG, "extractRelaySources: $group/$label -> $url")
+                callback(
+                    newExtractorLink(
+                        source = "Dark Server",
+                        name = "Dark Server ($label)",
+                        url = url,
+                        type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = referer
+                        this.quality = quality
+                    }
+                )
+                emitted++
+            }
+        }
+
+        // === Subtitulos del relay (data.cc) ===
+        val cc = data.optJSONObject("cc")
+        if (cc != null) {
+            val seenSubs = HashSet<String>()
+            for (k in cc.keys()) {
+                val v = cc.optJSONObject(k) ?: continue
+                // El JS del player reescribe este host al CDN real de Rumble.
+                val path = v.optString("path").replace("\\/", "/")
+                    .replace("1a-1791.com", "hugh.cdn.rumble.cloud").trim()
+                if (path.isEmpty() || !seenSubs.add(path)) continue
+                val lang = normalizeSubtitleLanguage(v.optString("language").ifBlank { k }) ?: continue
+                Log.d(TAG, "extractRelaySources: sub $lang -> $path")
+                subtitleCallback(SubtitleFile(lang = lang, url = path))
+            }
+        }
+        return emitted
     }
 
     /**
@@ -1542,7 +1725,11 @@ class DonghuaWorldProvider : MainAPI() {
      * formato JSON (sources: [...]). Ademas, tracks se declara ANTES que sources.
      * Nuevo regex acepta tanto : como = y no depende del orden con tracks.
      */
-    private suspend fun extractAndParseSources(html: String, callback: (ExtractorLink) -> Unit) {
+    private suspend fun extractAndParseSources(
+        html: String,
+        referer: String = "$PLAYER_BASE/",
+        callback: (ExtractorLink) -> Unit
+    ) {
         // FIX: El player usa "const sources = [...]" (JavaScript) no "sources: [...]" (JSON).
         // Ademas, tracks puede declararse antes o despues de sources.
         val sourcesMatch = Regex("""sources\s*[:=]\s*(\[[\s\S]*?\])\s*[;,]""").find(html)
@@ -1580,7 +1767,7 @@ class DonghuaWorldProvider : MainAPI() {
                             url = file,
                             type = ExtractorLinkType.M3U8
                         ) {
-                            this.referer = "$PLAYER_BASE/"
+                            this.referer = referer
                             this.quality = Qualities.Unknown.value
                         }
                     )
@@ -1597,7 +1784,7 @@ class DonghuaWorldProvider : MainAPI() {
                             url = file,
                             type = ExtractorLinkType.M3U8
                         ) {
-                            this.referer = "$PLAYER_BASE/"
+                            this.referer = referer
                             this.quality = quality
                         }
                     )
@@ -1612,7 +1799,7 @@ class DonghuaWorldProvider : MainAPI() {
                             url = file,
                             type = ExtractorLinkType.VIDEO
                         ) {
-                            this.referer = "$PLAYER_BASE/"
+                            this.referer = referer
                             this.quality = quality
                         }
                     )
@@ -1637,7 +1824,7 @@ class DonghuaWorldProvider : MainAPI() {
                         url = hlsUrl,
                         type = ExtractorLinkType.M3U8
                     ) {
-                        this.referer = "$PLAYER_BASE/"
+                        this.referer = referer
                         this.quality = Qualities.Unknown.value
                     }
                 )

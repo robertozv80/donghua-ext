@@ -173,9 +173,27 @@ private fun tdFlight(html: String): String {
 }
 
 /** Objeto JSON-LD `TVSeries` de la ficha (name, description, image, genre, aggregateRating). */
-private fun tdLdJson(doc: Document): String =
-    doc.select("script[type=application/ld+json]").mapNotNull { it.data().trim().ifBlank { null } }
-        .firstOrNull { it.contains("TVSeries") || it.contains("aggregateRating") } ?: ""
+private fun tdLdJson(doc: Document): String {
+    val block = doc.select("script[type=application/ld+json]").mapNotNull { it.data().trim().ifBlank { null } }
+        .firstOrNull { it.contains("TVSeries") || it.contains("aggregateRating") } ?: return ""
+    // v17: el sitio ahora publica UN solo bloque con un ARRAY
+    // [BreadcrumbList, TVSeries]. El primer "name" del array es la miga de pan
+    // "Inicio", y tdJsonStr lo tomaba como titulo de la ficha (hero y detalle
+    // decian "Inicio"). Se devuelve unicamente el objeto TVSeries/Movie.
+    return try {
+        val arr = org.json.JSONArray(block)
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            when (o.optString("@type")) {
+                "TVSeries", "Movie", "VideoObject" -> return o.toString()
+            }
+        }
+        block
+    } catch (_: Exception) {
+        // Objeto suelto (formato anterior): se usa tal cual.
+        block
+    }
+}
 
 /**
  * Extractor de Ok.Ru (odnoklassniki). La página del embed trae el
@@ -663,6 +681,11 @@ class TioDonghuaProvider : MainAPI() {
 
         val episodes = ArrayList<Episode>()
         val seen = HashSet<String>()
+        // v17: la temporada activa vive en un <button> del tab ("Temporada 4
+        // (10)"), no en un encabezado del grid; tdSeasonOf no lo veia y todos
+        // los capitulos caian en la temporada por defecto, distinto de la web.
+        val tabSeason = (doc.selectFirst("button.bg-brand-500") ?: doc.selectFirst("button"))
+            ?.text()?.let { Regex("""(?i)Temporada\s*(\d+)""").find(it)?.groupValues?.get(1)?.toIntOrNull() }
         for (a in doc.select("a[href^=/ver/]")) {
             val epId = Regex("/ver/(\\d+)").find(a.attr("href"))?.groupValues?.get(1) ?: continue
             // Sin "Capítulo N" es el botón "Empezar a Ver (Ep 1)" del hero, que
@@ -673,11 +696,26 @@ class TioDonghuaProvider : MainAPI() {
             // name se deja null: la etiqueta del sitio ("Renegade Immortal
             // Episodio 166 Sub Español") repite la serie y el sufijo; con
             // season+episode CloudStream renderiza "Episodio N" y agrupa.
-            val seasonNum = tdSeasonOf(a)
+            val seasonNum = tdSeasonOf(a) ?: tabSeason
             episodes.add(newEpisode("$mainUrl/ver/$epId") {
                 this.episode = epNum
                 this.season = seasonNum
             })
+        }
+        // v17: el SSR solo pinta la temporada activa; se unen los capitulos del
+        // API (que lista seasons/episodes completos) para no perder ninguno.
+        val apiJson = apiGet("$TD_API/donghuas/$slug").orEmpty()
+        val apiData = tdJsonVal(apiJson, "data") ?: apiJson
+        for (season in tdJsonObjs(apiData, "seasons")) {
+            val sn = tdJsonInt(season, "season_number")
+            for (ep in tdJsonObjs(season, "episodes")) {
+                val epId = tdJsonStr(ep, "id") ?: continue
+                if (!seen.add(epId)) continue
+                episodes.add(newEpisode("$mainUrl/ver/$epId") {
+                    this.episode = tdJsonInt(ep, "episode_number")
+                    this.season = sn
+                })
+            }
         }
         episodes.sortWith(compareBy({ it.season ?: 1 }, { it.episode ?: 0 }))
         Log.i(TAG, "loadSerie $slug: ${episodes.size} episodios, rating=$rating, generos=${genres.size}")
